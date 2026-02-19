@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "Poc-it"
+version = "0.1.0"
+description = "Sistema inteligente capaz de transformar una descripción funcional en una PoC backend básica,
+funcional y versionada en Git, validando la reducción de tiempo frente a un desarrollo manual"
+
+[tool.poetry.dependencies]
+python = ">=3.11.0, <3.14"
+crewai = ">=0.1.24"
+python-dotenv = ">=1.0.0"
+
+[tool.pyright]
+useLibraryCodeForTypes = true
+exclude = [".cache"]
+
+[tool.ruff]
+select = ['E', 'W', 'F', 'I', 'B', 'C4', 'ARG', 'SIM']
+ignore = ['W291', 'W292', 'W293']
