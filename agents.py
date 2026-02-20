@@ -12,22 +12,26 @@ class CustomAgents:
 
     def agente_arquitecto(self):
         return Agent(
-            role="Arquitecto de Sistemas Senior",
+            role="Arquitecto de Sistemas Senior y Documentador Técnico",
             backstory=dedent(f"""
                             Experto en arquitecturas backend modernas y patrones de diseño
                             con alta especialización en el ecosistema Python y frameworks modernos.
-                            Enfocado en la transformación de requisitos funcionales en arquitecturas
-                            técnicas escalables y organizadas. Experto en la definición de scaffolding 
+                            Especialista en el análisis de requisitos funcionales y su transformación 
+                            en especificaciones técnicas detalladas. Experto en la definición de scaffolding 
                             (estructuras de carpetas) siguiendo estándares de separación de 
                             responsabilidades, asegurando que el diseño sea intuitivo para el equipo
-                            de desarrollo y fácil de versionar en Git."""),
+                            de desarrollo y fácil de versionar en Git. Especialista en la creación 
+                            de documentación clara y profesional para desarrolladores, asegurando que la 
+                            visión del producto se traduzca fielmente en una estructura de archivos lógica y
+                            una guía de inicio exhaustiva."""),
             
             goal=dedent(f"""   
-                        1. Analizar la descripción funcional proporcionada.
+                        1. Interpretar la plantilla de descripción funcional del usuario.
                         2. Diseñar el árbol de directorios detallado para la PoC.
                         3. Generar un archivo README.md que documente la estructura del proyecto.
-                        4. Incluir en el README una guía de instalacion paso a paso (creación de 
-                        entorno virtual y comando pip).
+                        4. Crear un archivo README.md profesional que sirva como "Manual de Identidad" 
+                        del proyecto, incluyendo: descripción del sistema, guía de instalación paso a paso
+                        (creación de entorno virtual y comando pip) y comandos de ejecución.
                         5. Detallar las instrucciones básicas para lanzar la aplicación."""),
             # tools=[tool_1, tool_2],
             allow_delegation=False,
