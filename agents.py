@@ -1,17 +1,14 @@
 from crewai import Agent
 from crewai_tools import FileWriterTool
 from textwrap import dedent
-from langchain.llms import OpenAI, Ollama
-from langchain_openai import ChatOpenAI
+from langchain_community.chat_models import ChatOllama
 
 # Inicializamos la herramienta de escritura
 file_writer_tool = FileWriterTool()
 
 class AgentesGeneradoresPoC:
     def __init__(self):
-        self.OpenAIGPT35 = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.7)
-        self.OpenAIGPT4 = ChatOpenAI(model_name="gpt-4", temperature=0.7)
-        self.Ollama = Ollama(model="openhermes")
+        self.deepseek = ChatOllama(model="deepseek-r1:8b", temperature=0.7)
 
     def agente_arquitecto(self):
         return Agent(
@@ -39,7 +36,7 @@ class AgentesGeneradoresPoC:
             tools=[file_writer_tool],
             allow_delegation=False,
             verbose=True,
-            llm=self.OpenAIGPT35,
+            llm=self.deepseek,
         )
 
     def agent_2_name(self):
@@ -50,7 +47,7 @@ class AgentesGeneradoresPoC:
             # tools=[tool_1, tool_2],
             allow_delegation=False,
             verbose=True,
-            llm=self.OpenAIGPT35,
+            llm=self.deepseek,
         )
     
     def agent_3_name(self):
@@ -61,7 +58,7 @@ class AgentesGeneradoresPoC:
             # tools=[tool_1, tool_2],
             allow_delegation=False,
             verbose=True,
-            llm=self.OpenAIGPT35,
+            llm=self.deepseek,
         )
     
     def agent_4_name(self):
@@ -72,5 +69,5 @@ class AgentesGeneradoresPoC:
             # tools=[tool_1, tool_2],
             allow_delegation=False,
             verbose=True,
-            llm=self.OpenAIGPT35,
+            llm=self.deepseek,
         )
