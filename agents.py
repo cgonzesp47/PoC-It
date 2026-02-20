@@ -1,10 +1,13 @@
 from crewai import Agent
+from crewai_tools import FileWriterTool
 from textwrap import dedent
 from langchain.llms import OpenAI, Ollama
 from langchain_openai import ChatOpenAI
 
+# Inicializamos la herramienta de escritura
+file_writer_tool = FileWriterTool()
 
-class CustomAgents:
+class AgentesGeneradoresPoC:
     def __init__(self):
         self.OpenAIGPT35 = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.7)
         self.OpenAIGPT4 = ChatOpenAI(model_name="gpt-4", temperature=0.7)
@@ -33,7 +36,7 @@ class CustomAgents:
                         del proyecto, incluyendo: descripción del sistema, guía de instalación paso a paso
                         (creación de entorno virtual y comando pip) y comandos de ejecución.
                         5. Detallar las instrucciones básicas para lanzar la aplicación."""),
-            # tools=[tool_1, tool_2],
+            tools=[file_writer_tool],
             allow_delegation=False,
             verbose=True,
             llm=self.OpenAIGPT35,
