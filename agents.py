@@ -1,14 +1,13 @@
 from crewai import Agent
-from crewai_tools import FileWriterTool
 from textwrap import dedent
-from langchain_community.chat_models import ChatOllama
 
-# Inicializamos la herramienta de escritura
-file_writer_tool = FileWriterTool()
+from tools.escribir_archivo_readme import escribir_archivo_readme_tool
+custom_tool = escribir_archivo_readme_tool
 
 class AgentesGeneradoresPoC:
     def __init__(self):
-        self.deepseek = ChatOllama(model="deepseek-r1:8b", temperature=0.7)
+        # CrewAI maneja Ollama con el formato de string "ollama/nombre_modelo"
+        self.llm = "ollama/deepseek7b:latest"
 
     def agente_arquitecto(self):
         return Agent(
@@ -33,10 +32,10 @@ class AgentesGeneradoresPoC:
                         del proyecto, incluyendo: descripción del sistema, guía de instalación paso a paso
                         (creación de entorno virtual y comando pip) y comandos de ejecución.
                         5. Detallar las instrucciones básicas para lanzar la aplicación."""),
-            tools=[file_writer_tool],
+            tools=[custom_tool],
             allow_delegation=False,
             verbose=True,
-            llm=self.deepseek,
+            llm=self.llm,
         )
 
     def agent_2_name(self):
@@ -47,7 +46,7 @@ class AgentesGeneradoresPoC:
             # tools=[tool_1, tool_2],
             allow_delegation=False,
             verbose=True,
-            llm=self.deepseek,
+            llm=self.llm,
         )
     
     def agent_3_name(self):
@@ -58,7 +57,7 @@ class AgentesGeneradoresPoC:
             # tools=[tool_1, tool_2],
             allow_delegation=False,
             verbose=True,
-            llm=self.deepseek,
+            llm=self.llm,
         )
     
     def agent_4_name(self):
@@ -69,5 +68,5 @@ class AgentesGeneradoresPoC:
             # tools=[tool_1, tool_2],
             allow_delegation=False,
             verbose=True,
-            llm=self.deepseek,
+            llm=self.llm,
         )

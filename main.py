@@ -2,14 +2,14 @@ import os
 from crewai import Agent, Task, Crew, Process
 from textwrap import dedent
 from agents import AgentesGeneradoresPoC
+from tools.escribir_archivo_readme import escribir_archivo_readme_tool
 from tasks import TareasGeneracionPoC
 
-# Install duckduckgo-search for this example:
-# !pip install -U duckduckgo-search
+# Evitar error de CrewAI buscando OPENAI_API_KEY
+os.environ["OPENAI_API_KEY"] = "not-needed"
 
-from langchain.tools import DuckDuckGoSearchRun
-
-search_tool = DuckDuckGoSearchRun()
+# Ollama está configurado para ejecutarse localmente en http://localhost:11434
+# Asegúrate de tener Ollama corriendo con: ollama serve
 
 # This is the main class that you will use to define your custom crew.
 # You can define as many agents and tasks as you want in agents.py and tasks.py
@@ -30,23 +30,20 @@ class CustomCrew:
 
         # Define your custom agents and tasks here
         agente_arquitecto = agents.agente_arquitecto()
-        custom_agent_2 = agents.agent_2_name()
+        herramienta_escritura = escribir_archivo_readme_tool
 
         # Custom tasks include agent name and variables as input
         datos_plantilla = [self.nombre, self.objetivo, self.entidades, self.acciones, self.reglas]
         tarea_diseño_arq = tasks.tarea_diseño_arq(
             agente_arquitecto,
-            datos_plantilla
-        )
-
-        custom_task_2 = tasks.task_2_name(
-            custom_agent_2,
+            datos_plantilla,
+            herramienta_escritura,
         )
 
         # Define your custom crew here
         crew = Crew(
-            agents=[agente_arquitecto, custom_agent_2],
-            tasks=[tarea_diseño_arq, custom_task_2],
+            agents=[agente_arquitecto],
+            tasks=[tarea_diseño_arq],
             verbose=True,
         )
 
