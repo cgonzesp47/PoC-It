@@ -2,6 +2,7 @@ from crewai import Agent
 from textwrap import dedent
 
 from tools.escribir_archivo_readme import escribir_archivo_readme_tool
+from tools.leer_archivo_readme import leer_archivo_readme_tool
 custom_tool = escribir_archivo_readme_tool
 
 class AgentesGeneradoresPoC:
@@ -33,6 +34,26 @@ class AgentesGeneradoresPoC:
                         (creación de entorno virtual y comando pip) y comandos de ejecución.
                         5. Detallar las instrucciones básicas para lanzar la aplicación."""),
             tools=[custom_tool],
+            allow_delegation=False,
+            verbose=True,
+            llm=self.llm,
+        )
+
+    def agente_revisor(self):
+        return Agent(
+            role="Revisor de Documentación Técnica",
+            backstory=dedent(f"""
+                            Especialista en validación de documentación técnica y control de calidad.
+                            Experto en verificar que todos los componentes clave están presentes y bien documentados.
+                            Detallista y exigente, asegura que no falte ningún detalle importante en la documentación.
+                            Si encuentra deficiencias, proporciona retroalimentación clara y específica."""),
+            
+            goal=dedent(f"""
+                        1. Revisar el README.md que ha sido generado por el arquitecto.
+                        2. Verificar que contenga TODAS las secciones obligatorias con contenido adecuado.
+                        3. Si falta alguna sección o está incompleta, comunicar qué hace falta.
+                        4. Si el README es completo, confirmar que está listo para usar."""),
+            tools=[leer_archivo_readme_tool],
             allow_delegation=False,
             verbose=True,
             llm=self.llm,

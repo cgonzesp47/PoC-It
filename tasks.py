@@ -25,15 +25,34 @@ class TareasGeneracionPoC:
 
                 **FORMATO OBLIGATORIO**:
                 Action: escribir_archivo_readme
-                Action Input: {"contenido": "<README COMPLETO, NO SOLO EL ESQUEMA>"}
+                Action Input: {{"contenido": "<README COMPLETO, NO SOLO EL ESQUEMA>"}}
 
-                **CONTENIDO MÍNIMO DEL README** (obligatorio):
-                - Título del proyecto
-                - Descripción
-                - Instalación (crear venv + pip install)
-                - Ejecución
-                - Estructura del proyecto (árbol de directorios)
-                - Principales entidades y reglas de negocio
+                **CONTENIDO MÍNIMO DEL README** (TODAS LAS SECCIONES SON OBLIGATORIAS):
+                
+                # [NOMBRE DEL PROYECTO]
+                
+                ## DESCRIPCIÓN
+                [Explicar qué hace el sistema y su propósito]
+                
+                ## INSTALACIÓN
+                Debes explicar paso a paso:
+                - Crear entorno virtual (venv)
+                - Instalar dependencias con poetry install
+                - Configuración adicional si es necesaria
+                
+                ## EJECUCIÓN
+                Debes explicar:
+                - Comando para iniciar el servidor FastAPI
+                - Puerto y URL de acceso
+                - Comando para ver documentación interactiva
+                
+                ## ESTRUCTURA DEL PROYECTO
+                [Árbol de directorios completo y detallado]
+                
+                ## ENTIDADES Y REGLAS DE NEGOCIO
+                [Listar entidades con sus campos y reglas de validación]
+                
+                IMPORTANTE: El README DEBE incluir TODAS estas secciones completamente desarrolladas. Si falta alguna, la tarea se considera incompleta.
                 
                 **Parámetros**:
                 - Plantilla de Requisitos: {datos_plantilla}
@@ -51,6 +70,38 @@ class TareasGeneracionPoC:
             expected_output="Esquema de directorios y contenido completo del README.md.",
             agent=agente_arquitecto,
             tools=[herramienta_escritura],
+        )
+
+    def tarea_revision_readme(self, agente_revisor):
+        return Task(
+            description=dedent(
+                f"""
+                **Tarea**: Revisión y Validación del README.md
+                **Descripción**: Revisar el archivo README.md que ha sido generado por el arquitecto
+                y verificar que contenga TODAS las secciones obligatorias con contenido adecuado.
+                
+                **INSTRUCCIÓN CRÍTICA**: Debes usar obligatoriamente la herramienta 'leer_archivo_readme' 
+                para leer el contenido del archivo. No supongas qué contiene; léelo completamente.
+
+                **SECCIONES OBLIGATORIAS QUE DEBES VALIDAR**:
+                1. DESCRIPCIÓN - Explica qué hace el sistema
+                2. INSTALACIÓN - Pasos para instalar (venv, poetry install, etc.)
+                3. EJECUCIÓN - Comandos para ejecutar (uvicorn, puerto de acceso, documentación)
+                4. ESTRUCTURA DEL PROYECTO - Árbol de directorios o estructura de carpetas
+                5. ENTIDADES Y REGLAS DE NEGOCIO - Listado de entidades y reglas de validación
+
+                **RESULTADO ESPERADO**:
+                Si TODAS las 5 secciones están presentes y tienen contenido adecuado:
+                - Responde: "APROBADO: El README contiene todas las secciones obligatorias."
+                
+                Si FALTA alguna sección:
+                - Responde: "RECHAZADO: Faltan las siguientes secciones: [listar cuáles]"
+                
+                **Nota**: {self.__tip_section()}
+                """
+            ),
+            expected_output="Resultado de validación: APROBADO o RECHAZADO con detalles",
+            agent=agente_revisor,
         )
 
     def task_2_name(self, agent):
