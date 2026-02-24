@@ -1,29 +1,35 @@
-## agents.py
-This file contains the definition of custom agents.
-To create a Agent, you need to define the following:
-1. Role: The role of the agent.
-2. Backstory: The backstory of the agent.
-3. Goal: The goal of the agent.
-4. Tools: The tools that the agent has access to (optional).
-5. Allow Delegation: Whether the agent can delegate tasks to other agents(optional).
+```json
 
-    [More Details about Agent](https://docs.crewai.com/concepts/agents).
+POC - LabBorrow-API
+=================
 
-## task.py
-This file contains the definition of custom tasks.
-To Create a task, you need to define the following :
-1. description: A string that describes the task.
-2. agent: An agent object that will be assigned to the task.
-3. expected_output: The expected output of the task.
+Descripción General
+------------------
 
-    [More Details about Task](https://docs.crewai.com/concepts/tasks).
+Este proyecto es una PoC de implementación del sistema LabBorrow, diseñado para gestionar el préstamo y devolución de materiales técnicos entre alumnos y profesores. El objetivo es controlar la disponibilidad del inventario y permitir un uso eficiente del mismo en la academia.
 
-## crew (main.py)
-This is the main file that you will use to run your custom crew.
-To create a Crew , you need to define Agent ,Task and following Parameters:
-1. Agent: List of agents that you want to include in the crew.
-2. Task: List of tasks that you want to include in the crew.
-3. verbose: If True, print the output of each task.(default is False).
-4. debug: If True, print the debug logs.(default is False).
+Estructura General
+-----------------
 
-    [More Details about Crew](https://docs.crewai.com/concepts/crew).
+La aplicación se encuentra dividida en diferentes módulos funcionales, agrupados según su responsabilidad:
+
+```json
+    .
+    ├── app/
+    |  ├── controllers/        # Módulo de controladores para API
+    |  └── routers/           # Ruteador de endpoints FastAPI
+    |
+    ├── models/               # Modelos del sistema (entidades y relaciones)
+    |
+    ├── services/            # Módulos de servicios para la persistencia de datos e interacciones con el servidor de bases de datos
+    |
+    └── core/                # Módulo principal, contiene la implementación del FastAPI y los negociadores de negocios (business rules)
+```
+Instalación
+----------
+
+Para instalar todo el entorno necesario para trabajar en este proyecto se deben seguir los siguientes pasos:
+
+1. Crear un ambiente virtual con Python 3.9 o superior. En nuestro caso, se usarán las versiones 3.9 y 3.8. Puedes encontrar más información aquí: https://realpython.com/python-virtual-environments-the-quick-guide/.
+2. Crear un nuevo proyecto con Git. Por ejemplo: `git init`
+3. Clonar el repositorio del proyecto en tu carpeta de trabajo. En nuestro caso, se usará la URL: "https://github.com/YOUR_GITHUB_USERNAME/labborrow-api
