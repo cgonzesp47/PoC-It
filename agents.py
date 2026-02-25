@@ -8,8 +8,8 @@ custom_tool = escribir_archivo_readme_tool
 class AgentesGeneradoresPoC:
     def __init__(self):
         # CrewAI maneja Ollama con el formato de string "ollama/nombre_modelo"
-        self.llm = "ollama/deepseek7b:latest"
-
+        self.llm_rapido = "ollama/deepseek7b:latest"
+        self.llm_potente = "ollama/mistral7b:latest"
     def agente_arquitecto(self):
         return Agent(
             role="Arquitecto de Sistemas Senior y Documentador Técnico",
@@ -36,7 +36,7 @@ class AgentesGeneradoresPoC:
             tools=[custom_tool],
             allow_delegation=False,
             verbose=True,
-            llm=self.llm,
+            llm=self.llm_potente,
         )
 
     def agente_revisor(self):
@@ -56,7 +56,7 @@ class AgentesGeneradoresPoC:
             tools=[leer_archivo_readme_tool],
             allow_delegation=False,
             verbose=True,
-            llm=self.llm,
+            llm=self.llm_rapido,
         )
 
     def agent_2_name(self):
@@ -67,7 +67,7 @@ class AgentesGeneradoresPoC:
             # tools=[tool_1, tool_2],
             allow_delegation=False,
             verbose=True,
-            llm=self.llm,
+            llm=self.llm_rapido,
         )
     
     def agent_3_name(self):
@@ -78,7 +78,7 @@ class AgentesGeneradoresPoC:
             # tools=[tool_1, tool_2],
             allow_delegation=False,
             verbose=True,
-            llm=self.llm,
+            llm=self.llm_rapido,
         )
     
     def agent_4_name(self):
@@ -89,5 +89,5 @@ class AgentesGeneradoresPoC:
             # tools=[tool_1, tool_2],
             allow_delegation=False,
             verbose=True,
-            llm=self.llm,
+            llm=self.llm_rapido,
         )
