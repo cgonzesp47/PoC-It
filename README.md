@@ -1,29 +1,45 @@
-## agents.py
-This file contains the definition of custom agents.
-To create a Agent, you need to define the following:
-1. Role: The role of the agent.
-2. Backstory: The backstory of the agent.
-3. Goal: The goal of the agent.
-4. Tools: The tools that the agent has access to (optional).
-5. Allow Delegation: Whether the agent can delegate tasks to other agents(optional).
 
-    [More Details about Agent](https://docs.crewai.com/concepts/agents).
+# LabBorrow-API
 
-## task.py
-This file contains the definition of custom tasks.
-To Create a task, you need to define the following :
-1. description: A string that describes the task.
-2. agent: An agent object that will be assigned to the task.
-3. expected_output: The expected output of the task.
+## DESCRIPCIÓN
+El sistema LabBorrow-API es una aplicación web que se enfoca en la gestión del préstamo y devolución de material técnico (osciloscopios, placas de desarrollo, multímetros) entre alumnos y profesores, mientras controla la disponibilidad del inventario. El sistema permite al usuario dar de alta nuevos materiales, obtener un listado actualizado de los elementos disponibles para préstamo, solicitar prestamos, registrar devoluciones y controlar el número máximo de objetos en prestamo por cada usuario.
 
-    [More Details about Task](https://docs.crewai.com/concepts/tasks).
+## INSTALACIÓN
+1. Crea un entorno virtual utilizando `venv` y abre la consola del mismo.
+2. Instala las dependencias con `poetry install`.
+3. Sigue cualquier configuración adicional si es necesaria.
 
-## crew (main.py)
-This is the main file that you will use to run your custom crew.
-To create a Crew , you need to define Agent ,Task and following Parameters:
-1. Agent: List of agents that you want to include in the crew.
-2. Task: List of tasks that you want to include in the crew.
-3. verbose: If True, print the output of each task.(default is False).
-4. debug: If True, print the debug logs.(default is False).
+## EJECUCIÓN
+1. Inicia el servidor FastAPI ejecutando el comando `uvicorn main:app --host 0.0.0.0 --port 8000`.
+2. El sistema estará disponible en la URL <http://localhost:8000>.
+3. Para ver la documentación interactiva, utiliza el comando `curl http://localhost:8000/docs`
 
-    [More Details about Crew](https://docs.crewai.com/concepts/crew).
+## ESTRUCTURA DEL PROYECTO
+```yaml
+fastapi-labborrow-api
+│ 
+├── main.py
+├── README.md
+├── requirements.txt
+└── src
+    ├── main.py
+    ├── services
+    │   ├── user.py
+    │   └── material.py
+    ├── models
+    │   ├── user.py
+    │   └── material.py
+    ├── routers
+    │   ├── user_router.py
+    │   └── material_router.py
+    ├── utils
+    │   ├── database.py
+    │   ├── auth.py
+    │   └── upload.py
+    └── tests
+        ├── conftest.py
+        └── test_user.py
+```
+## ENTIDADES Y REGLAS DE NEGOCIO
+- **Material** (ID, nombre, categoría, estado) - Regla de negocio: Material no puede estar marcado como "en uso".
+- **Usuario** (ID, nombre, rol) - Regla de negocio: Un usuario no puede tener más de 2 materiales prestados simultáneamente.
