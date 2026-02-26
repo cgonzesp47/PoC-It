@@ -9,7 +9,7 @@ class AgentesGeneradoresPoC:
     def __init__(self):
         # CrewAI maneja Ollama con el formato de string "ollama/nombre_modelo"
         self.llm_rapido = "ollama/deepseek7b:latest"
-        self.llm_potente = "ollama/mistral7b:latest"
+        self.llm_potente = "ollama/qwen7b:latest"
     def agente_arquitecto(self):
         return Agent(
             role="Arquitecto de Sistemas Senior y Documentador Técnico",
@@ -33,7 +33,7 @@ class AgentesGeneradoresPoC:
                         del proyecto, incluyendo: descripción del sistema, guía de instalación paso a paso
                         (creación de entorno virtual y comando pip) y comandos de ejecución.
                         5. Detallar las instrucciones básicas para lanzar la aplicación."""),
-            tools=[custom_tool],
+            tools=[escribir_archivo_readme_tool],
             allow_delegation=False,
             verbose=True,
             llm=self.llm_potente,

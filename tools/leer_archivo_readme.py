@@ -13,7 +13,7 @@ class LeerArchivoReadmeTool(BaseTool):
     description: str = "Lee el contenido del archivo README.md que se ha generado."
     args_schema: type[BaseModel] = LeerArchivoReadmeArgs
 
-    def _run(self) -> str:
+    def _run(self, **kwargs) -> str:
         try:
             with open("README.md", "r", encoding="utf-8") as f:
                 contenido = f.read()

@@ -72,7 +72,7 @@ class TareasGeneracionPoC:
             tools=[herramienta_escritura],
         )
 
-    def tarea_revision_readme(self, agente_revisor):
+    def tarea_revision_readme(self, agente_revisor, herramienta_lectura):
         return Task(
             description=dedent(
                 f"""
@@ -80,8 +80,12 @@ class TareasGeneracionPoC:
                 **Descripción**: Revisar el archivo README.md que ha sido generado por el arquitecto
                 y verificar que contenga TODAS las secciones obligatorias con contenido adecuado.
                 
-                **INSTRUCCIÓN CRÍTICA**: Debes usar obligatoriamente la herramienta 'leer_archivo_readme' 
+                **INSTRUCCIÓN CRÍTICA**: Debes EJECUTAR obligatoriamente la herramienta 'leer_archivo_readme' 
                 para leer el contenido del archivo. No supongas qué contiene; léelo completamente.
+
+                **FORMATO OBLIGATORIO**:
+                Action: leer_archivo_readme
+                Action Input: {{}}
 
                 **SECCIONES OBLIGATORIAS QUE DEBES VALIDAR**:
                 1. DESCRIPCIÓN - Explica qué hace el sistema
@@ -100,8 +104,9 @@ class TareasGeneracionPoC:
                 **Nota**: {self.__tip_section()}
                 """
             ),
-            expected_output="Resultado de validación: APROBADO o RECHAZADO con detalles",
+            expected_output="Resultado final de validación: APROBADO o RECHAZADO con detalles específicos",
             agent=agente_revisor,
+            tools=[herramienta_lectura],
         )
 
     def task_2_name(self, agent):

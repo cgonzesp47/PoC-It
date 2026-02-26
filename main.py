@@ -9,9 +9,6 @@ from tasks import TareasGeneracionPoC
 # Evitar error de CrewAI buscando OPENAI_API_KEY
 os.environ["OPENAI_API_KEY"] = "not-needed"
 
-# Ollama está configurado para ejecutarse localmente en http://localhost:11434
-# Asegúrate de tener Ollama corriendo con: ollama serve
-
 # This is the main class that you will use to define your custom crew.
 # You can define as many agents and tasks as you want in agents.py and tasks.py
 
@@ -42,7 +39,10 @@ class CustomCrew:
             herramienta_escritura,
         )
         
-        tarea_revision_readme = tasks.tarea_revision_readme(agente_revisor)
+        tarea_revision_readme = tasks.tarea_revision_readme(
+            agente_revisor,
+            leer_archivo_readme_tool,
+        )
 
         # Define your custom crew here
         crew = Crew(
