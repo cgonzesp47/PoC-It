@@ -38,11 +38,13 @@ class CustomCrew:
         tarea_diseño_arq = tasks.tarea_diseño_arq(
             agente_arquitecto,
             datos_plantilla,
+            self.nombre,
             herramienta_escritura,
         )
         
         tarea_revision_readme = tasks.tarea_revision_readme(
             agente_revisor,
+            self.nombre,
             leer_archivo_readme_tool,
         )
         
@@ -75,8 +77,9 @@ if __name__ == "__main__":
     custom_crew = CustomCrew(nombre, objetivo, entidades, acciones, reglas)
     result = custom_crew.run()
     print("\n\n########################")
-    print("\nProceso finalizado. Revisa tu carpeta para ver:")
-    print("  - README.md (documentación)")
-    print("  - .git/ (repositorio inicializado)")    
+    print("\nProceso finalizado. Revisa la carpeta output/ para ver:")
+    print(f"  - output/{nombre}/ (directorio del proyecto)")
+    print(f"  - output/{nombre}/README.md (documentación)")
+    print(f"  - output/{nombre}/.git/ (repositorio inicializado)")    
     print("########################\n")
     print(result)

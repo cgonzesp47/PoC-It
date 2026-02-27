@@ -6,7 +6,7 @@ class TareasGeneracionPoC:
     def __tip_section(self):
         return "If you do your BEST WORK, I'll give you a $10,000 commission!"
 
-    def tarea_diseño_arq(self, agente_arquitecto, datos_plantilla, herramienta_escritura):
+    def tarea_diseño_arq(self, agente_arquitecto, datos_plantilla, nombre_proyecto, herramienta_escritura):
         return Task(
             description=dedent(
                 f"""
@@ -25,7 +25,7 @@ class TareasGeneracionPoC:
 
                 **FORMATO OBLIGATORIO**:
                 Action: escribir_archivo_readme
-                Action Input: {{"contenido": "<README COMPLETO, NO SOLO EL ESQUEMA>"}}
+                Action Input: {{"contenido": "<README COMPLETO, NO SOLO EL ESQUEMA>", "nombre_proyecto": "{nombre_proyecto}"}}
 
                 **CONTENIDO MÍNIMO DEL README** (TODAS LAS SECCIONES SON OBLIGATORIAS):
                 
@@ -72,7 +72,7 @@ class TareasGeneracionPoC:
             tools=[herramienta_escritura],
         )
 
-    def tarea_revision_readme(self, agente_revisor, herramienta_lectura):
+    def tarea_revision_readme(self, agente_revisor, nombre_proyecto, herramienta_lectura):
         return Task(
             description=dedent(
                 f"""
@@ -85,7 +85,7 @@ class TareasGeneracionPoC:
 
                 **FORMATO OBLIGATORIO**:
                 Action: leer_archivo_readme
-                Action Input: {{}}
+                Action Input: {{"nombre_proyecto": "{nombre_proyecto}"}}
 
                 **SECCIONES OBLIGATORIAS QUE DEBES VALIDAR**:
                 1. DESCRIPCIÓN - Explica qué hace el sistema
