@@ -1,15 +1,22 @@
-from crewai import Agent
+from crewai import Agent, LLM
 from textwrap import dedent
 
 from tools.escribir_archivo_readme import escribir_archivo_readme_tool
 from tools.leer_archivo_readme import leer_archivo_readme_tool
+from tools.inicializar_repositorio_git import inicializar_repositorio_git_tool
 custom_tool = escribir_archivo_readme_tool
 
 class AgentesGeneradoresPoC:
     def __init__(self):
-        # CrewAI maneja Ollama con el formato de string "ollama/nombre_modelo"
-        self.llm_rapido = "ollama/deepseek7b:latest"
-        self.llm_potente = "ollama/qwen7b:latest"
+        # Configuración de LLMs con timeout aumentado a 1200 segundos (20 minutos)
+        self.llm_rapido = LLM(
+            model="ollama/deepseek7b:latest",
+            timeout=1200,  # 20 minutos
+        )
+        self.llm_potente = LLM(
+            model="ollama/qwen7b:latest",
+            timeout=1200,  # 20 minutos
+        )
     def agente_arquitecto(self):
         return Agent(
             role="Arquitecto de Sistemas Senior y Documentador Técnico",
@@ -59,17 +66,30 @@ class AgentesGeneradoresPoC:
             llm=self.llm_rapido,
         )
 
-    def agent_2_name(self):
+    def agente_integrador_git(self):
         return Agent(
-            role="Define agent 2 role here",
-            backstory=dedent(f"""Define agent 2 backstory here"""),
-            goal=dedent(f"""Define agent 2 goal here"""),
-            # tools=[tool_1, tool_2],
+            role="Integrador Git y Especialista en Control de Versiones",
+            backstory=dedent(f"""
+                            Experto en gestión de repositorios Git y control de versiones.
+                            Especialista en la inicialización de proyectos, configuración de repositorios
+                            y creación de commits estructurados siguiendo convenciones profesionales.
+                            Mantiene historial limpio y organizado, asegurando que cada cambio esté
+                            debidamente documentado. Conoce las mejores prácticas para archivos .gitignore,
+                            estructura de commits y mensajes descriptivos que facilitan la colaboración
+                            en equipo."""),
+            
+            goal=dedent(f"""
+                        1. Inicializar un repositorio Git en el directorio del proyecto.
+                        2. Crear un archivo .gitignore apropiado para proyectos Python/FastAPI.
+                        3. Realizar el commit inicial con todos los archivos generados por el arquitecto.
+                        4. Asegurar que el README.md validado por el revisor esté incluido en el repositorio.
+                        5. Documentar el estado del repositorio y confirmar que está listo para desarrollo."""),
+            tools=[inicializar_repositorio_git_tool],
             allow_delegation=False,
             verbose=True,
-            llm=self.llm_rapido,
+            llm=self.llm_potente,
         )
-    
+
     def agent_3_name(self):
         return Agent(
             role="Define agent 3 role here",

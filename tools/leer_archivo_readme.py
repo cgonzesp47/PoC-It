@@ -1,25 +1,25 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from crewai.tools.base_tool import BaseTool
+import os
 
 
 class LeerArchivoReadmeArgs(BaseModel):
-    # Esta herramienta no necesita argumentos, pero CrewAI requiere un esquema
-    # Dejamos la clase vacía con pass o sin campos
-    pass
+    nombre_proyecto: str = Field(..., description="Nombre del proyecto para localizar el directorio")
 
 
 class LeerArchivoReadmeTool(BaseTool):
     name: str = "leer_archivo_readme"
-    description: str = "Lee el contenido del archivo README.md que se ha generado."
+    description: str = "Lee el contenido del archivo README.md desde ./output/{nombre_proyecto}/."
     args_schema: type[BaseModel] = LeerArchivoReadmeArgs
 
-    def _run(self, **kwargs) -> str:
+    def _run(self, nombre_proyecto: str, **kwargs) -> str:
         try:
-            with open("README.md", "r", encoding="utf-8") as f:
+            readme_path = os.path.join("output", nombre_proyecto, "README.md")
+            with open(readme_path, "r", encoding="utf-8") as f:
                 contenido = f.read()
             return contenido
         except FileNotFoundError:
-            return "Error: El archivo README.md no existe aún."
+            return f"Error: El archivo README.md no existe en output/{nombre_proyecto}/"
         except Exception as e:
             return f"Error al leer el archivo: {str(e)}"
 

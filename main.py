@@ -4,6 +4,7 @@ from textwrap import dedent
 from agents import AgentesGeneradoresPoC
 from tools.escribir_archivo_readme import escribir_archivo_readme_tool
 from tools.leer_archivo_readme import leer_archivo_readme_tool
+from tools.inicializar_repositorio_git import inicializar_repositorio_git_tool
 from tasks import TareasGeneracionPoC
 
 # Evitar error de CrewAI buscando OPENAI_API_KEY
@@ -29,6 +30,7 @@ class CustomCrew:
         # Define your custom agents and tasks here
         agente_arquitecto = agents.agente_arquitecto()
         agente_revisor = agents.agente_revisor()
+        agente_integrador = agents.agente_integrador_git()
         herramienta_escritura = escribir_archivo_readme_tool
 
         # Custom tasks include agent name and variables as input
@@ -36,18 +38,26 @@ class CustomCrew:
         tarea_diseño_arq = tasks.tarea_diseño_arq(
             agente_arquitecto,
             datos_plantilla,
+            self.nombre,
             herramienta_escritura,
         )
         
         tarea_revision_readme = tasks.tarea_revision_readme(
             agente_revisor,
+            self.nombre,
             leer_archivo_readme_tool,
         )
-
+        
+        tarea_integracion_git = tasks.tarea_integracion_git(
+            agente_integrador,
+            self.nombre,
+            inicializar_repositorio_git_tool,
+        )
+        
         # Define your custom crew here
         crew = Crew(
-            agents=[agente_arquitecto, agente_revisor],
-            tasks=[tarea_diseño_arq, tarea_revision_readme],
+            agents=[agente_arquitecto, agente_revisor, agente_integrador],
+            tasks=[tarea_diseño_arq, tarea_revision_readme, tarea_integracion_git],
             verbose=True,
         )
 
@@ -67,6 +77,9 @@ if __name__ == "__main__":
     custom_crew = CustomCrew(nombre, objetivo, entidades, acciones, reglas)
     result = custom_crew.run()
     print("\n\n########################")
-    print("\nProceso finalizado. Revisa tu carpeta para ver el README.md.")    
+    print("\nProceso finalizado. Revisa la carpeta output/ para ver:")
+    print(f"  - output/{nombre}/ (directorio del proyecto)")
+    print(f"  - output/{nombre}/README.md (documentación)")
+    print(f"  - output/{nombre}/.git/ (repositorio inicializado)")    
     print("########################\n")
     print(result)
