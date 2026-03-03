@@ -6,7 +6,7 @@ class TareasGeneracionPoC:
     def __tip_section(self):
         return "If you do your BEST WORK, I'll give you a $10,000 commission!"
 
-    def tarea_diseño_arq(self, agente_arquitecto, datos_plantilla, herramienta_escritura):
+    def tarea_diseño_arq(self, agente_arquitecto, datos_plantilla, nombre_proyecto, herramienta_escritura):
         return Task(
             description=dedent(
                 f"""
@@ -25,7 +25,7 @@ class TareasGeneracionPoC:
 
                 **FORMATO OBLIGATORIO**:
                 Action: escribir_archivo_readme
-                Action Input: {{"contenido": "<README COMPLETO, NO SOLO EL ESQUEMA>"}}
+                Action Input: {{"contenido": "<README COMPLETO, NO SOLO EL ESQUEMA>", "nombre_proyecto": "{nombre_proyecto}"}}
 
                 **CONTENIDO MÍNIMO DEL README** (TODAS LAS SECCIONES SON OBLIGATORIAS):
                 
@@ -72,7 +72,7 @@ class TareasGeneracionPoC:
             tools=[herramienta_escritura],
         )
 
-    def tarea_revision_readme(self, agente_revisor, herramienta_lectura):
+    def tarea_revision_readme(self, agente_revisor, nombre_proyecto, herramienta_lectura):
         return Task(
             description=dedent(
                 f"""
@@ -85,7 +85,7 @@ class TareasGeneracionPoC:
 
                 **FORMATO OBLIGATORIO**:
                 Action: leer_archivo_readme
-                Action Input: {{}}
+                Action Input: {{"nombre_proyecto": "{nombre_proyecto}"}}
 
                 **SECCIONES OBLIGATORIAS QUE DEBES VALIDAR**:
                 1. DESCRIPCIÓN - Explica qué hace el sistema
@@ -107,6 +107,40 @@ class TareasGeneracionPoC:
             expected_output="Resultado final de validación: APROBADO o RECHAZADO con detalles específicos",
             agent=agente_revisor,
             tools=[herramienta_lectura],
+        )
+
+    def tarea_integracion_git(self, agente_integrador, nombre_proyecto, herramienta_git):
+        return Task(
+            description=dedent(
+                f"""
+                **Tarea**: Integración con Git y Control de Versiones
+                **Descripción**: Inicializar un repositorio Git en el directorio del proyecto
+                y realizar el commit inicial con toda la documentación generada y validada.
+                
+                **INSTRUCCIÓN CRÍTICA**: Debes EJECUTAR obligatoriamente la herramienta 'inicializar_repositorio_git' 
+                para crear el repositorio y hacer el commit inicial. No describas lo que harías; ejecútalo.
+
+                **FORMATO OBLIGATORIO**:
+                Action: inicializar_repositorio_git
+                Action Input: {{"nombre_proyecto": "{nombre_proyecto}"}}
+
+                **RESULTADO ESPERADO**:
+                1. Repositorio Git inicializado en el directorio actual
+                2. Archivo .gitignore creado con configuración para Python/FastAPI
+                3. Commit inicial realizado con el README.md y archivos existentes
+                4. Confirmación de la ubicación del repositorio
+                
+                **Entregables**:
+                - Ruta del repositorio local creado
+                - Mensaje del commit inicial
+                - Instrucciones para vincular a repositorio remoto (si se desea)
+                
+                **Nota**: {self.__tip_section()}
+                """
+            ),
+            expected_output="Confirmación de repositorio Git inicializado con ubicación y detalles del commit",
+            agent=agente_integrador,
+            tools=[herramienta_git],
         )
 
     def task_2_name(self, agent):
