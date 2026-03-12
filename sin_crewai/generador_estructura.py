@@ -21,14 +21,11 @@ def generar_estructura_json(nombre: str, objetivo: str, funcionalidades: str, re
         dict: Estructura del proyecto en formato JSON
     """
     
-    prompt = f"""Genera un JSON con la estructura de archivos para esta API FastAPI:
+    prompt = f"""Genera un JSON simple con SOLO la lista de archivos para esta API FastAPI:
 
 PROYECTO: {nombre}
-PROPÓSITO: {objetivo}
-FUNCIONALIDADES: {funcionalidades}
-RESTRICCIONES: {restricciones}
 
-ARCHIVOS MÍNIMOS REQUERIDOS (incluye TODOS estos):
+Archivos requeridos (placeholder simple en cada uno):
 - main.py
 - app/__init__.py
 - app/api.py
@@ -39,21 +36,21 @@ ARCHIVOS MÍNIMOS REQUERIDOS (incluye TODOS estos):
 - requirements.txt
 - .gitignore
 
-REGLAS CRÍTICAS:
-- NO uses bases de datos (ni SQLAlchemy, ni SQLite, ni ninguna BD)
-- Usa almacenamiento EN MEMORIA: listas o diccionarios globales
-- Los modelos deben ser Pydantic (from pydantic import BaseModel)
-- El código debe ser funcional y ejecutable
-- Responde SOLO el JSON, sin explicaciones adicionales
+Genera un JSON con placeholders BREVES:
 
-FORMATO EXACTO (sin indentación extra):
 {{
-"main.py": "código completo",
-"app/models.py": "modelos Pydantic con BaseModel",
-...
+"main.py": "# FastAPI main application",
+"app/__init__.py": "# App package",
+"app/api.py": "# API routes",
+"app/models.py": "# Data models",
+"app/schemas.py": "# Request/response schemas",
+"tests/__init__.py": "",
+"tests/test_api.py": "# API tests",
+"requirements.txt": "fastapi\\nuvicorn[standard]\\npydantic\\npytest\\nhttpx",
+".gitignore": "__pycache__/\\n*.pyc\\nvenv/\\n.env"
 }}
 
-JSON:"""
+Responde SOLO el JSON exacto:"""
 
     print("  > Generando estructura JSON con Ollama...")
     
@@ -64,8 +61,8 @@ JSON:"""
             'content': prompt
         }],
         options={
-            'temperature': 0.2,
-            'num_predict': 3000,
+            'temperature': 0.1,
+            'num_predict': 500,
         }
     )
     

@@ -9,6 +9,8 @@ import time
 from sin_crewai.generador_readme import generar_readme_basico, guardar_readme
 from sin_crewai.generador_estructura import generar_estructura_json, añadir_json_a_readme
 from sin_crewai.materializador import materializar_estructura
+from sin_crewai.generador_codigo import rellenar_archivos_con_codigo
+from sin_crewai.validador import validar_y_corregir_archivos
 from sin_crewai.integrador_git import inicializar_git
 
 
@@ -40,23 +42,34 @@ def generar_poc(nombre: str, objetivo: str, actores: str, funcionalidades: str, 
     añadir_json_a_readme(ruta_readme, estructura)
     print("[OK] Fase 2 completada\n")
     
-    # FASE 3: Materializar estructura
+    # FASE 3: Materializar estructura (esqueletos vacíos)
     print("[FASE 3] Creando archivos del proyecto...")
     archivos_creados = materializar_estructura(nombre, estructura)
     print("[OK] Fase 3 completada\n")
     
-    # FASE 4: Inicializar Git
-    print("[FASE 4] Inicializando control de versiones...")
+    # FASE 4: Rellenar archivos con código funcional
+    print("[FASE 4] Generando codigo funcional...")
+    archivos_rellenados = rellenar_archivos_con_codigo(nombre, objetivo, funcionalidades, restricciones, estructura)
+    print("[OK] Fase 4 completada\n")
+    
+    # FASE 5: Validar y corregir código
+    print("[FASE 5] Validando codigo generado...")
+    reporte_validacion = validar_y_corregir_archivos(nombre, estructura)
+    print("[OK] Fase 5 completada\n")
+    
+    # FASE 6: Inicializar Git
+    print("[FASE 6] Inicializando control de versiones...")
     git_ok = inicializar_git(nombre)
     if git_ok:
-        print("[OK] Fase 4 completada\n")
+        print("[OK] Fase 6 completada\n")
     else:
-        print("[WARNING] Fase 4 con errores (Git no disponible o fallo)\n")
+        print("[WARNING] Fase 6 con errores (Git no disponible o fallo)\n")
     
     return {
         'nombre': nombre,
         'readme': ruta_readme,
         'archivos': archivos_creados,
+        'validacion': reporte_validacion,
         'git': git_ok
     }
 

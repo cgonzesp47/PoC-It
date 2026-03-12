@@ -52,7 +52,7 @@ README.md:"""
         }],
         options={
             'temperature': 0.3,
-            'num_predict': 600,
+            'num_predict': 700,
         }
     )
     
