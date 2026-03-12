@@ -6,6 +6,58 @@ import ollama
 import os
 
 
+def _generar_requirements_contextuales(objetivo: str, funcionalidades: str) -> str:
+    """
+    Genera requirements.txt con dependencias según el contexto del proyecto.
+    
+    Args:
+        objetivo: Objetivo del proyecto
+        funcionalidades: Funcionalidades del proyecto
+        
+    Returns:
+        str: Contenido del requirements.txt
+    """
+    # Dependencias base siempre presentes
+    deps = [
+        'fastapi>=0.104.0',
+        'uvicorn[standard]>=0.24.0',
+        'pydantic>=2.0.0',
+        'pytest>=7.4.0',
+        'httpx>=0.25.0'
+    ]
+    
+    texto_completo = (objetivo + " " + funcionalidades).lower()
+    
+    # Detectar necesidad de python-multipart (upload de archivos)
+    if any(word in texto_completo for word in ['upload', 'file', 'archivo', 'fichero', 'multipart']):
+        deps.append('python-multipart>=0.0.6')
+    
+    # Detectar necesidad de Google Cloud
+    if any(word in texto_completo for word in ['google drive', 'google cloud', 'gcp', 'cloud run', 'service account']):
+        deps.append('google-cloud-storage>=2.10.0')
+        deps.append('google-auth>=2.23.0')
+        deps.append('google-api-python-client>=2.100.0')  # Para googleapiclient.discovery
+    
+    # Detectar necesidad de AWS
+    if any(word in texto_completo for word in ['aws', 's3', 'boto3', 'amazon']):
+        deps.append('boto3>=1.28.0')
+    
+    # Detectar necesidad de base de datos
+    if any(word in texto_completo for word in ['database', 'postgres', 'postgresql', 'sql']):
+        deps.append('sqlalchemy>=2.0.0')
+        deps.append('psycopg2-binary>=2.9.0')
+    
+    if any(word in texto_completo for word in ['mongo', 'mongodb']):
+        deps.append('pymongo>=4.5.0')
+    
+    # Detectar necesidad de JWT/Auth
+    if any(word in texto_completo for word in ['jwt', 'auth', 'token', 'oauth']):
+        deps.append('python-jose[cryptography]>=3.3.0')
+        deps.append('passlib[bcrypt]>=1.7.4')
+    
+    return '\n'.join(deps)
+
+
 def generar_codigo_para_archivo(
     nombre_proyecto: str,
     ruta_archivo: str,
@@ -29,12 +81,15 @@ def generar_codigo_para_archivo(
         str: Código funcional generado
     """
     
+    # Generar requirements.txt contextual
+    if ruta_archivo == 'requirements.txt':
+        return _generar_requirements_contextuales(objetivo, funcionalidades)
+    
     # Archivos que no necesitan código complejo
     archivos_simples = {
         'tests/__init__.py': '',
         'app/__init__.py': 'from app.api import router',
         '.gitignore': '__pycache__/\n*.pyc\n*.pyo\n*.pyd\n.Python\nvenv/\n.env\n*.log\n.pytest_cache/\n*.db',
-        'requirements.txt': 'fastapi>=0.104.0\nuvicorn[standard]>=0.24.0\npydantic>=2.0.0\npytest>=7.4.0\nhttpx>=0.25.0'
     }
     
     if ruta_archivo in archivos_simples:
@@ -56,27 +111,74 @@ def generar_codigo_para_archivo(
     
     print(f"    > Generando código para {ruta_archivo}...")
     
-    response = ollama.chat(
-        model='qwen7b:latest',
-        messages=[{
-            'role': 'user',
-            'content': prompt
-        }],
-        options={
-            'temperature': 0.2,
-            'num_predict': 800,
-        }
-    )
+    MAX_REINTENTOS = 2
+    codigo = ""  # Inicializar para evitar unbound variable
     
-    codigo = response['message']['content'].strip()
+    for intento in range(MAX_REINTENTOS):
+        response = ollama.chat(
+            model='qwen7b:latest',
+            messages=[{
+                'role': 'user',
+                'content': prompt
+            }],
+            options={
+                'temperature': 0.2,
+                'num_predict': 2500,  # Aumentado de 800 a 2500 para PoCs complejas
+            }
+        )
+        
+        codigo = response['message']['content'].strip()
+        
+        # Limpiar si viene con markdown
+        if codigo.startswith('```python'):
+            codigo = codigo.replace('```python', '').replace('```', '').strip()
+        elif codigo.startswith('```'):
+            codigo = codigo.replace('```', '').strip()
+        
+        # Detectar si el código está truncado
+        if _esta_truncado(codigo):
+            print(f"    [WARN] Código posiblemente truncado, reintentando ({intento+1}/{MAX_REINTENTOS})...")
+            continue
+        
+        return codigo
     
-    # Limpiar si viene con markdown
-    if codigo.startswith('```python'):
-        codigo = codigo.replace('```python', '').replace('```', '').strip()
-    elif codigo.startswith('```'):
-        codigo = codigo.replace('```', '').strip()
-    
+    # Si todos los intentos fallan, retornar el último intento
+    print(f"    [WARN] Usando código del último intento (puede estar incompleto)")
     return codigo
+
+
+def _esta_truncado(codigo: str) -> bool:
+    """
+    Detecta si el código parece estar truncado o incompleto.
+    
+    Args:
+        codigo: Código Python a validar
+        
+    Returns:
+        bool: True si el código parece truncado
+    """
+    if not codigo:
+        return True
+    
+    lineas = codigo.strip().split('\n')
+    if not lineas:
+        return True
+    
+    ultima_linea = lineas[-1].strip()
+    
+    # Señales de truncamiento
+    truncamiento_signals = [
+        ultima_linea.endswith((',', '(', '[', '{', '\\')),
+        'def ' in ultima_linea and ':' not in ultima_linea,
+        'class ' in ultima_linea and ':' not in ultima_linea,
+        codigo.count('"""') % 2 != 0,  # Docstring sin cerrar
+        codigo.count("'''") % 2 != 0,  # Docstring alternativo sin cerrar
+        codigo.count('(') != codigo.count(')'),  # Paréntesis desbalanceados
+        codigo.count('[') != codigo.count(']'),  # Corchetes desbalanceados
+        codigo.count('{') != codigo.count('}'),  # Llaves desbalanceadas
+    ]
+    
+    return any(truncamiento_signals)
 
 
 def _get_prompt_main(nombre: str) -> str:
@@ -89,7 +191,9 @@ Requisitos:
 - Incluir el router
 - Añadir endpoint raíz GET / que retorne mensaje de bienvenida
 
-Responde SOLO el código Python, sin explicaciones:"""
+IMPORTANTE: SOLO código Python puro. Todos los comentarios con #. Sin texto explicativo al final.
+
+Genera el código:"""
 
 
 def _get_prompt_models(nombre: str, objetivo: str, funcionalidades: str) -> str:
@@ -106,7 +210,9 @@ Requisitos:
 - Usa Optional para campos opcionales
 - Añade ejemplos en Field() si es útil
 
-Responde SOLO el código Python, sin explicaciones:"""
+IMPORTANTE: SOLO código Python puro. Todos los comentarios con #. Sin texto explicativo al final.
+
+Genera el código:"""
 
 
 def _get_prompt_schemas(nombre: str, objetivo: str, funcionalidades: str) -> str:
@@ -123,43 +229,49 @@ Requisitos:
 - Usa Pydantic BaseModel
 - Hereda de los modelos cuando sea apropiado
 
-Responde SOLO el código Python, sin explicaciones:"""
+IMPORTANTE: SOLO código Python puro. Todos los comentarios con #. Sin texto explicativo al final.
+
+Genera el código:"""
 
 
 def _get_prompt_api(nombre: str, objetivo: str, funcionalidades: str, restricciones: str) -> str:
-    return f"""Genera el archivo app/api.py con rutas CRUD funcionales para esta API:
+    # Condensar contexto para dejar más espacio a la generación de código
+    objetivo_resumido = objetivo[:300] + "..." if len(objetivo) > 300 else objetivo
+    funcionalidades_resumidas = funcionalidades[:400] + "..." if len(funcionalidades) > 400 else funcionalidades
+    restricciones_resumidas = restricciones[:250] + "..." if len(restricciones) > 250 else restricciones
+    
+    return f"""Genera app/api.py para FastAPI: {nombre}
 
-PROYECTO: {nombre}
-PROPÓSITO: {objetivo}
-FUNCIONALIDADES: {funcionalidades}
-RESTRICCIONES: {restricciones}
+CONTEXTO:
+{objetivo_resumido}
 
-Requisitos CRÍTICOS:
-- Usa APIRouter de FastAPI
-- Almacenamiento EN MEMORIA: listas/diccionarios globales al inicio del archivo
-- Implementa operaciones CRUD básicas según las funcionalidades
-- Maneja errores con HTTPException
-- Usa los schemas correctos en las rutas
-- Implementa TODAS las restricciones de negocio mencionadas
-- Código funcional y ejecutable
+QUÉ DEBE HACER:
+{funcionalidades_resumidas}
 
-EJEMPLO:
+REGLAS:
+{restricciones_resumidas}
+
+ESTRUCTURA OBLIGATORIA:
 ```python
 from fastapi import APIRouter, HTTPException
-from app.models import Item
-from app.schemas import ItemCreate
+from app.schemas import ...
 
 router = APIRouter()
-items = []  # Almacenamiento en memoria
+# Almacenamiento en memoria aquí
 
-@router.post("/items", response_model=Item)
-def create_item(item: ItemCreate):
-    new_item = Item(id=len(items)+1, **item.dict())
-    items.append(new_item)
-    return new_item
+@router.post("/endpoint")
+def funcion(param: Schema):
+    # Implementación con validaciones
+    pass
 ```
 
-Responde SOLO el código Python funcional, sin explicaciones:"""
+IMPORTANTE - REGLAS DE FORMATO:
+1. SOLO código Python - NINGÚN texto explicativo fuera del código
+2. TODOS los comentarios deben empezar con # (numeral)
+3. PROHIBIDO incluir bloques "NOTAS:" o listas sin #
+4. NO agregues secciones explicativas al final
+
+GENERA CÓDIGO COMPLETO Y FUNCIONAL (solo código Python puro):"""
 
 
 def _get_prompt_tests(nombre: str, funcionalidades: str) -> str:
@@ -175,7 +287,9 @@ Requisitos:
 - Verifica códigos de estado
 - Verifica estructura de respuestas
 
-Responde SOLO el código Python, sin explicaciones:"""
+IMPORTANTE: SOLO código Python puro. Todos los comentarios con #. Sin texto explicativo al final.
+
+Genera el código:"""
 
 
 def rellenar_archivos_con_codigo(
@@ -198,6 +312,7 @@ def rellenar_archivos_con_codigo(
     Returns:
         int: Número de archivos rellenados
     """
+    from sin_crewai.validador import _limpiar_codigo_generado
     
     directorio_base = f"output/{nombre_proyecto}"
     archivos_rellenados = 0
@@ -213,6 +328,16 @@ def rellenar_archivos_con_codigo(
             restricciones,
             estructura
         )
+        
+        # CRÍTICO: Limpiar código ANTES de escribirlo al archivo
+        # Esto elimina duplicaciones, texto sin comentar, etc.
+        if ruta_archivo.endswith('.py'):
+            codigo_original_len = len(codigo.split('\n'))
+            codigo = _limpiar_codigo_generado(codigo)
+            codigo_limpio_len = len(codigo.split('\n'))
+            
+            if codigo_original_len != codigo_limpio_len:
+                print(f"    [LIMPIEZA] {ruta_archivo}: {codigo_original_len} → {codigo_limpio_len} líneas")
         
         ruta_completa = os.path.join(directorio_base, ruta_archivo)
         
