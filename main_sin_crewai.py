@@ -54,7 +54,14 @@ def generar_poc(nombre: str, objetivo: str, actores: str, funcionalidades: str, 
     
     # FASE 5: Validar y corregir código
     print("[FASE 5] Validando codigo generado...")
-    reporte_validacion = validar_y_corregir_archivos(nombre, estructura)
+    # Agregar contexto completo a estructura para reintentos y fallbacks inteligentes
+    estructura_con_contexto = {
+        **estructura,
+        'objetivo': objetivo,
+        'funcionalidades': funcionalidades,
+        'restricciones': restricciones
+    }
+    reporte_validacion = validar_y_corregir_archivos(nombre, estructura_con_contexto, modo_reintento=True)
     print("[OK] Fase 5 completada\n")
     
     # FASE 6: Inicializar Git
