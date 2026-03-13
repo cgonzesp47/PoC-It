@@ -6,56 +6,84 @@ import ollama
 import os
 
 
-def _generar_requirements_contextuales(objetivo: str, funcionalidades: str) -> str:
+def _generar_requirements_contextuales(tecnologias: str) -> str:
     """
-    Genera requirements.txt con dependencias según el contexto del proyecto.
+    Genera requirements.txt con dependencias según las tecnologías especificadas.
+    Usa el LLM para inferir las dependencias necesarias (sin hardcodeo).
     
     Args:
-        objetivo: Objetivo del proyecto
-        funcionalidades: Funcionalidades del proyecto
+        tecnologias: Tecnologías solicitadas (separadas por comas)
         
     Returns:
         str: Contenido del requirements.txt
     """
-    # Dependencias base siempre presentes
-    deps = [
-        'fastapi>=0.104.0',
-        'uvicorn[standard]>=0.24.0',
-        'pydantic>=2.0.0',
-        'pytest>=7.4.0',
-        'httpx>=0.25.0'
-    ]
     
-    texto_completo = (objetivo + " " + funcionalidades).lower()
+    # Si no hay tecnologías específicas, solo base
+    if not tecnologias or tecnologias.lower().strip() in ['ninguna', 'no', 'none']:
+        return '''fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+pytest>=7.4.0
+httpx>=0.25.0'''
     
-    # Detectar necesidad de python-multipart (upload de archivos)
-    if any(word in texto_completo for word in ['upload', 'file', 'archivo', 'fichero', 'multipart']):
-        deps.append('python-multipart>=0.0.6')
+    # Usar LLM para inferir dependencias
+    prompt = f"""Genera requirements.txt para una API FastAPI que necesita estas tecnologías: {tecnologias}
+
+REGLAS ESTRICTAS:
+1. SIEMPRE incluir dependencias base: fastapi, uvicorn[standard], pydantic, pytest, httpx
+2. Añadir SOLO las dependencias necesarias para las tecnologías especificadas
+3. Usar versiones recientes (>=X.Y.Z)
+4. Formato: una dependencia por línea (paquete>=version)
+5. NO incluir comentarios, NO incluir explicaciones
+6. Si una tecnología necesita múltiples paquetes, incluir todos
+
+FORMATO ESPERADO:
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+...
+
+Genera SOLO el requirements.txt (sin texto adicional):"""
     
-    # Detectar necesidad de Google Cloud
-    if any(word in texto_completo for word in ['google drive', 'google cloud', 'gcp', 'cloud run', 'service account']):
-        deps.append('google-cloud-storage>=2.10.0')
-        deps.append('google-auth>=2.23.0')
-        deps.append('google-api-python-client>=2.100.0')  # Para googleapiclient.discovery
+    print(f"    > Infiriendo dependencias para: {tecnologias}")
     
-    # Detectar necesidad de AWS
-    if any(word in texto_completo for word in ['aws', 's3', 'boto3', 'amazon']):
-        deps.append('boto3>=1.28.0')
-    
-    # Detectar necesidad de base de datos
-    if any(word in texto_completo for word in ['database', 'postgres', 'postgresql', 'sql']):
-        deps.append('sqlalchemy>=2.0.0')
-        deps.append('psycopg2-binary>=2.9.0')
-    
-    if any(word in texto_completo for word in ['mongo', 'mongodb']):
-        deps.append('pymongo>=4.5.0')
-    
-    # Detectar necesidad de JWT/Auth
-    if any(word in texto_completo for word in ['jwt', 'auth', 'token', 'oauth']):
-        deps.append('python-jose[cryptography]>=3.3.0')
-        deps.append('passlib[bcrypt]>=1.7.4')
-    
-    return '\n'.join(deps)
+    try:
+        response = ollama.chat(
+            model='qwen7b:latest',
+            messages=[{'role': 'user', 'content': prompt}],
+            options={
+                'temperature': 0.1,
+                'num_predict': 500
+            }
+        )
+        
+        contenido = response['message']['content'].strip()
+        
+        # Limpiar si viene con markdown
+        if '```' in contenido:
+            contenido = contenido.split('```')[1]
+            if contenido.startswith('txt') or contenido.startswith('python'):
+                contenido = '\n'.join(contenido.split('\n')[1:])
+        
+        # Validar que tenga al menos las dependencias base
+        if 'fastapi' not in contenido.lower():
+            print(f"    [WARN] LLM no incluyó dependencias base, usando fallback")
+            return '''fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+pytest>=7.4.0
+httpx>=0.25.0'''
+        
+        return contenido.strip()
+        
+    except Exception as e:
+        print(f"    [ERROR] Error al generar requirements: {e}")
+        # Fallback a dependencias base
+        return '''fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+pytest>=7.4.0
+httpx>=0.25.0'''
 
 
 def generar_codigo_para_archivo(
@@ -64,7 +92,8 @@ def generar_codigo_para_archivo(
     objetivo: str,
     funcionalidades: str,
     restricciones: str,
-    estructura_completa: dict
+    estructura_completa: dict,
+    tecnologias: str = "ninguna"
 ) -> str:
     """
     Genera código funcional para un archivo específico.
@@ -76,6 +105,7 @@ def generar_codigo_para_archivo(
         funcionalidades: Funcionalidades del sistema
         restricciones: Restricciones del sistema
         estructura_completa: Estructura completa del proyecto para contexto
+        tecnologias: Tecnologías/integraciones necesarias
         
     Returns:
         str: Código funcional generado
@@ -83,7 +113,7 @@ def generar_codigo_para_archivo(
     
     # Generar requirements.txt contextual
     if ruta_archivo == 'requirements.txt':
-        return _generar_requirements_contextuales(objetivo, funcionalidades)
+        return _generar_requirements_contextuales(tecnologias)
     
     # Archivos que no necesitan código complejo
     archivos_simples = {
@@ -297,7 +327,8 @@ def rellenar_archivos_con_codigo(
     objetivo: str,
     funcionalidades: str,
     restricciones: str,
-    estructura: dict
+    estructura: dict,
+    tecnologias: str = "ninguna"
 ) -> int:
     """
     Rellena todos los archivos del proyecto con código funcional.
@@ -308,6 +339,7 @@ def rellenar_archivos_con_codigo(
         funcionalidades: Funcionalidades del sistema
         restricciones: Restricciones del sistema
         estructura: Estructura de archivos del proyecto
+        tecnologias: Tecnologías/integraciones necesarias
         
     Returns:
         int: Número de archivos rellenados
@@ -326,7 +358,8 @@ def rellenar_archivos_con_codigo(
             objetivo,
             funcionalidades,
             restricciones,
-            estructura
+            estructura,
+            tecnologias
         )
         
         # CRÍTICO: Limpiar código ANTES de escribirlo al archivo

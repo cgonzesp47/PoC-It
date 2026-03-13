@@ -184,114 +184,79 @@ def _limpiar_codigo_generado(codigo: str) -> str:
     return '\n'.join(codigo_final)
 
 
-def generar_codigo_fallback(nombre_archivo: str, nombre_proyecto: str = "", objetivo: str = "") -> str:
+def generar_codigo_fallback(nombre_archivo: str, nombre_proyecto: str = "", tecnologias: str = "") -> str:
     """
     Genera código fallback contextual para archivos con errores.
+    Usa el LLM para generar código apropiado sin hardcodeo de tecnologías.
     
     Args:
         nombre_archivo: Nombre del archivo
         nombre_proyecto: Nombre del proyecto (para contexto)
-        objetivo: Objetivo del proyecto (para detectar keywords)
+        tecnologias: Tecnologías especificadas
         
     Returns:
         str: Código fallback apropiado según el contexto
     """
     
-    # Fallback contextual para api.py
-    if nombre_archivo == 'app/api.py' and objetivo:
-        keywords_lower = objetivo.lower()
-        
-        # PoCs de autenticación/Google Drive/OAuth/Storage
-        if any(word in keywords_lower for word in ['google drive', 'oauth', 'upload', 'file', 'storage', 'service account', 'cloud']):
-            return '''from fastapi import APIRouter, UploadFile, File, HTTPException, status
-from typing import List
-import logging
+    # Para api.py, intentar generar código contextual con LLM
+    if nombre_archivo == 'app/api.py' and tecnologias and tecnologias.lower() != 'ninguna':
+        try:
+            import ollama
+            
+            prompt = f"""Genera app/api.py fallback para una API FastAPI que usa: {tecnologias}
 
-router = APIRouter()
-logger = logging.getLogger(__name__)
+REQUISITOS:
+- Código simple y funcional (sin integraciones reales)
+- Usar almacenamiento en memoria (listas/dicts)
+- APIRouter con endpoints básicos
+- Incluir endpoint /health
+- SOLO imports estándar de FastAPI (no importar librerías de {tecnologias})
 
-uploaded_files = []
-
-@router.post("/upload", status_code=status.HTTP_201_CREATED)
-async def upload_file(file: UploadFile = File(...)):
-    """Subir archivo"""
-    try:
-        file_info = {
-            "id": len(uploaded_files) + 1,
-            "filename": file.filename,
-            "content_type": file.content_type,
-            "status": "uploaded"
-        }
-        uploaded_files.append(file_info)
-        logger.info(f"Archivo: {file.filename}")
-        return file_info
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/files")
-def list_files():
-    """Listar archivos"""
-    return {"files": uploaded_files, "total": len(uploaded_files)}
-
-@router.get("/health")
-def health_check():
-    return {"status": "ok"}
-'''
-        
-        # PoCs de préstamos/alquiler
-        elif any(word in keywords_lower for word in ['préstamo', 'alquiler', 'rent', 'borrow', 'loan']):
-            return '''from fastapi import APIRouter, HTTPException, status
+ESTRUCTURA:
+```python
+from fastapi import APIRouter, HTTPException
 from typing import List
 
 router = APIRouter()
 
-items_db = []
-loans_db = []
-item_counter = 0
-loan_counter = 0
-
-@router.post("/items", status_code=status.HTTP_201_CREATED)
-def create_item(name: str, description: str = None):
-    """Crear ítem"""
-    global item_counter
-    item_counter += 1
-    item = {"id": item_counter, "name": name, "description": description, "available": True}
-    items_db.append(item)
-    return item
-
-@router.get("/items")
-def list_items(available: bool = None):
-    """Listar ítems"""
-    if available is not None:
-        return [i for i in items_db if i["available"] == available]
-    return items_db
-
-@router.post("/loans", status_code=status.HTTP_201_CREATED)
-def create_loan(item_id: int, user: str):
-    """Crear préstamo"""
-    global loan_counter
-    item = next((i for i in items_db if i["id"] == item_id), None)
-    if not item:
-        raise HTTPException(status_code=404, detail="Ítem no encontrado")
-    if not item["available"]:
-        raise HTTPException(status_code=400, detail="No disponible")
-    
-    loan_counter += 1
-    loan = {"id": loan_counter, "item_id": item_id, "user": user, "status": "active"}
-    loans_db.append(loan)
-    item["available"] = False
-    return loan
-
-@router.get("/loans")
-def list_loans():
-    """Listar préstamos"""
-    return loans_db
+# Variables en memoria
+items = []
 
 @router.get("/health")
-def health_check():
-    return {"status": "ok"}
-'''
+def health():
+    return {{"status": "ok"}}
+
+# Más endpoints...
+```
+
+IMPORTANTE: SOLO código Python. Sin texto explicativo.
+
+Genera el código:"""
+            
+            response = ollama.chat(
+                model='qwen7b:latest',
+                messages=[{'role': 'user', 'content': prompt}],
+                options={'temperature': 0.1, 'num_predict': 800}
+            )
+            
+            codigo = response['message']['content'].strip()
+            
+            # Limpiar markdown
+            if codigo.startswith('```python'):
+                codigo = codigo.replace('```python', '').replace('```', '').strip()
+            elif codigo.startswith('```'):
+                codigo = codigo.replace('```', '').strip()
+            
+            # Validar que sea código válido
+            try:
+                import ast
+                ast.parse(codigo)
+                return codigo
+            except:
+                print(f"    [WARN] Código LLM inválido, usando fallback genérico")
+        
+        except Exception as e:
+            print(f"    [WARN] Error al generar con LLM: {e}, usando fallback genérico")
     
     # Fallbacks estándar
     fallbacks = {
@@ -348,7 +313,7 @@ def validar_y_corregir_archivos(nombre_proyecto: str, estructura: dict, modo_rei
     
     Args:
         nombre_proyecto: Nombre del proyecto
-        estructura: Estructura de archivos del proyecto (debe incluir objetivo, funcionalidades, restricciones)
+        estructura: Estructura de archivos del proyecto (debe incluir objetivo, funcionalidades, restricciones, tecnologias)
         modo_reintento: Si True, reintenta generar el archivo. Si False, usa fallback (por defecto True)
         
     Returns:
@@ -397,7 +362,8 @@ def validar_y_corregir_archivos(nombre_proyecto: str, estructura: dict, modo_rei
                             estructura.get('objetivo', ''),
                             estructura.get('funcionalidades', ''),
                             estructura.get('restricciones', ''),
-                            estructura
+                            estructura,
+                            estructura.get('tecnologias', 'ninguna')
                         )
                         
                         # Validar nuevo código
@@ -421,7 +387,7 @@ def validar_y_corregir_archivos(nombre_proyecto: str, estructura: dict, modo_rei
                     if not regenerado:
                         # Tras MAX_REINTENTOS, usar fallback
                         print(f"    [FALLBACK] No se pudo regenerar, usando código fallback...")
-                        codigo_fallback = generar_codigo_fallback(ruta_archivo, nombre_proyecto, estructura.get('objetivo', ''))
+                        codigo_fallback = generar_codigo_fallback(ruta_archivo, nombre_proyecto, estructura.get('tecnologias', ''))
                         # Sobrescribir completamente el archivo
                         with open(ruta_completa, 'w', encoding='utf-8') as f:
                             f.write(codigo_fallback)
@@ -430,7 +396,7 @@ def validar_y_corregir_archivos(nombre_proyecto: str, estructura: dict, modo_rei
                 else:
                     # Modo fallback directo
                     print(f"    [FALLBACK] Aplicando código fallback...")
-                    codigo_fallback = generar_codigo_fallback(ruta_archivo, nombre_proyecto, estructura.get('objetivo', ''))
+                    codigo_fallback = generar_codigo_fallback(ruta_archivo, nombre_proyecto, estructura.get('tecnologias', ''))
                     # Sobrescribir completamente el archivo
                     with open(ruta_completa, 'w', encoding='utf-8') as f:
                         f.write(codigo_fallback)
