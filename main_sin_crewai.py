@@ -14,7 +14,7 @@ from sin_crewai.validador import validar_y_corregir_archivos
 from sin_crewai.integrador_git import inicializar_git
 
 
-def generar_poc(nombre: str, objetivo: str, actores: str, funcionalidades: str, restricciones: str):
+def generar_poc(nombre: str, objetivo: str, actores: str, funcionalidades: str, restricciones: str, tecnologias: str = "ninguna"):
     """
     Genera una PoC completa: README + Estructura + Git
     
@@ -24,6 +24,7 @@ def generar_poc(nombre: str, objetivo: str, actores: str, funcionalidades: str, 
         actores: Quién utilizará el sistema
         funcionalidades: Qué debería hacer el sistema
         restricciones: Reglas o límites importantes
+        tecnologias: Tecnologías/integraciones necesarias (separadas por comas)
     """
     
     print(f"\n{'='*60}")
@@ -49,7 +50,7 @@ def generar_poc(nombre: str, objetivo: str, actores: str, funcionalidades: str, 
     
     # FASE 4: Rellenar archivos con código funcional
     print("[FASE 4] Generando codigo funcional...")
-    archivos_rellenados = rellenar_archivos_con_codigo(nombre, objetivo, funcionalidades, restricciones, estructura)
+    archivos_rellenados = rellenar_archivos_con_codigo(nombre, objetivo, funcionalidades, restricciones, estructura, tecnologias)
     print("[OK] Fase 4 completada\n")
     
     # FASE 5: Validar y corregir código
@@ -59,7 +60,8 @@ def generar_poc(nombre: str, objetivo: str, actores: str, funcionalidades: str, 
         **estructura,
         'objetivo': objetivo,
         'funcionalidades': funcionalidades,
-        'restricciones': restricciones
+        'restricciones': restricciones,
+        'tecnologias': tecnologias
     }
     reporte_validacion = validar_y_corregir_archivos(nombre, estructura_con_contexto, modo_reintento=True)
     print("[OK] Fase 5 completada\n")
@@ -104,9 +106,15 @@ def main():
     funcionalidades = input("4. ¿Qué debería poder hacer el sistema?: ").strip()
     restricciones = input("5. ¿Hay reglas o límites importantes?: ").strip()
     
+    print("6. ¿Qué tecnologías/integraciones necesita? (separadas por comas)")
+    print("   Ejemplos: google-drive, aws-s3, mongodb, postgresql, ninguna")
+    tecnologias = input("   > ").strip()
+    if not tecnologias:
+        tecnologias = "ninguna"
+    
     # Generar PoC
     try:
-        resultado = generar_poc(nombre, objetivo, actores, funcionalidades, restricciones)
+        resultado = generar_poc(nombre, objetivo, actores, funcionalidades, restricciones, tecnologias)
         
         # Calcular tiempo
         tiempo_final = time.time()
