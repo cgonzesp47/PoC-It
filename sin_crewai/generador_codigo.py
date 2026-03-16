@@ -141,10 +141,23 @@ def generar_codigo_para_archivo(
     
     print(f"    > Generando código para {ruta_archivo}...")
     
-    MAX_REINTENTOS = 2
-    codigo = ""  # Inicializar para evitar unbound variable
+    # Ajustar num_predict según complejidad del archivo
+    num_predict_map = {
+        'main.py': 500,
+        'app/__init__.py': 100,
+        'app/models.py': 800,
+        'app/schemas.py': 800,
+        'app/api.py': 3500,  # Archivo más complejo, necesita más tokens
+        'tests/test_api.py': 1000,
+    }
     
-    for intento in range(MAX_REINTENTOS):
+    num_predict = num_predict_map.get(ruta_archivo, 1000)
+    
+    # Solo 1 reintento para ahorrar tiempo
+    MAX_REINTENTOS = 1
+    codigo = ""
+    
+    for intento in range(MAX_REINTENTOS + 1):
         response = ollama.chat(
             model='qwen7b:latest',
             messages=[{
@@ -153,27 +166,27 @@ def generar_codigo_para_archivo(
             }],
             options={
                 'temperature': 0.2,
-                'num_predict': 2500,  # Aumentado de 800 a 2500 para PoCs complejas
+                'num_predict': num_predict,
             }
         )
         
         codigo = response['message']['content'].strip()
         
-        # Limpiar si viene con markdown
+        # Limpiar markdown
         if codigo.startswith('```python'):
             codigo = codigo.replace('```python', '').replace('```', '').strip()
         elif codigo.startswith('```'):
             codigo = codigo.replace('```', '').strip()
         
-        # Detectar si el código está truncado
-        if _esta_truncado(codigo):
-            print(f"    [WARN] Código posiblemente truncado, reintentando ({intento+1}/{MAX_REINTENTOS})...")
-            continue
+        # Si no está truncado, retornar inmediatamente
+        if not _esta_truncado(codigo):
+            return codigo
         
-        return codigo
+        if intento < MAX_REINTENTOS:
+            print(f"    [WARN] Código truncado, reintentando ({intento+1}/{MAX_REINTENTOS})...")
     
-    # Si todos los intentos fallan, retornar el último intento
-    print(f"    [WARN] Usando código del último intento (puede estar incompleto)")
+    # Si falla, retornar el último intento (puede estar incompleto pero mejor que nada)
+    print(f"    [WARN] Código posiblemente incompleto, usando último intento")
     return codigo
 
 

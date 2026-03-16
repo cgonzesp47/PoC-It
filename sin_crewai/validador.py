@@ -161,7 +161,7 @@ def _limpiar_codigo_generado(codigo: str) -> str:
     
     codigo = '\n'.join(lineas)
     
-    # PASO 5: Verificar que no quede texto sin comentar al final
+    # PASO 5: Verificar que no quede texto sin comentar al final (MENOS AGRESIVO)
     lineas = codigo.split('\n')
     codigo_final = []
     
@@ -175,11 +175,17 @@ def _limpiar_codigo_generado(codigo: str) -> str:
             '=' in linea_strip or  # Asignaciones
             linea_strip.endswith((':',  ')', ']', '}', ',', '"', "'")) or  # Finales típicos
             linea_strip.startswith(('"', "'", '(', '[', '{')) or  # Inicios típicos
-            re.match(r'^[a-zA-Z_]\w*\(', linea_strip)):  # Llamadas a función
+            re.match(r'^[a-zA-Z_]\w*\(', linea_strip) or  # Llamadas a función
+            re.match(r'^[a-zA-Z_]\w*:\s*\w+', linea_strip)):  # Campos Pydantic (nombre: tipo)
             codigo_final.append(linea)
         else:
-            # Línea sospechosa, omitir
-            print(f"    [LIMPIEZA] Línea sospechosa eliminada: {linea_strip[:60]}...")
+            # Línea sospechosa, omitir solo si no es campo de clase
+            # NO eliminar si está indentada (probablemente campo de clase)
+            if linea.startswith((' ', '\t')):
+                # Línea indentada, probablemente código válido, mantener
+                codigo_final.append(linea)
+            else:
+                print(f"    [LIMPIEZA] Línea sospechosa eliminada: {linea_strip[:60]}...")
     
     return '\n'.join(codigo_final)
 
@@ -324,7 +330,7 @@ def validar_y_corregir_archivos(nombre_proyecto: str, estructura: dict, modo_rei
     directorio_base = f"output/{nombre_proyecto}"
     reporte = {}
     archivos_corregidos = 0
-    MAX_REINTENTOS = 3  # Máximo de reintentos por archivo
+    MAX_REINTENTOS = 1  # REDUCIDO: Solo 1 reintento para ahorrar tiempo (antes 3)
     
     print(f"  > Validando código generado...")
     
