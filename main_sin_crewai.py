@@ -6,7 +6,7 @@ Este archivo reemplaza la implementación con agentes de CrewAI
 por una solución más simple y rápida con llamadas directas al LLM
 """
 import time
-from sin_crewai.generador_readme import generar_readme_basico, guardar_readme
+from sin_crewai.generador_readme import generar_readme_basico, guardar_readme, actualizar_readme_con_endpoints
 from sin_crewai.generador_estructura import generar_estructura_json, añadir_json_a_readme
 from sin_crewai.materializador import materializar_estructura
 from sin_crewai.generador_codigo import rellenar_archivos_con_codigo
@@ -33,7 +33,7 @@ def generar_poc(nombre: str, objetivo: str, actores: str, funcionalidades: str, 
     
     # FASE 1: Generar README básico
     print("[FASE 1] Generando README basico...")
-    readme_contenido = generar_readme_basico(nombre, objetivo, actores, funcionalidades, restricciones)
+    readme_contenido = generar_readme_basico(nombre, objetivo, actores, funcionalidades, restricciones, tecnologias)
     ruta_readme = guardar_readme(nombre, readme_contenido)
     print("[OK] Fase 1 completada\n")
     
@@ -52,6 +52,11 @@ def generar_poc(nombre: str, objetivo: str, actores: str, funcionalidades: str, 
     print("[FASE 4] Generando codigo funcional...")
     archivos_rellenados = rellenar_archivos_con_codigo(nombre, objetivo, funcionalidades, restricciones, estructura, tecnologias)
     print("[OK] Fase 4 completada\n")
+    
+    # FASE 4.5: Actualizar README con endpoints reales
+    print("[FASE 4.5] Documentando endpoints generados...")
+    actualizar_readme_con_endpoints(nombre, tecnologias)
+    print("[OK] Fase 4.5 completada\n")
     
     # FASE 5: Validar y corregir código
     print("[FASE 5] Validando codigo generado...")
