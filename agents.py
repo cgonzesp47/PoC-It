@@ -4,6 +4,8 @@ from textwrap import dedent
 from tools.escribir_archivo_readme import escribir_archivo_readme_tool
 from tools.leer_archivo_readme import leer_archivo_readme_tool
 from tools.inicializar_repositorio_git import inicializar_repositorio_git_tool
+from tools.generar_estructura import generar_estructura_tool
+
 custom_tool = escribir_archivo_readme_tool
 
 class AgentesGeneradoresPoC:
@@ -33,19 +35,27 @@ class AgentesGeneradoresPoC:
                             una guía de inicio exhaustiva."""),
             
             goal=dedent(f"""   
-                        1. Interpretar la plantilla de descripción funcional del usuario.
-                        2. Diseñar el árbol de directorios detallado para la PoC.
-                        3. Generar un archivo README.md que documente la estructura del proyecto.
-                        4. Crear un archivo README.md profesional que sirva como "Manual de Identidad" 
-                        del proyecto, incluyendo: descripción del sistema, guía de instalación paso a paso
-                        (creación de entorno virtual y comando pip) y comandos de ejecución.
-                        5. Detallar las instrucciones básicas para lanzar la aplicación."""),
-            tools=[escribir_archivo_readme_tool],
+                        Diseñar y documentar PoCs backend en FastAPI de forma simple y profesional.
+                        
+                        Cuando diseñes:
+                        - Interpreta requisitos funcionales
+                        - Define arquitectura simple (sin capas enterprise)
+                        - Documenta en README con secciones: Descripción, Instalación, Ejecución
+                        - Incluye JSON estructural en sección "## ESTRUCTURA_JSON_AUTOGENERADA (NO MODIFICAR)"
+                        
+                        Cuando materialices:
+                        - Lee el README generado
+                        - Extrae el JSON exacto
+                        - Crea la estructura sin modificar nada
+                        
+                        Cada tarea te indicará qué hacer específicamente."""),
+            tools=[],
             allow_delegation=False,
             verbose=True,
             llm=self.llm_potente,
         )
 
+    '''
     def agente_revisor(self):
         return Agent(
             role="Revisor de Documentación Técnica",
@@ -65,6 +75,7 @@ class AgentesGeneradoresPoC:
             verbose=True,
             llm=self.llm_rapido,
         )
+    '''
 
     def agente_integrador_git(self):
         return Agent(
@@ -84,12 +95,13 @@ class AgentesGeneradoresPoC:
                         3. Realizar el commit inicial con todos los archivos generados por el arquitecto.
                         4. Asegurar que el README.md validado por el revisor esté incluido en el repositorio.
                         5. Documentar el estado del repositorio y confirmar que está listo para desarrollo."""),
-            tools=[inicializar_repositorio_git_tool],
+            tools=[],
             allow_delegation=False,
-            verbose=True,
+            verbose=False,
             llm=self.llm_potente,
         )
 
+    '''
     def agent_3_name(self):
         return Agent(
             role="Define agent 3 role here",
@@ -111,3 +123,4 @@ class AgentesGeneradoresPoC:
             verbose=True,
             llm=self.llm_rapido,
         )
+    '''
