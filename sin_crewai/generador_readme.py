@@ -31,7 +31,7 @@ FUNCIONALIDADES: {funcionalidades}
 RESTRICCIONES: {restricciones}
 TECNOLOGÍAS: {tecnologias}
 
-Genera SOLO documentación en formato Markdown que incluya:
+Genera SOLO documentación en formato Markdown que incluya unicamente los siguientes apartados:
 - Título # {nombre}
 - Descripción del proyecto
 - Requisitos (Python 3.8+)
@@ -41,6 +41,7 @@ Genera SOLO documentación en formato Markdown que incluya:
 - Tecnologías usadas
 
 NO generes código Python, solo texto Markdown descriptivo.
+Solo debes incluir esas secciones, no añadas secciones adicionales ni detalles que no estén en la información proporcionada.
 
 README.md:"""
 
