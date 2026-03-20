@@ -272,9 +272,14 @@ Requisitos:
 - Usa Pydantic BaseModel
 - Hereda de los modelos cuando sea apropiado
 
-IMPORTANTE: SOLO código Python puro. Todos los comentarios con #. Sin texto explicativo al final.
+🚨 REGLAS CRÍTICAS ANTI-DUPLICACIÓN:
+1. Genera CADA schema UNA SOLA VEZ
+2. NO repitas definiciones de clases
+3. NO incluyas ejemplos duplicados
+4. Define cada campo UNA VEZ por clase
+5. SOLO código Python - comentarios con #
 
-Genera el código:"""
+GENERA EL CÓDIGO UNA ÚNICA VEZ:"""
 
 
 def _get_prompt_api(nombre: str, objetivo: str, funcionalidades: str, restricciones: str) -> str:
@@ -308,13 +313,15 @@ def funcion(param: Schema):
     pass
 ```
 
-IMPORTANTE - REGLAS DE FORMATO:
-1. SOLO código Python - NINGÚN texto explicativo fuera del código
-2. TODOS los comentarios deben empezar con # (numeral)
-3. PROHIBIDO incluir bloques "NOTAS:" o listas sin #
-4. NO agregues secciones explicativas al final
+🚨 REGLAS CRÍTICAS ANTI-DUPLICACIÓN:
+1. Genera el archivo COMPLETO UNA SOLA VEZ de principio a fin
+2. NO repitas ningún import
+3. NO repitas ninguna función o endpoint
+4. NO incluyas múltiples versiones del mismo código
+5. SOLO código Python - comentarios con #
+6. PROHIBIDO texto explicativo fuera del código
 
-GENERA CÓDIGO COMPLETO Y FUNCIONAL (solo código Python puro):"""
+GENERA EL CÓDIGO UNA ÚNICA VEZ (solo código Python puro):"""
 
 
 def _get_prompt_tests(nombre: str, funcionalidades: str) -> str:
@@ -335,6 +342,107 @@ IMPORTANTE: SOLO código Python puro. Todos los comentarios con #. Sin texto exp
 Genera el código:"""
 
 
+def _generar_api_con_contexto_schemas(
+    nombre: str,
+    objetivo: str,
+    funcionalidades: str,
+    restricciones: str,
+    estructura: dict,
+    schemas_disponibles: list
+) -> str:
+    """
+    Genera api.py con contexto explícito de los schemas disponibles.
+    Lee el contenido COMPLETO de schemas.py para que el LLM vea qué campos tiene cada schema.
+    """
+    objetivo_resumido = objetivo[:300] + "..." if len(objetivo) > 300 else objetivo
+    funcionalidades_resumidas = funcionalidades[:400] + "..." if len(funcionalidades) > 400 else funcionalidades
+    restricciones_resumidas = restricciones[:200] + "..." if len(restricciones) > 200 else restricciones
+    
+    schemas_str = ', '.join(schemas_disponibles)
+    
+    schemas_path = os.path.join(f"output/{nombre}", "app/schemas.py")
+    contenido_schemas = ""
+    try:
+        with open(schemas_path, 'r', encoding='utf-8') as f:
+            contenido_schemas = f.read().strip()
+    except Exception as e:
+        print(f"    [WARN] No se pudo leer schemas.py: {e}")
+        contenido_schemas = "# No disponible"
+    
+    prompt = f"""Genera app/api.py para FastAPI: {nombre}
+
+CONTEXTO: {objetivo_resumido}
+FUNCIONALIDADES: {funcionalidades_resumidas}
+REGLAS: {restricciones_resumidas}
+
+🔴🔴🔴 CRÍTICO - CONTENIDO COMPLETO DE SCHEMAS.PY 🔴🔴🔴
+
+Aquí está el archivo app/schemas.py que acabas de generar:
+
+```python
+{contenido_schemas}
+```
+
+REGLAS INFLEXIBLES:
+1. Importa SOLO los schemas definidos arriba: {schemas_str}
+2. Usa SOLO los campos que existen en cada schema
+3. Si ItemCreate tiene solo 'name', entonces data.name es lo ÚNICO disponible
+4. NO uses data.metadata si no existe en el schema
+5. NO uses data.content si no existe en el schema
+6. NO inventes campos que no están definidos
+
+EJEMPLO:
+Si ItemCreate es:
+```python
+class ItemCreate(BaseModel):
+    name: str
+```
+
+Tu código DEBE ser:
+```python
+@router.post("/items", response_model=ItemResponse)
+def create(data: ItemCreate):
+    # SOLO data.name disponible
+    item_id = str(len(storage) + 1)
+    storage[item_id] = {{"id": item_id, "name": data.name}}
+    return ItemResponse(id=int(item_id), name=data.name)
+```
+
+🚨 ANTI-DUPLICACIÓN:
+1. Genera el archivo UNA SOLA VEZ completo
+2. NO repitas imports, funciones ni endpoints
+3. SOLO código Python - comentarios con #
+
+GENERA EL CÓDIGO UNA ÚNICA VEZ:"""
+    
+    print(f"    > Generando api.py con contexto: {schemas_str}")
+    
+    MAX_REINTENTOS = 1
+    codigo = ""  # Inicializar para evitar warning de Pylance
+    
+    for intento in range(MAX_REINTENTOS + 1):
+        response = ollama.chat(
+            model='qwen7b:latest',
+            messages=[{'role': 'user', 'content': prompt}],
+            options={'temperature': 0.2, 'num_predict': 3500}
+        )
+        
+        codigo = response['message']['content'].strip()
+        if codigo.startswith('```python'):
+            codigo = codigo.replace('```python', '').replace('```', '').strip()
+        elif codigo.startswith('```'):
+            codigo = codigo.replace('```', '').strip()
+        
+        if not _esta_truncado(codigo):
+            return codigo
+        
+        if intento < MAX_REINTENTOS:
+            print(f"    [WARN] Código truncado, reintentando ({intento+1}/{MAX_REINTENTOS})...")
+    
+    print(f"    [WARN] Código posiblemente incompleto")
+    return codigo
+
+
 def rellenar_archivos_con_codigo(
     nombre_proyecto: str,
     objetivo: str,
@@ -345,6 +453,7 @@ def rellenar_archivos_con_codigo(
 ) -> int:
     """
     Rellena todos los archivos del proyecto con código funcional.
+    OPTIMIZADO: Genera schemas.py primero, luego api.py con contexto.
     
     Args:
         nombre_proyecto: Nombre de la PoC
@@ -358,22 +467,65 @@ def rellenar_archivos_con_codigo(
         int: Número de archivos rellenados
     """
     from sin_crewai.validador import _limpiar_codigo_generado
+    from sin_crewai.validador_imports import extraer_clases_pydantic
     
     directorio_base = f"output/{nombre_proyecto}"
     archivos_rellenados = 0
     
     print(f"  > Generando código funcional para archivos...")
     
-    for ruta_archivo in estructura.keys():
-        codigo = generar_codigo_para_archivo(
-            nombre_proyecto,
-            ruta_archivo,
-            objetivo,
-            funcionalidades,
-            restricciones,
-            estructura,
-            tecnologias
+    # FASE 1: Generar schemas.py PRIMERO
+    schemas_generados = []
+    if 'app/schemas.py' in estructura:
+        print(f"    [FASE 1/2] Generando schemas.py primero...")
+        codigo_schemas = generar_codigo_para_archivo(
+            nombre_proyecto, 'app/schemas.py', objetivo,
+            funcionalidades, restricciones, estructura, tecnologias
         )
+        
+        codigo_schemas = _limpiar_codigo_generado(codigo_schemas)
+        ruta_schemas = os.path.join(directorio_base, 'app/schemas.py')
+        
+        try:
+            with open(ruta_schemas, 'w', encoding='utf-8') as f:
+                f.write(codigo_schemas)
+            archivos_rellenados += 1
+            print(f"    [OK] app/schemas.py generado")
+            
+            schemas_generados = extraer_clases_pydantic(ruta_schemas)
+            if schemas_generados:
+                print(f"    [INFO] Schemas detectados: {', '.join(schemas_generados)}")
+        except Exception as e:
+            print(f"    [ERROR] Error al generar schemas.py: {e}")
+    
+    # FASE 2: Generar resto de archivos
+    print(f"    [FASE 2/2] Generando resto de archivos...")
+    
+    for ruta_archivo in estructura.keys():
+        # Saltar schemas.py (ya generado)
+        if ruta_archivo == 'app/schemas.py':
+            continue
+        
+        # Para api.py, usar contexto de schemas si están disponibles
+        if ruta_archivo == 'app/api.py' and schemas_generados:
+            codigo = _generar_api_con_contexto_schemas(
+                nombre_proyecto,
+                objetivo,
+                funcionalidades,
+                restricciones,
+                estructura,
+                schemas_generados
+            )
+        else:
+            codigo = generar_codigo_para_archivo(
+                nombre_proyecto,
+                ruta_archivo,
+                objetivo,
+                funcionalidades,
+                restricciones,
+                estructura,
+                tecnologias
+            )
         
         # CRÍTICO: Limpiar código ANTES de escribirlo al archivo
         # Esto elimina duplicaciones, texto sin comentar, etc.
