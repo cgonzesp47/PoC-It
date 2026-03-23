@@ -6,7 +6,11 @@ mediante entrada por consola.
 """
 
 import asyncio
-from scope_guardian.analizador_viabilidad import UserTemplate, run_scope_guardian
+from scope_guardian.analizador_viabilidad import (
+    PlantillaUsuario,
+    analizar_viabilidad,
+)
+from scope_guardian.maquina_estados import ejecutar_asesoria_tecnica
 
 
 TEMPLATE_PROMPT = """
@@ -25,7 +29,7 @@ Responde a cada punto cuando se te solicite.
 """
 
 
-def collect_user_input() -> UserTemplate:
+def collect_user_input() -> PlantillaUsuario:
     """
     Solicita por consola los 6 campos de la plantilla.
     """
@@ -39,7 +43,7 @@ def collect_user_input() -> UserTemplate:
     limites = input("\n5. ¿Hay reglas o límites importantes?\n> ").strip()
     tecnologias = input("\n6. ¿Qué tecnologías/integraciones necesita?\n> ").strip()
 
-    return UserTemplate(
+    return PlantillaUsuario(
         nombre=nombre,
         problema=problema,
         usuarios=usuarios,
@@ -56,7 +60,47 @@ async def main() -> None:
 
     try:
         user_data = collect_user_input()
-        await run_scope_guardian(user_data)
+        resultado = await analizar_viabilidad(user_data)
+
+        print("\n==============================")
+        print("INFORME DE VIABILIDAD")
+        print("==============================\n")
+        print(f"DECISION: {'TRUE' if resultado.puede_generarse_automaticamente else 'FALSE'}")
+        print("\n==============================\n")
+
+        print("=== ARQUITECTURA PROPUESTA ===\n")
+        print(resultado.arquitectura)
+        print("\n==============================\n")
+
+        if not resultado.puede_generarse_automaticamente:
+            print("Resultado: Solicitud fuera de generación automática.\n")
+        else:
+            print("Resultado: Puede generarse automáticamente.\n")
+
+        print("=== OPCIONES DE PROFUNDIZACIÓN ===\n")
+        for opcion in resultado.opciones:
+            print(opcion)
+
+        # Bloque interactivo: el programa debe quedarse esperando selección
+        if resultado.opciones:
+            while True:
+                seleccion = input(
+                    "\nSelecciona una opción (1-3) o pulsa Enter para salir:\n> "
+                ).strip()
+
+                if seleccion == "":
+                    print("Saliendo sin seleccionar opción.")
+                    break
+
+                if seleccion.isdigit() and 1 <= int(seleccion) <= len(resultado.opciones):
+                    print(f"\nHas seleccionado la opción {seleccion}.")
+                    print("Funcionalidad asociada aún no implementada.")
+                    break
+                else:
+                    print("Selección no válida. Introduce un número correcto.")
+        else:
+            print("No se han generado opciones.")
+
     except KeyboardInterrupt:
         print("\nEjecución cancelada por el usuario.")
     except Exception as exc:
