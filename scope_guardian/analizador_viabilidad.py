@@ -20,6 +20,7 @@ from scope_guardian.models import PlantillaUsuario, ResultadoViabilidad
 from scope_guardian.clasificador import clasificar_viabilidad
 from scope_guardian.arquitectura import generar_arquitectura
 from scope_guardian.opciones import generar_opciones
+from scope_guardian.fases import detectar_fase, FaseProyecto
 
 
 # ==========================================================
@@ -40,12 +41,29 @@ from scope_guardian.opciones import generar_opciones
 
 async def analizar_viabilidad(datos: PlantillaUsuario) -> ResultadoViabilidad:
     decision = clasificar_viabilidad(datos)
-    arquitectura = generar_arquitectura(datos)
-    opciones = generar_opciones(
-        arquitectura=arquitectura,
-        limites=datos.limites,
-        tecnologias=datos.tecnologias,
-    )
+
+    # Detectar fase (actualmente forzada a FASE_0)
+    fase = detectar_fase(datos)
+
+    # 🔹 NUEVO FLUJO:
+    # En FASE_0 no generamos arquitectura primero.
+    # Generamos directamente opciones estratégicas de arranque.
+    if fase == FaseProyecto.FASE_0:
+        arquitectura = ""  # No inducimos sesgo arquitectónico
+        opciones = generar_opciones(
+            arquitectura="",
+            limites=datos.limites,
+            tecnologias=datos.tecnologias,
+            fase=fase,
+        )
+    else:
+        arquitectura = generar_arquitectura(datos)
+        opciones = generar_opciones(
+            arquitectura=arquitectura,
+            limites=datos.limites,
+            tecnologias=datos.tecnologias,
+            fase=fase,
+        )
 
     return ResultadoViabilidad(
         puede_generarse_automaticamente=decision,

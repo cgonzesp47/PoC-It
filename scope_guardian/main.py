@@ -10,8 +10,6 @@ from scope_guardian.analizador_viabilidad import (
     PlantillaUsuario,
     analizar_viabilidad,
 )
-from scope_guardian.maquina_estados import ejecutar_asesoria_tecnica
-
 
 TEMPLATE_PROMPT = """
 ==============================
@@ -68,9 +66,10 @@ async def main() -> None:
         print(f"DECISION: {'TRUE' if resultado.puede_generarse_automaticamente else 'FALSE'}")
         print("\n==============================\n")
 
-        print("=== ARQUITECTURA PROPUESTA ===\n")
-        print(resultado.arquitectura)
-        print("\n==============================\n")
+        if resultado.arquitectura.strip():
+            print("=== ARQUITECTURA PROPUESTA ===\n")
+            print(resultado.arquitectura)
+            print("\n==============================\n")
 
         if not resultado.puede_generarse_automaticamente:
             print("Resultado: Solicitud fuera de generación automática.\n")
