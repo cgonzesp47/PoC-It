@@ -45,7 +45,7 @@ async def analizar_viabilidad(datos: PlantillaUsuario) -> ResultadoViabilidad:
     # Detectar fase (actualmente forzada a FASE_0)
     fase = detectar_fase(datos)
 
-    # 🔹 NUEVO FLUJO:
+    # NUEVO FLUJO:
     # En FASE_0 no generamos arquitectura primero.
     # Generamos directamente opciones estratégicas de arranque.
     if fase == FaseProyecto.FASE_0:

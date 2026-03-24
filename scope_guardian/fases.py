@@ -16,34 +16,33 @@ class FaseProyecto(str, Enum):
     FASE_2 = "FASE_2"  # Código ya existente
 
 
-PROMPT_CLASIFICACION_FASE = """
-Analiza la descripción del usuario y determina en qué fase se encuentra su proyecto.
+PROMPT_EXTRACCION_FASE = """
+Analiza la descripción del usuario y responde EXCLUSIVAMENTE en formato JSON válido.
 
-FASE_0:
-- No tiene nada implementado.
-- Parte desde cero.
-- Quiere crear la API o proyecto desde el inicio.
-- No ha especificado en qué fase se encuentra.
+Debes inferir señales semánticas, NO decidir la fase directamente.
 
-FASE_1:
-- Tiene arquitectura o diseño conceptual.
-- Aún no hay código implementado.
-- Está validando contratos o estructura.
+Devuelve exactamente este esquema:
 
-FASE_2:
-- Ya existe código implementado.
-- Quiere mejorar, refactorizar u optimizar.
+{
+  "menciona_codigo_existente": boolean,
+  "menciona_refactor_o_mejora": boolean,
+  "menciona_elementos_concretos_de_codigo": boolean,
+  "nivel_confianza": number
+}
 
-Responde EXCLUSIVAMENTE con una de estas opciones:
-FASE_0
-FASE_1
-FASE_2
+Reglas:
+- menciona_codigo_existente: true si el usuario afirma tener código ya implementado.
+- menciona_refactor_o_mejora: true si habla de refactorizar, optimizar o mejorar algo existente.
+- menciona_elementos_concretos_de_codigo: true si menciona clases, controladores, servicios, repositorios propios.
+- nivel_confianza: número entre 0 y 1 indicando qué tan seguro estás del análisis.
+- No añadas texto fuera del JSON.
 """
 
 
 def detectar_fase(datos: PlantillaUsuario) -> FaseProyecto:
     """
-    Utiliza el LLM para clasificar la fase del proyecto.
+    Detecta la fase del proyecto mediante extracción estructurada
+    de señales semánticas usando el LLM en modo JSON.
     """
 
     descripcion = f"""
@@ -57,27 +56,33 @@ Usuarios:
 {datos.usuarios}
 """
 
-    prompt = f"{PROMPT_CLASIFICACION_FASE}\n\nDescripción del usuario:\n{descripcion}"
+    prompt = f"{PROMPT_EXTRACCION_FASE}\n\nDescripción del usuario:\n{descripcion}"
 
     respuesta = ollama.chat(
         model="qwen7b:latest",
         messages=[{"role": "user", "content": prompt}],
+        format="json",  # Fuerza salida estructurada si el backend lo soporta
         options={
             "temperature": 0.0,
-            "num_predict": 5,
-            "stop": ["\n"],
+            "num_predict": 200,
         },
     )
 
-    texto = respuesta.get("message", {}).get("content", "").strip().upper()
+    data = respuesta.get("message", {}).get("content", "{}")
 
-    # Normalización defensiva
-    if texto.startswith("FASE_1"):
-        return FaseProyecto.FASE_1
+    try:
+        import json
+        señales = json.loads(data)
+    except Exception:
+        # Fallback conservador
+        return FaseProyecto.FASE_0
 
-    if texto.startswith("FASE_2"):
+    menciona_codigo = señales.get("menciona_codigo_existente", False)
+    menciona_refactor = señales.get("menciona_refactor_o_mejora", False)
+    menciona_elementos = señales.get("menciona_elementos_concretos_de_codigo", False)
+
+    # Lógica estructural mínima y conservadora
+    if menciona_codigo or menciona_refactor or menciona_elementos:
         return FaseProyecto.FASE_2
 
-    # Si el modelo duda, responde vacío o algo ambiguo,
-    # asumimos por defecto FASE_0 (caso más conservador)
     return FaseProyecto.FASE_0
