@@ -92,8 +92,26 @@ async def main() -> None:
                     break
 
                 if seleccion.isdigit() and 1 <= int(seleccion) <= len(resultado.opciones):
+                    opcion_elegida = resultado.opciones[int(seleccion) - 1]
                     print(f"\nHas seleccionado la opción {seleccion}.")
-                    print("Funcionalidad asociada aún no implementada.")
+                    
+                    from scope_guardian.materializador_opcion import materializar_opcion
+                    contexto = (
+                        f"Nombre: {user_data.nombre}\n"
+                        f"Problema: {user_data.problema}\n"
+                        f"Funcionalidades: {user_data.funcionalidades}\n"
+                        f"Límites: {user_data.limites}\n"
+                        f"Tecnologías: {user_data.tecnologias}\n"
+                    )
+                    
+                    detalle = materializar_opcion(opcion_elegida, contexto)
+                    
+                    print("\n==============================")
+                    print("DESARROLLO DE LA OPCIÓN")
+                    print("==============================\n")
+                    print(detalle)
+                    print("\n==============================")
+                    
                     break
                 else:
                     print("Selección no válida. Introduce un número correcto.")
