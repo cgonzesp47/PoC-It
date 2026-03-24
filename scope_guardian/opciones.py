@@ -1,83 +1,171 @@
 """
-Módulo de generación y validación de implementaciones parciales.
-Responsabilidad única: proponer y validar caminos de avance de la PoC.
+Módulo de generación de opciones adaptadas según fase del proyecto.
+
+Responsabilidad:
+Proponer acciones estratégicas alineadas con el nivel de madurez del usuario.
 """
 
 import re
 import ollama
+from dataclasses import dataclass
+from typing import List
+from scope_guardian.fases import FaseProyecto
 
 
-PROMPT_OPCIONES = """
-A partir de la arquitectura anterior:
+# ==========================================================
+# MODELO DE RESTRICCIONES POR FASE
+# ==========================================================
+
+@dataclass(frozen=True)
+class ConfiguracionFase:
+    objetivo: str
+    debe_incluir: List[str]
+    debe_evitar: List[str]
+
+
+def _configuracion_por_fase(fase: FaseProyecto) -> ConfiguracionFase:
+    """
+    Define de forma declarativa el comportamiento esperado por fase.
+    Sin hardcodeos dispersos en el prompt.
+    """
+
+    #if fase == FaseProyecto.FASE_0:
+    return ConfiguracionFase(
+            objetivo=(
+                "ARRANCAR la PoC desde cero con enfoque estratégico.\n\n"
+                "IMPORTANTE:\n"
+                "- Asume que NO existe ningún proyecto creado.\n"
+                "- Asume que NO existe código base.\n"
+                "- Ignora cualquier mención a validación de arquitectura existente.\n"
+                "- Tu rol es iniciar el proyecto desde cero.\n"
+            ),
+            debe_incluir=[
+                "estructura base del proyecto",
+                "formalización de contrato REST",
+                "especificación OpenAPI o Swagger",
+                "documentación técnica inicial",
+                "definición clara de responsabilidades por capa",
+            ],
+            debe_evitar=[
+                "implementar método",
+                "crear método",
+                "refactor",
+                "optimizar",
+                "mejorar método existente",
+                "lógica interna de servicio",
+            ],
+        )
+
+    if fase == FaseProyecto.FASE_1:
+        return ConfiguracionFase(
+            objetivo="TRANSICIÓN de diseño conceptual a implementación.",
+            debe_incluir=[
+                "DTO formales",
+                "validación explícita de contratos",
+                "esqueleto base de implementación",
+                "Swagger mockeado",
+            ],
+            debe_evitar=[
+                "refactor profundo",
+                "optimización avanzada",
+            ],
+        )
+
+    return ConfiguracionFase(
+        objetivo="MEJORAR implementación existente.",
+        debe_incluir=[
+            "refactor",
+            "separación de capas",
+            "centralización de errores",
+            "reducción de deuda técnica",
+        ],
+        debe_evitar=[
+            "bootstrap inicial",
+            "creación de proyecto desde cero",
+        ],
+    )
+
+
+# ==========================================================
+# CONSTRUCCIÓN DEL PROMPT
+# ==========================================================
+
+def _construir_prompt(
+    arquitectura: str | None,
+    limites: str,
+    configuracion: ConfiguracionFase,
+) -> str:
+
+    incluir = "\n".join(f"- {item}" for item in configuracion.debe_incluir)
+    evitar = "\n".join(f"- {item}" for item in configuracion.debe_evitar)
+
+    bloque_arquitectura = ""
+    if arquitectura:
+        bloque_arquitectura = f"""
+Arquitectura actual:
 
 {arquitectura}
+"""
+
+    return f"""
+{bloque_arquitectura}
 
 Límites:
 {limites}
 
-INSTRUCCIONES IMPORTANTES:
+OBJETIVO ESTRATÉGICO:
+{configuracion.objetivo}
 
-- NO generes checklist genéricos.
-- NO describas pasos típicos de desarrollo.
-- NO propongas tareas obvias que ya estén implícitas en la arquitectura.
-- Cada opción debe aportar VALOR REAL al usuario.
+LAS OPCIONES DEBEN INCLUIR CONCEPTOS RELACIONADOS CON:
+{incluir}
 
-Las opciones deben cumplir al menos uno de estos objetivos:
+LAS OPCIONES NO DEBEN CONTENER:
+{evitar}
 
-- Detectar ambigüedades en el contrato REST (por ejemplo, campos poco definidos).
-- Detectar posibles inconsistencias entre endpoints relacionados.
-- Mejorar la separación de responsabilidades (Controller / Service / Repository).
-- Proponer una mejora estructural que facilite futuras integraciones reales.
-- Centralizar o mejorar el manejo de errores.
-- Ofrecer generación de documentación Swagger mockeada.
-- Ofrecer definir formalmente esquemas JSON si puede haber dudas.
-- Reducir incertidumbre técnica para QA o arquitectos.
+INSTRUCCIONES CRÍTICAS:
 
-Cada opción debe ser una IMPLEMENTACIÓN PARCIAL CONCRETA que el sistema pueda realizar sin romper los límites.
-Evita propuestas que hagan la PoC no automatizable.
-Mantén almacenamiento exclusivamente en memoria.
-No introduzcas nuevas tecnologías.
-Una de las opciones puede ser una aclaración técnica estratégica si detectas ambigüedad relevante.
-
-Genera EXACTAMENTE 3 opciones usando ESTA plantilla obligatoria:
+1. Genera EXACTAMENTE 3 opciones.
+2. Cada opción debe comenzar con 1), 2), 3).
+3. Deben seguir estrictamente esta plantilla:
 
 1)
 Clase afectada:
 Cambio específico:
 Impacto técnico:
 
-2)
-Clase afectada:
-Cambio específico:
-Impacto técnico:
+4. PROHIBIDO generar bloques de código.
+5. PROHIBIDO usar ``` o cualquier sintaxis de código.
+6. NO escribas clases Java, métodos, anotaciones ni implementaciones.
 
-3)
-Clase afectada:
-Cambio específico:
-Impacto técnico:
+Las opciones deben ser estratégicas y descriptivas, NO técnicas en forma de código.
+
+No añadas texto adicional fuera de las 3 opciones.
+No expliques razonamiento.
+No incluyas comentarios.
 """
 
 
-def _resumir_arquitectura(arquitectura: str) -> str:
-    """
-    Reduce la arquitectura eliminando bloques extensos y
-    limitando tamaño para evitar saturación del modelo.
-    """
-    lineas = arquitectura.split("\n")
-    resumen: list[str] = []
+# ==========================================================
+# GENERACIÓN
+# ==========================================================
 
-    for linea in lineas:
-        if len(linea.strip()) > 200:
-            continue
-        resumen.append(linea)
+def _generar_opciones_raw(
+    arquitectura: str,
+    limites: str,
+    fase: FaseProyecto,
+) -> list[str]:
 
-    return "\n".join(resumen[:80])
+    configuracion = _configuracion_por_fase(fase)
 
+    # En FASE_0 no pasamos arquitectura para evitar sesgo hacia micro‑implementación
+    arquitectura_para_prompt = None
+    if fase != FaseProyecto.FASE_0:
+        arquitectura_para_prompt = arquitectura
 
-def _generar_opciones_raw(arquitectura: str, limites: str) -> list[str]:
-    prompt = PROMPT_OPCIONES.format(
-        arquitectura=arquitectura,
+    prompt = _construir_prompt(
+        arquitectura=arquitectura_para_prompt,
         limites=limites,
+        configuracion=configuracion,
     )
 
     respuesta = ollama.chat(
@@ -85,99 +173,37 @@ def _generar_opciones_raw(arquitectura: str, limites: str) -> list[str]:
         messages=[{"role": "user", "content": prompt}],
         options={
             "temperature": 0.1,
-            "num_predict": 250,
+            "num_predict": 350,
         },
     )
 
     texto = respuesta.get("message", {}).get("content", "").strip()
 
-    # Dividir en bloques estructurados por numeración
+    # Eliminación defensiva de bloques de código si el modelo desobedece
+    texto = re.sub(r"```.*?```", "", texto, flags=re.DOTALL)
+
     bloques = re.split(r"\n(?=\d+\))", texto)
 
-    opciones = []
-    for bloque in bloques:
-        bloque = bloque.strip()
-        if re.match(r"^\d+\)", bloque):
-            opciones.append(bloque)
-
-    # Si no detecta bloques correctamente, fallback simple
-    if not opciones:
-        lineas = [l.strip() for l in texto.split("\n") if l.strip()]
-        candidatas = [l for l in lineas if len(l) > 15]
-        opciones = [
-            f"{i+1}) {candidatas[i]}"
-            for i in range(min(3, len(candidatas)))
-        ]
+    opciones = [
+        bloque.strip()
+        for bloque in bloques
+        if re.match(r"^\d+\)", bloque.strip())
+    ]
 
     return opciones[:3]
-
-
-def _validar_opcion(
-    opcion: str,
-    arquitectura: str,
-    limites: str,
-    tecnologias: str,
-) -> bool:
-    prompt_validacion = f"""
-Arquitectura:
-{arquitectura}
-
-Tecnologías:
-{tecnologias}
-
-Límites:
-{limites}
-
-Opción:
-{opcion}
-
-¿La opción respeta los límites, es coherente con la arquitectura
-y no introduce tecnologías nuevas?
-
-Responde SOLO:
-A) VALIDA
-B) INVALIDA
-"""
-
-    respuesta = ollama.chat(
-        model="qwen7b:latest",
-        messages=[{"role": "user", "content": prompt_validacion}],
-        options={
-            "temperature": 0.0,
-            "num_predict": 3,
-            "stop": ["\n"],
-        },
-    )
-
-    texto = respuesta.get("message", {}).get("content", "").strip().upper()
-    return texto.startswith("A")
 
 
 def generar_opciones(
     arquitectura: str,
     limites: str,
     tecnologias: str,
+    fase: FaseProyecto,
 ) -> list[str]:
-    arquitectura_resumida = _resumir_arquitectura(arquitectura)
-    opciones_raw = _generar_opciones_raw(arquitectura_resumida, limites)
-
-    # Si el modelo devuelve menos de 3 opciones, reintentar una vez
-    if len(opciones_raw) < 3:
-        opciones_raw = _generar_opciones_raw(arquitectura_resumida, limites)
-
-    opciones_validas: list[str] = []
-
-    for opcion in opciones_raw:
-        if _validar_opcion(
-            opcion=opcion,
-            arquitectura=arquitectura,
-            limites=limites,
-            tecnologias=tecnologias,
-        ):
-            opciones_validas.append(opcion)
-
-    if not opciones_validas:
-        return opciones_raw
-
-    # Asegurar máximo 3 opciones
-    return opciones_validas[:3]
+    """
+    Genera opciones estratégicamente alineadas con la fase.
+    """
+    return _generar_opciones_raw(
+        arquitectura=arquitectura,
+        limites=limites,
+        fase=fase,
+    )
