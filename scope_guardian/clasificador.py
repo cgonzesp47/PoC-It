@@ -13,13 +13,23 @@ Debes elegir UNA única opción.
 A) GENERABLE_AUTOMATICAMENTE
 B) NO_GENERABLE_AUTOMATICAMENTE
 
-Solo es A si la solución es:
-- API REST simple
-- Python
-- FastAPI
-- CRUD básico
+Regla principal:
 
-En cualquier otro caso es B.
+Es A si:
+- La tecnología base es Python
+- Utiliza FastAPI como framework principal
+- Es una API REST
+- Aunque incluya integraciones externas (Google Cloud, OAuth, Stripe, bases de datos, etc.)
+
+Es B solo si:
+- No usa Python
+- No usa FastAPI
+- Es otro framework (Spring Boot, Node, .NET, etc.)
+- O no es una API REST backend
+
+IMPORTANTE:
+Las integraciones externas NO convierten la solución en NO_GENERABLE.
+En esos casos podrá generarse parcialmente.
 
 Responde SOLO con:
 A
@@ -40,16 +50,26 @@ Tecnologias:
         messages=[{"role": "user", "content": prompt}],
         options={
             "temperature": 0.0,
-            "num_predict": 3,
-            "stop": ["\n"],
+            "num_predict": 15,
         },
     )
 
     texto = respuesta.get("message", {}).get("content", "").strip().upper()
 
-    if texto.startswith("A"):
+    # Normalización defensiva
+    texto = texto.replace(")", "").replace(".", "").strip()
+
+    # Aceptamos múltiples variantes robustamente
+    if texto.startswith("A") or "GENERABLE_AUTOMATICAMENTE" in texto:
         return True
-    if texto.startswith("B"):
+
+    if texto.startswith("B") or "NO_GENERABLE_AUTOMATICAMENTE" in texto:
         return False
+
+    # Fallback conservador pero informativo
+    # Si contiene FASTAPI explícitamente, asumimos generable
+    tecnologias = (datos.tecnologias or "").lower()
+    if "fastapi" in tecnologias:
+        return True
 
     return False
