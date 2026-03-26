@@ -76,47 +76,88 @@ async def main() -> None:
         else:
             print("Resultado: Puede generarse automáticamente.\n")
 
-        print("=== OPCIONES DE PROFUNDIZACIÓN ===\n")
-        for opcion in resultado.opciones:
-            print(opcion)
+        # --------------------------------------------------
+        # NUEVO FLUJO: MODO GENERADOR PRINCIPAL
+        # --------------------------------------------------
+        from scope_guardian.capacidades import evaluar_capacidades
+        from scope_guardian.orquestador_parcial import OrquestadorParcial
 
-        # Bloque interactivo: el programa debe quedarse esperando selección
-        if resultado.opciones:
-            while True:
-                seleccion = input(
-                    "\nSelecciona una opción (1-3) o pulsa Enter para salir:\n> "
-                ).strip()
+        descripcion_global = (
+            f"Nombre: {user_data.nombre}\n"
+            f"Problema: {user_data.problema}\n"
+            f"Usuarios: {user_data.usuarios}\n"
+            f"Funcionalidades: {user_data.funcionalidades}\n"
+            f"Límites: {user_data.limites}\n"
+            f"Tecnologías: {user_data.tecnologias}\n"
+        )
 
-                if seleccion == "":
-                    print("Saliendo sin seleccionar opción.")
-                    break
+        # Solo intentamos generar si el analizador declaró viabilidad automática
+        if resultado.puede_generarse_automaticamente:
+            evaluacion = evaluar_capacidades(descripcion_global)
 
-                if seleccion.isdigit() and 1 <= int(seleccion) <= len(resultado.opciones):
-                    opcion_elegida = resultado.opciones[int(seleccion) - 1]
-                    print(f"\nHas seleccionado la opción {seleccion}.")
-                    
-                    from scope_guardian.materializador_opcion import materializar_opcion
-                    contexto = (
-                        f"Nombre: {user_data.nombre}\n"
-                        f"Problema: {user_data.problema}\n"
-                        f"Funcionalidades: {user_data.funcionalidades}\n"
-                        f"Límites: {user_data.limites}\n"
-                        f"Tecnologías: {user_data.tecnologias}\n"
-                    )
-                    
-                    detalle = materializar_opcion(opcion_elegida, contexto)
-                    
-                    print("\n==============================")
-                    print("DESARROLLO DE LA OPCIÓN")
-                    print("==============================\n")
-                    print(detalle)
-                    print("\n==============================")
-                    
-                    break
+            if evaluacion.generables:
+                # Determinar tipo de generación
+                if evaluacion.manuales:
+                    modo_generacion = "PARCIAL"
                 else:
-                    print("Selección no válida. Introduce un número correcto.")
+                    modo_generacion = "COMPLETA"
+
+                print(f"\n=== MODO GENERADOR {modo_generacion} ACTIVADO ===\n")
+
+                orquestador = OrquestadorParcial(
+                    nombre_proyecto=user_data.nombre,
+                    descripcion_global=descripcion_global,
+                    tecnologias=user_data.tecnologias,
+                )
+
+                resumen = orquestador.ejecutar()
+
+                print("======================================")
+                print(f"GENERACIÓN {modo_generacion} FINALIZADA")
+                print("======================================\n")
+                print(f"Proyecto generado en: output/{resumen['nombre_proyecto']}")
+                print(f"Archivos creados: {len(resumen['archivos_creados'])}\n")
+
+                if modo_generacion == "PARCIAL":
+                    print("Elementos que requieren intervención manual:")
+                    for bloque in resumen.get("bloques_manuales", []):
+                        print(f"- {bloque}")
+                    print("\nConsulta README_FINAL.md para instrucciones adicionales.")
+                else:
+                    print("La PoC ha sido generada completamente sin pasos manuales.")
+
+                return
+
+        # --------------------------------------------------
+        # MODO ASESOR ESTRATÉGICO (Incompatibilidad tecnológica)
+        # --------------------------------------------------
+        print("=== ANÁLISIS ESTRATÉGICO DE RIESGOS ===\n")
+
+        from scope_guardian.opciones import generar_opciones
+
+        opciones_estrategicas = resultado.opciones
+
+        # Si el analizador no generó opciones, forzamos generación estratégica
+        if not opciones_estrategicas:
+            opciones_estrategicas = generar_opciones(
+                arquitectura=resultado.arquitectura,
+                limites=user_data.limites,
+                tecnologias=user_data.tecnologias,
+            )
+
+        if opciones_estrategicas:
+            for opcion in opciones_estrategicas:
+                print(opcion)
+                print("\n------------------------------\n")
+
+            print(
+                "Estas validaciones deben ejecutarse antes de iniciar la implementación.\n"
+                "El objetivo es confirmar o descartar hipótesis críticas de viabilidad técnica."
+            )
         else:
-            print("No se han generado opciones.")
+            print("No se han podido generar análisis estratégicos.")
+        
+        return
 
     except KeyboardInterrupt:
         print("\nEjecución cancelada por el usuario.")
