@@ -1,147 +1,93 @@
 """
-Módulo de generación de opciones adaptadas según fase del proyecto.
+ScopeGuardian - Generador de Opciones Estratégicas
 
-Responsabilidad:
-Proponer acciones estratégicas alineadas con el nivel de madurez del usuario.
+Nuevo enfoque:
+
+Las opciones SOLO se generan cuando:
+- La PoC NO puede generarse automáticamente.
+- Existe incompatibilidad tecnológica o alcance fuera de FastAPI + Python.
+
+Por tanto:
+- Se elimina la lógica por fases.
+- Se prioriza valor estratégico.
+- Se generan 3 riesgos técnicos + 3 acciones concretas.
 """
 
 import re
 import ollama
-from dataclasses import dataclass
 from typing import List
-from scope_guardian.fases import FaseProyecto
 
 
 # ==========================================================
-# MODELO DE RESTRICCIONES POR FASE
+# CONSTRUCCIÓN DEL PROMPT ESTRATÉGICO
 # ==========================================================
 
-@dataclass(frozen=True)
-class ConfiguracionFase:
-    objetivo: str
-    debe_incluir: List[str]
-    debe_evitar: List[str]
-
-
-def _configuracion_por_fase(fase: FaseProyecto) -> ConfiguracionFase:
-    """
-    Define de forma declarativa el comportamiento esperado por fase.
-    Sin hardcodeos dispersos en el prompt.
-    """
-
-    #if fase == FaseProyecto.FASE_0:
-    return ConfiguracionFase(
-            objetivo=(
-                "ARRANCAR la PoC desde cero con enfoque estratégico.\n\n"
-                "IMPORTANTE:\n"
-                "- Asume que NO existe ningún proyecto creado.\n"
-                "- Asume que NO existe código base.\n"
-                "- Ignora cualquier mención a validación de arquitectura existente.\n"
-                "- Tu rol es iniciar el proyecto desde cero.\n"
-            ),
-            debe_incluir=[
-                "estructura base del proyecto",
-                "formalización de contrato REST",
-                "especificación OpenAPI o Swagger",
-                "documentación técnica inicial",
-                "definición clara de responsabilidades por capa",
-            ],
-            debe_evitar=[
-                "implementar método",
-                "crear método",
-                "refactor",
-                "optimizar",
-                "mejorar método existente",
-                "lógica interna de servicio",
-            ],
-        )
-
-    if fase == FaseProyecto.FASE_1:
-        return ConfiguracionFase(
-            objetivo="TRANSICIÓN de diseño conceptual a implementación.",
-            debe_incluir=[
-                "DTO formales",
-                "validación explícita de contratos",
-                "esqueleto base de implementación",
-                "Swagger mockeado",
-            ],
-            debe_evitar=[
-                "refactor profundo",
-                "optimización avanzada",
-            ],
-        )
-
-    return ConfiguracionFase(
-        objetivo="MEJORAR implementación existente.",
-        debe_incluir=[
-            "refactor",
-            "separación de capas",
-            "centralización de errores",
-            "reducción de deuda técnica",
-        ],
-        debe_evitar=[
-            "bootstrap inicial",
-            "creación de proyecto desde cero",
-        ],
-    )
-
-
-# ==========================================================
-# CONSTRUCCIÓN DEL PROMPT
-# ==========================================================
-
-def _construir_prompt(
-    arquitectura: str | None,
-    limites: str,
-    configuracion: ConfiguracionFase,
+def _construir_prompt_estrategico(
+    descripcion_global: str,
 ) -> str:
-
-    incluir = "\n".join(f"- {item}" for item in configuracion.debe_incluir)
-    evitar = "\n".join(f"- {item}" for item in configuracion.debe_evitar)
-
-    bloque_arquitectura = ""
-    if arquitectura:
-        bloque_arquitectura = f"""
-Arquitectura actual:
-
-{arquitectura}
-"""
-
     return f"""
-{bloque_arquitectura}
+Eres un arquitecto software senior especializado en validación técnica de PoCs complejas en cualquier dominio tecnológico.
 
-Límites:
-{limites}
+La siguiente PoC NO puede generarse automáticamente debido a incompatibilidad tecnológica o alcance fuera del dominio soportado.
 
-OBJETIVO ESTRATÉGICO:
-{configuracion.objetivo}
+Tu misión es actuar como asesor técnico estratégico y ayudar a decidir si la PoC es viable antes de implementarla.
 
-LAS OPCIONES DEBEN INCLUIR CONCEPTOS RELACIONADOS CON:
-{incluir}
+Descripción de la PoC:
 
-LAS OPCIONES NO DEBEN CONTENER:
-{evitar}
+{descripcion_global}
 
-INSTRUCCIONES CRÍTICAS:
+INSTRUCCIONES OBLIGATORIAS (NO OMITIR NINGUNA):
 
-1. Genera EXACTAMENTE 3 opciones.
-2. Cada opción debe comenzar con 1), 2), 3).
-3. Deben seguir estrictamente esta plantilla:
+1. Identifica exactamente 3 RIESGOS TÉCNICOS CRÍTICOS que puedan comprometer la viabilidad real.
+2. Los riesgos deben ser profundos (no triviales ni administrativos).
+3. Para cada riesgo debes desarrollar razonamiento estructurado y accionable.
+4. Cada riesgo debe incluir obligatoriamente TODAS las secciones siguientes.
+5. Cada bloque debe tener suficiente detalle técnico (mínimo 120 palabras por riesgo).
+6. Prohibido responder de forma genérica.
+7. Prohibido proponer tareas superficiales como “crear proyecto base” o “documentar”.
+8. No usar bloques ```.
+9. No generar código extenso, pero sí puedes mencionar comandos, endpoints o configuraciones concretas si aportan claridad.
+10. Prioriza los riesgos por impacto real en la decisión de continuar o no con la PoC.
+
+FORMATO OBLIGATORIO (RESPETA EXACTAMENTE ESTA ESTRUCTURA):
 
 1)
-Clase afectada:
-Cambio específico:
-Impacto técnico:
+Riesgo técnico:
+Por qué es crítico en esta PoC:
+Acción de validación:
+Pasos concretos:
+1.
+2.
+3.
+Criterio de confirmación (qué resultado confirma viabilidad):
+Criterio de invalidación (qué resultado demuestra que el enfoque no es viable):
+Impacto en la decisión final:
 
-4. PROHIBIDO generar bloques de código.
-5. PROHIBIDO usar ``` o cualquier sintaxis de código.
-6. NO escribas clases Java, métodos, anotaciones ni implementaciones.
+2)
+Riesgo técnico:
+Por qué es crítico en esta PoC:
+Acción de validación:
+Pasos concretos:
+1.
+2.
+3.
+Criterio de confirmación (qué resultado confirma viabilidad):
+Criterio de invalidación (qué resultado demuestra que el enfoque no es viable):
+Impacto en la decisión final:
 
-Las opciones deben ser estratégicas y descriptivas, NO técnicas en forma de código.
+3)
+Riesgo técnico:
+Por qué es crítico en esta PoC:
+Acción de validación:
+Pasos concretos:
+1.
+2.
+3.
+Criterio de confirmación (qué resultado confirma viabilidad):
+Criterio de invalidación (qué resultado demuestra que el enfoque no es viable):
+Impacto en la decisión final:
 
-No añadas texto adicional fuera de las 3 opciones.
-No expliques razonamiento.
-No incluyas comentarios.
+No añadas texto adicional fuera de los 3 bloques.
 """
 
 
@@ -149,37 +95,43 @@ No incluyas comentarios.
 # GENERACIÓN
 # ==========================================================
 
-def _generar_opciones_raw(
+def generar_opciones(
     arquitectura: str,
     limites: str,
-    fase: FaseProyecto,
-) -> list[str]:
+    tecnologias: str,
+    fase=None,
+) -> List[str]:
+    """
+    Genera 3 riesgos técnicos + 3 acciones concretas.
 
-    configuracion = _configuracion_por_fase(fase)
+    La lógica por fases queda eliminada en el nuevo flujo.
+    """
 
-    # En FASE_0 no pasamos arquitectura para evitar sesgo hacia micro‑implementación
-    arquitectura_para_prompt = None
-    if fase != FaseProyecto.FASE_0:
-        arquitectura_para_prompt = arquitectura
+    descripcion_global = f"""
+Arquitectura declarada:
+{arquitectura}
 
-    prompt = _construir_prompt(
-        arquitectura=arquitectura_para_prompt,
-        limites=limites,
-        configuracion=configuracion,
-    )
+Restricciones:
+{limites}
+
+Tecnologías:
+{tecnologias}
+"""
+
+    prompt = _construir_prompt_estrategico(descripcion_global)
 
     respuesta = ollama.chat(
         model="qwen7b:latest",
         messages=[{"role": "user", "content": prompt}],
         options={
-            "temperature": 0.1,
-            "num_predict": 350,
+            "temperature": 0.2,
+            "num_predict": 1200,
         },
     )
 
     texto = respuesta.get("message", {}).get("content", "").strip()
 
-    # Eliminación defensiva de bloques de código si el modelo desobedece
+    # Limpieza defensiva
     texto = re.sub(r"```.*?```", "", texto, flags=re.DOTALL)
 
     bloques = re.split(r"\n(?=\d+\))", texto)
@@ -191,19 +143,3 @@ def _generar_opciones_raw(
     ]
 
     return opciones[:3]
-
-
-def generar_opciones(
-    arquitectura: str,
-    limites: str,
-    tecnologias: str,
-    fase: FaseProyecto,
-) -> list[str]:
-    """
-    Genera opciones estratégicamente alineadas con la fase.
-    """
-    return _generar_opciones_raw(
-        arquitectura=arquitectura,
-        limites=limites,
-        fase=fase,
-    )
