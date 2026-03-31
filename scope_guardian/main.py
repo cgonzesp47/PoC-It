@@ -57,6 +57,9 @@ async def main() -> None:
     Punto de entrada principal.
     """
 
+    import time
+    inicio_ejecucion = time.perf_counter()
+
     try:
         user_data = collect_user_input()
         resultado = await analizar_viabilidad(user_data)
@@ -359,11 +362,37 @@ Devuelve SOLO código Python entre:
                 ruta_completa.parent.mkdir(parents=True, exist_ok=True)
                 ruta_completa.write_text(contenido, encoding="utf-8")
 
-            # README_FINAL (siempre generado también en modo COMPLETO)
-            readme_final = f"# {user_data.nombre}\n\n"
-            readme_final += "## Generación completa\n\n"
-            readme_final += "Se ha generado el proyecto completo con validación sintáctica y autocorrección automática.\n\n"
-            readme_final += "El proyecto está listo para ejecución y pruebas.\n"
+            # Generación dinámica de README_FINAL
+            from scope_guardian.generador_informes import generar_readme_final
+
+            import ast
+
+            def extraer_endpoints(code: str):
+                rutas = []
+                try:
+                    tree = ast.parse(code)
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.FunctionDef):
+                            for dec in node.decorator_list:
+                                if isinstance(dec, ast.Attribute) and isinstance(dec.value, ast.Name):
+                                    if dec.value.id == "router":
+                                        if hasattr(dec, "attr"):
+                                            rutas.append(dec.attr.upper())
+                except Exception:
+                    pass
+                return rutas
+
+            endpoints_generados = extraer_endpoints(endpoints_code)
+
+            readme_final = generar_readme_final(
+                nombre=user_data.nombre,
+                descripcion_global=descripcion_global,
+                arquitectura=resultado.arquitectura,
+                endpoints_generados=endpoints_generados,
+                modo=str(resultado.modo),
+                tecnologias=user_data.tecnologias,
+            )
+
             (output_dir / "README_FINAL.md").write_text(readme_final, encoding="utf-8")
 
             print("======================================")
@@ -372,6 +401,12 @@ Devuelve SOLO código Python entre:
             print(f"Proyecto generado en: output/{user_data.nombre}")
             print(f"Archivos creados: {len(estructura_base)}\n")
             print("La PoC ha sido generada utilizando validación + autocorrección.\n")
+
+            fin_ejecucion = time.perf_counter()
+            duracion = fin_ejecucion - inicio_ejecucion
+            minutos = int(duracion // 60)
+            segundos = int(duracion % 60)
+            print(f"Tiempo total de ejecución: {minutos}m {segundos}s\n")
 
             return
 
@@ -491,29 +526,60 @@ Devuelve SOLO código Python entre:
                 ruta_completa.parent.mkdir(parents=True, exist_ok=True)
                 ruta_completa.write_text(contenido, encoding="utf-8")
 
-            # 5) README_FINAL (siempre generado)
-            readme_final = f"# {user_data.nombre}\n\n"
-            readme_final += "## Generación parcial\n\n"
-            readme_final += "Se ha generado todo el código que puede construirse automáticamente.\n\n"
-            readme_final += "Revisar README_MANUAL para pasos externos pendientes.\n"
-            (output_dir / "README_FINAL.md").write_text(readme_final, encoding="utf-8")
-
-            # 6) README_MANUAL
-            readme_manual = f"# Pasos manuales - {user_data.nombre}\n\n"
-            readme_manual += "Configuración manual requerida para integraciones externas:\n\n"
-            readme_manual += f"{user_data.tecnologias}\n\n"
-            readme_manual += (
-                "- Configuración de credenciales (Service Account / ADC)\n"
-                "- Permisos e IAM\n"
-                "- Variables de entorno necesarias\n"
-                "- Despliegue en Cloud Run\n"
+            # Generación dinámica de README_FINAL y README_MANUAL
+            from scope_guardian.generador_informes import (
+                generar_readme_final,
+                generar_readme_manual,
             )
+
+            import ast
+
+            def extraer_endpoints(code: str):
+                rutas = []
+                try:
+                    tree = ast.parse(code)
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.FunctionDef):
+                            for dec in node.decorator_list:
+                                if isinstance(dec, ast.Attribute) and isinstance(dec.value, ast.Name):
+                                    if dec.value.id == "router":
+                                        if hasattr(dec, "attr"):
+                                            rutas.append(dec.attr.upper())
+                except Exception:
+                    pass
+                return rutas
+
+            endpoints_generados = extraer_endpoints(endpoints_code)
+
+            readme_final = generar_readme_final(
+                nombre=user_data.nombre,
+                descripcion_global=descripcion_global,
+                arquitectura=resultado.arquitectura,
+                endpoints_generados=endpoints_generados,
+                modo=str(resultado.modo),
+                tecnologias=user_data.tecnologias,
+            )
+
+            readme_manual = generar_readme_manual(
+                nombre=user_data.nombre,
+                arquitectura=resultado.arquitectura,
+                tecnologias=user_data.tecnologias,
+                endpoints_generados=endpoints_generados,
+            )
+
+            (output_dir / "README_FINAL.md").write_text(readme_final, encoding="utf-8")
             (output_dir / "README_MANUAL.md").write_text(readme_manual, encoding="utf-8")
 
             print("======================================")
             print("GENERACIÓN PARCIAL FINALIZADA")
             print("======================================\n")
             print(f"Proyecto generado en: output/{user_data.nombre}\n")
+
+            fin_ejecucion = time.perf_counter()
+            duracion = fin_ejecucion - inicio_ejecucion
+            minutos = int(duracion // 60)
+            segundos = int(duracion % 60)
+            print(f"Tiempo total de ejecución: {minutos}m {segundos}s\n")
 
             return
 
@@ -534,18 +600,39 @@ Devuelve SOLO código Python entre:
                 tecnologias=user_data.tecnologias,
             )
 
+        from pathlib import Path
+
+        output_dir = Path("output") / user_data.nombre
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        contenido_readme = f"# {user_data.nombre} — Análisis Estratégico\n\n"
+        contenido_readme += "## Modo Asesor Técnico\n\n"
+
         if opciones_estrategicas:
             for opcion in opciones_estrategicas:
-                print(opcion)
-                print("\n------------------------------\n")
+                contenido_readme += opcion.strip() + "\n\n---\n\n"
 
-            print(
+            contenido_readme += (
                 "Estas validaciones deben ejecutarse antes de iniciar la implementación.\n"
-                "El objetivo es confirmar o descartar hipótesis críticas de viabilidad técnica."
+                "El objetivo es confirmar o descartar hipótesis críticas de viabilidad técnica.\n"
             )
         else:
-            print("No se han podido generar análisis estratégicos.")
-        
+            contenido_readme += "No se han podido generar análisis estratégicos.\n"
+
+        (output_dir / "README_ASESOR.md").write_text(
+            contenido_readme.strip(), encoding="utf-8"
+        )
+
+        print("======================================")
+        print("ANÁLISIS ESTRATÉGICO GENERADO")
+        print("======================================\n")
+        print(f"Archivo generado en: output/{user_data.nombre}/README_ASESOR.md\n")
+
+        fin_ejecucion = time.perf_counter()
+        duracion = fin_ejecucion - inicio_ejecucion
+        minutos = int(duracion // 60)
+        segundos = int(duracion % 60)
+        print(f"Tiempo total de ejecución: {minutos}m {segundos}s\n")
         return
 
     except KeyboardInterrupt:
