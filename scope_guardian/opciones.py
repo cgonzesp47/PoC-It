@@ -142,4 +142,9 @@ Tecnologías:
         if re.match(r"^\d+\)", bloque.strip())
     ]
 
+    # Fallback robusto: si el modelo no respeta exactamente el formato,
+    # devolvemos el texto completo como único bloque estratégico
+    if not opciones and texto:
+        return [texto]
+
     return opciones[:3]
