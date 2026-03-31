@@ -4,6 +4,7 @@ Responsabilidad única: estructuras de datos.
 """
 
 from dataclasses import dataclass
+from enum import Enum
 from pydantic import BaseModel, Field
 
 
@@ -16,8 +17,14 @@ class PlantillaUsuario(BaseModel):
     tecnologias: str = Field(...)
 
 
+class ModoGeneracion(str, Enum):
+    COMPLETO = "COMPLETO"
+    PARCIAL = "PARCIAL"
+    ASESOR = "ASESOR"
+
+
 @dataclass
 class ResultadoViabilidad:
-    puede_generarse_automaticamente: bool
+    modo: ModoGeneracion
     arquitectura: str
     opciones: list[str]
