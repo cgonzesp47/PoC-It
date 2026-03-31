@@ -1,22 +1,42 @@
 """
-ScopeGuardian - Materializador de Archivos
+ScopeGuardian - Inyección Segura de Bloques Dinámicos
 
 Responsabilidad:
-Materializar físicamente en disco una estructura de archivos
-ya validada previamente por los generadores.
-
-Este módulo:
-- NO utiliza LLM.
-- NO valida sintaxis (eso ya fue validado antes).
-- NO mezcla lógica de generación.
-- Elimina completamente el proyecto previo si existe (Opción A).
+- Insertar bloques generados por el LLM dentro de los marcadores.
+- Nunca reescribir archivos completos.
+- Validar sintaxis tras la inyección.
 """
 
 from __future__ import annotations
 
-import os
-import shutil
-from typing import Dict, List
+import ast
+from typing import Dict, List, Any
+
+
+# ==========================================================
+# UTILIDAD INTERNA
+# ==========================================================
+
+
+def _reemplazar_bloque(
+    contenido: str,
+    start_marker: str,
+    end_marker: str,
+    nuevo_bloque: str,
+) -> str:
+    if start_marker not in contenido or end_marker not in contenido:
+        return contenido
+
+    before = contenido.split(start_marker)[0] + start_marker
+    after = contenido.split(end_marker)[1]
+
+    return f"{before}\n{nuevo_bloque.strip()}\n{end_marker}{after}"
+
+
+def _validar_sintaxis(estructura: Dict[str, str]) -> None:
+    for ruta, contenido in estructura.items():
+        if ruta.endswith(".py"):
+            ast.parse(contenido)
 
 
 # ==========================================================
@@ -24,48 +44,77 @@ from typing import Dict, List
 # ==========================================================
 
 
-def materializar_proyecto(
-    nombre_proyecto: str,
-    estructura: Dict[str, str],
-) -> List[str]:
+def inyectar_bloques_dinamicos(
+    estructura_base: Dict[str, str],
+    bloques: Dict[str, Any],
+) -> Dict[str, str]:
     """
-    Materializa en disco la estructura completa del proyecto.
-
-    Si el directorio ya existe, se elimina completamente antes de crear uno nuevo.
-
-    Args:
-        nombre_proyecto: Nombre del proyecto.
-        estructura: Diccionario {ruta_relativa: contenido}.
-
-    Returns:
-        Lista de rutas de archivos creados.
+    Inserta bloques LLM dentro de los marcadores.
     """
 
-    if not estructura:
-        raise ValueError("No hay estructura para materializar")
+    estructura = estructura_base.copy()
 
-    directorio_base = os.path.join("output", nombre_proyecto)
+    # =============================
+    # API.py
+    # =============================
 
-    # Eliminar proyecto anterior si existe
-    if os.path.exists(directorio_base):
-        shutil.rmtree(directorio_base)
+    estructura["app/api.py"] = _reemplazar_bloque(
+        estructura["app/api.py"],
+        "# === LLM_IMPORTS_START ===",
+        "# === LLM_IMPORTS_END ===",
+        str(bloques.get("imports", "") or ""),
+    )
 
-    os.makedirs(directorio_base, exist_ok=True)
+    estructura["app/api.py"] = _reemplazar_bloque(
+        estructura["app/api.py"],
+        "# === LLM_ENDPOINTS_START ===",
+        "# === LLM_ENDPOINTS_END ===",
+        str(bloques.get("endpoints", "") or ""),
+    )
 
-    archivos_creados: List[str] = []
+    # =============================
+    # SCHEMAS
+    # =============================
 
-    for ruta_relativa, contenido in estructura.items():
-        ruta_completa = os.path.join(directorio_base, ruta_relativa)
+    estructura["app/schemas.py"] = _reemplazar_bloque(
+        estructura["app/schemas.py"],
+        "# === LLM_SCHEMAS_START ===",
+        "# === LLM_SCHEMAS_END ===",
+        str(bloques.get("schemas", "") or ""),
+    )
 
-        # Crear directorios intermedios si es necesario
-        directorio_archivo = os.path.dirname(ruta_completa)
-        if directorio_archivo:
-            os.makedirs(directorio_archivo, exist_ok=True)
+    # =============================
+    # SERVICES
+    # =============================
 
-        # Escribir archivo
-        with open(ruta_completa, "w", encoding="utf-8") as f:
-            f.write(contenido)
+    estructura["app/services.py"] = _reemplazar_bloque(
+        estructura["app/services.py"],
+        "# === LLM_SERVICE_LOGIC_START ===",
+        "# === LLM_SERVICE_LOGIC_END ===",
+        str(bloques.get("services_logic", "") or ""),
+    )
 
-        archivos_creados.append(ruta_relativa)
+    # =============================
+    # REQUIREMENTS
+    # =============================
 
-    return archivos_creados
+    raw_requirements = bloques.get("requirements", [])
+    req_extra: List[str] = (
+        raw_requirements
+        if isinstance(raw_requirements, list)
+        else []
+    )
+
+    if req_extra:
+        req_block = "\n".join(str(r) for r in req_extra)
+        estructura["requirements.txt"] = _reemplazar_bloque(
+            estructura["requirements.txt"],
+            "# === LLM_REQUIREMENTS_START ===",
+            "# === LLM_REQUIREMENTS_END ===",
+            req_block,
+        )
+
+    # Validar sintaxis tras inyección
+    _validar_sintaxis(estructura)
+
+    return estructura
