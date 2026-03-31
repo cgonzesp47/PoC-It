@@ -58,7 +58,12 @@ def generar_informe_final(
     lineas.append("")
     lineas.append(
         "Se ha generado automáticamente la estructura base del proyecto "
-        "y los siguientes bloques:"
+        "necesaria para implementar los siguientes bloques funcionales:"
+    )
+    lineas.append("")
+    lineas.append(
+        "_Nota: Algunos bloques pueden requerir implementación manual adicional "
+        "si implican integraciones externas o configuración específica._"
     )
     lineas.append("")
 

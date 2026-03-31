@@ -40,7 +40,7 @@ from scope_guardian.fases import detectar_fase, FaseProyecto
 
 
 async def analizar_viabilidad(datos: PlantillaUsuario) -> ResultadoViabilidad:
-    decision = clasificar_viabilidad(datos)
+    modo = clasificar_viabilidad(datos)
 
     # Detectar fase (actualmente forzada a FASE_0)
     fase = detectar_fase(datos)
@@ -66,7 +66,7 @@ async def analizar_viabilidad(datos: PlantillaUsuario) -> ResultadoViabilidad:
         )
 
     return ResultadoViabilidad(
-        puede_generarse_automaticamente=decision,
+        modo=modo,
         arquitectura=arquitectura,
         opciones=opciones,
     )
