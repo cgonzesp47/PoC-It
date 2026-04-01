@@ -107,6 +107,8 @@ async def main() -> None:
         if resultado.modo == ModoGeneracion.COMPLETO:
             print("\n=== MODO GENERADOR COMPLETO ACTIVADO ===\n")
 
+            inicio_generacion_codigo = time.perf_counter()
+
             # 1) Generar estructura base determinista
             estructura_base = generar_proyecto_base(
                 nombre_proyecto=user_data.nombre,
@@ -384,6 +386,11 @@ Devuelve SOLO código Python entre:
 
             endpoints_generados = extraer_endpoints(endpoints_code)
 
+            fin_generacion_codigo = time.perf_counter()
+            tiempo_generacion_horas = (
+                fin_generacion_codigo - inicio_generacion_codigo
+            ) / 3600
+
             readme_final = generar_readme_final(
                 nombre=user_data.nombre,
                 descripcion_global=descripcion_global,
@@ -391,6 +398,7 @@ Devuelve SOLO código Python entre:
                 endpoints_generados=endpoints_generados,
                 modo=str(resultado.modo),
                 tecnologias=user_data.tecnologias,
+                tiempo_real_scopeguardian_horas=tiempo_generacion_horas,
             )
 
             (output_dir / "README_FINAL.md").write_text(readme_final, encoding="utf-8")
@@ -415,6 +423,8 @@ Devuelve SOLO código Python entre:
         # --------------------------------------------------
         if resultado.modo == ModoGeneracion.PARCIAL:
             print("\n=== MODO GENERACIÓN PARCIAL ACTIVADO ===\n")
+
+            inicio_generacion_codigo = time.perf_counter()
 
             # 1) Estructura base
             estructura_base = generar_proyecto_base(
@@ -551,6 +561,11 @@ Devuelve SOLO código Python entre:
 
             endpoints_generados = extraer_endpoints(endpoints_code)
 
+            fin_generacion_codigo = time.perf_counter()
+            tiempo_generacion_horas = (
+                fin_generacion_codigo - inicio_generacion_codigo
+            ) / 3600
+
             readme_final = generar_readme_final(
                 nombre=user_data.nombre,
                 descripcion_global=descripcion_global,
@@ -558,6 +573,7 @@ Devuelve SOLO código Python entre:
                 endpoints_generados=endpoints_generados,
                 modo=str(resultado.modo),
                 tecnologias=user_data.tecnologias,
+                tiempo_real_scopeguardian_horas=tiempo_generacion_horas,
             )
 
             readme_manual = generar_readme_manual(

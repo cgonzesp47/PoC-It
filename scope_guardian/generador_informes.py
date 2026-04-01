@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import ollama
 from typing import List
+from scope_guardian.estimador_esfuerzo import (
+    calcular_estimacion_llm,
+    generar_bloque_markdown,
+)
 
 
 MODEL = "qwen7b:latest"
@@ -34,6 +38,7 @@ def generar_readme_final(
     endpoints_generados: List[str],
     modo: str,
     tecnologias: str,
+    tiempo_real_scopeguardian_horas: float,
 ) -> str:
     """
     Genera README_FINAL dinámico.
@@ -101,7 +106,75 @@ No incluyas comentarios meta.
     if len(partes) > 2:
         contenido = marcador + partes[1]
 
-    return contenido.strip()
+    contenido = contenido.strip()
+
+    # ======================================================
+    # ESTIMACIÓN BASADA EN LLM
+    # ======================================================
+
+    descripcion_estimacion = f"""
+Proyecto: {nombre}
+Modo: {modo}
+
+Descripción:
+{descripcion_global}
+
+Arquitectura:
+{arquitectura}
+
+Endpoints generados:
+{endpoints_str}
+"""
+
+    # ======================================================
+    # ESTIMACIÓN A) PoC REAL GENERADA
+    # ======================================================
+
+    estimacion_generada = calcular_estimacion_llm(
+        descripcion_proyecto=descripcion_estimacion,
+        modo=modo,
+        tiempo_real_scopeguardian_horas=tiempo_real_scopeguardian_horas,
+    )
+
+    bloque_generada = generar_bloque_markdown(estimacion_generada)
+
+    # ======================================================
+    # ESTIMACIÓN B) PoC COMPLETA SOLICITADA POR EL USUARIO
+    # ======================================================
+
+    descripcion_completa = f"""
+PoC completa solicitada por el usuario (sin simplificaciones):
+
+{descripcion_global}
+"""
+
+    estimacion_completa = calcular_estimacion_llm(
+        descripcion_proyecto=descripcion_completa,
+        modo="COMPLETA_SOLICITADA",
+        tiempo_real_scopeguardian_horas=tiempo_real_scopeguardian_horas,
+    )
+
+    bloque_completa = generar_bloque_markdown(estimacion_completa)
+
+    nota = """
+> Nota: El ahorro real puede ser superior al porcentaje mostrado.  
+> El porcentaje se limita deliberadamente para evitar estimaciones excesivamente optimistas.
+"""
+
+    seccion_estimacion = (
+        "## Estimación de esfuerzo – A) PoC generada automáticamente\n\n"
+        "Esta estimación se refiere únicamente al alcance realmente generado por el sistema.\n\n"
+        + bloque_generada
+        + "\n\n---\n\n"
+        + "## Estimación de esfuerzo – B) PoC completa solicitada\n\n"
+        "Esta estimación considera la implementación completa tal y como fue descrita por el usuario, "
+        "incluyendo integraciones reales, configuración cloud y validación de permisos.\n\n"
+        + bloque_completa
+        + "\n\n"
+        + nota.strip()
+    )
+
+    return contenido + "\n\n---\n\n" + seccion_estimacion
 
 
 def generar_readme_manual(
