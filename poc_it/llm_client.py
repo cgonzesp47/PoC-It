@@ -34,6 +34,9 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# Ollama (fallback local mediante librería oficial)
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen7b:latest")
+
 # Modelos por defecto (puedes ajustarlos según tus preferencias)
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_OPENROUTER_MODEL = OPENROUTER_MODEL
@@ -118,6 +121,40 @@ def _call_openrouter(
         raise LLMError(f"Respuesta OpenRouter inesperada: {data}") from exc
 
 
+def _call_ollama(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.0,
+    max_tokens: Optional[int] = None,
+    **extra: Any,
+) -> str:
+    """
+    Llamada local a Ollama usando la librería oficial `ollama`.
+    Replica el comportamiento previo basado en ollama.chat().
+    """
+    try:
+        import ollama
+    except ImportError as exc:
+        raise LLMError(
+            "La librería 'ollama' no está instalada en el entorno."
+        ) from exc
+
+    try:
+        response = ollama.chat(
+            model=model or OLLAMA_MODEL,
+            messages=messages,
+            options={
+                "temperature": temperature,
+                "num_predict": max_tokens or 400,
+            },
+        )
+
+        return response["message"]["content"]
+
+    except Exception as exc:
+        raise LLMError(f"Error Ollama local: {exc}") from exc
+
+
 # ==========================================================
 # INTERFAZ DE ALTO NIVEL
 # ==========================================================
@@ -148,11 +185,12 @@ def chat_completion_text(
 
     last_error: Optional[Exception] = None
 
-    providers = []
-    if prefer == "groq":
-        providers = ["groq", "openrouter"]
-    else:
-        providers = ["openrouter", "groq"]
+    groq_error: Optional[Exception] = None
+    openrouter_error: Optional[Exception] = None
+    ollama_error: Optional[Exception] = None
+
+    # Orden fijo: Groq → OpenRouter → Ollama
+    providers = ["groq", "openrouter", "ollama"]
 
     for provider in providers:
         try:
@@ -162,17 +200,36 @@ def chat_completion_text(
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
-            else:
+            elif provider == "openrouter":
                 return _call_openrouter(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+            else:
+                return _call_ollama(
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
         except Exception as exc:
-            last_error = exc
+            if provider == "groq":
+                groq_error = exc
+            elif provider == "openrouter":
+                openrouter_error = exc
+            else:
+                ollama_error = exc
             continue
 
-    raise LLMError(f"Ambos proveedores fallaron: {last_error}")
+    error_msg = "All providers failed.\n"
+    if groq_error:
+        error_msg += f"- Groq error: {groq_error}\n"
+    if openrouter_error:
+        error_msg += f"- OpenRouter error: {openrouter_error}\n"
+    if ollama_error:
+        error_msg += f"- Ollama error: {ollama_error}\n"
+
+    raise LLMError(error_msg)
 
 
 def chat_completion_json(
@@ -200,7 +257,6 @@ def chat_completion_json(
         prefer=prefer,
     )
 
-    # Intento rápido de localizar el JSON si el modelo añade ruido
     raw_stripped = raw.strip()
     if raw_stripped.startswith("{") and raw_stripped.endswith("}"):
         return raw_stripped
@@ -210,9 +266,7 @@ def chat_completion_json(
         start = raw.index("{")
         end = raw.rindex("}")
         candidate = raw[start : end + 1]
-        # Validación rápida
         json.loads(candidate)
         return candidate
     except Exception:
-        # Devolver tal cual; el módulo llamador decidirá el fallback
         return raw
