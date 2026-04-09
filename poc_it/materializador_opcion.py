@@ -15,7 +15,7 @@ Diseño:
 from __future__ import annotations
 
 import re
-import ollama
+from poc_it.llm_client import chat_completion_text
 
 
 # ==========================================================
@@ -106,17 +106,12 @@ def materializar_opcion(
         contexto_proyecto=contexto_proyecto,
     )
 
-    response = ollama.chat(
-        model="qwen7b:latest",
-        messages=[{"role": "user", "content": prompt}],
-        options={
-            "temperature": 0.2,
-            "num_predict": 900,
-            "stop": ["END_OF_REPORT"],
-        },
-    )
-
-    texto = response.get("message", {}).get("content", "").strip()
+    texto = chat_completion_text(
+        prompt=prompt,
+        system=None,
+        temperature=0.2,
+        max_tokens=900,
+    ).strip()
 
     if "END_OF_REPORT" in texto:
         texto = texto.split("END_OF_REPORT")[0].strip()

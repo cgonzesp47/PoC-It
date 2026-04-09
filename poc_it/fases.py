@@ -6,8 +6,8 @@ Delegar en el modelo la clasificación del estado real del usuario.
 """
 
 from enum import Enum
-import ollama
 from poc_it.models import PlantillaUsuario
+from poc_it.llm_client import chat_completion_json
 
 
 class FaseProyecto(str, Enum):
@@ -58,17 +58,12 @@ Usuarios:
 
     prompt = f"{PROMPT_EXTRACCION_FASE}\n\nDescripción del usuario:\n{descripcion}"
 
-    respuesta = ollama.chat(
-        model="qwen7b:latest",
-        messages=[{"role": "user", "content": prompt}],
-        format="json",  # Fuerza salida estructurada si el backend lo soporta
-        options={
-            "temperature": 0.0,
-            "num_predict": 200,
-        },
+    data = chat_completion_json(
+        prompt=prompt,
+        system=None,
+        temperature=0.0,
+        max_tokens=200,
     )
-
-    data = respuesta.get("message", {}).get("content", "{}")
 
     try:
         import json

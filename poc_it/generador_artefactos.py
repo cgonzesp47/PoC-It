@@ -18,7 +18,7 @@ import json
 import re
 from typing import Dict, Any
 
-import ollama
+from poc_it.llm_client import chat_completion_text
 
 
 # ==========================================================
@@ -50,12 +50,12 @@ def _codigo_es_valido(codigo: str) -> bool:
 
 
 def _llamar_modelo(prompt: str, max_tokens: int = 2500) -> str:
-    response = ollama.chat(
-        model="qwen7b:latest",
-        messages=[{"role": "user", "content": prompt}],
-        options={"temperature": 0.0, "num_predict": max_tokens},
+    return chat_completion_text(
+        prompt=prompt,
+        system=None,
+        temperature=0.0,
+        max_tokens=max_tokens,
     )
-    return response.get("message", {}).get("content", "")
 
 
 def _generar_con_reintentos(

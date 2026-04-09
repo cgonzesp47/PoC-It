@@ -20,8 +20,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Dict, Any
-import ollama
 import json
+from poc_it.llm_client import chat_completion_json
 
 
 # ==========================================================
@@ -100,17 +100,12 @@ Descripción de la PoC:
 {descripcion_proyecto}
 """
 
-    response = ollama.chat(
-        model="qwen7b:latest",
-        messages=[{"role": "user", "content": prompt}],
-        format="json",
-        options={
-            "temperature": 0.0,
-            "num_predict": 800,
-        },
+    contenido = chat_completion_json(
+        prompt=prompt,
+        system=None,
+        temperature=0.0,
+        max_tokens=800,
     )
-
-    contenido = response.get("message", {}).get("content", "{}")
 
     try:
         data: Dict[str, Any] = json.loads(contenido)

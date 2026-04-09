@@ -14,8 +14,8 @@ Por tanto:
 """
 
 import re
-import ollama
 from typing import List
+from poc_it.llm_client import chat_completion_text
 
 
 # ==========================================================
@@ -171,13 +171,12 @@ Impacto en la decisión final:
 No añadas texto fuera de los 3 bloques.
 """
 
-    respuesta = ollama.chat(
-        model="qwen7b:latest",
-        messages=[{"role": "user", "content": prompt_estable}],
-        options={"temperature": 0.2, "num_predict": 1700},
-    )
-
-    texto = respuesta.get("message", {}).get("content", "").strip()
+    texto = chat_completion_text(
+        prompt=prompt_estable,
+        system=None,
+        temperature=0.2,
+        max_tokens=1700,
+    ).strip()
 
     texto = re.sub(r"```.*?```", "", texto, flags=re.DOTALL)
 

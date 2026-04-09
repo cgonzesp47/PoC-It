@@ -11,24 +11,24 @@ Prompts concisos, estructurados y orientados a valor.
 
 from __future__ import annotations
 
-import ollama
 from typing import List
+from poc_it.llm_client import chat_completion_text
 from poc_it.estimador_esfuerzo import (
     calcular_estimacion_llm,
     generar_bloque_markdown,
 )
 
 
-MODEL = "qwen7b:latest"
+# Modelo gestionado centralmente por llm_client
 
 
 def _llamar_modelo(prompt: str, max_tokens: int = 1800) -> str:
-    response = ollama.chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        options={"temperature": 0.2, "num_predict": max_tokens},
-    )
-    return response.get("message", {}).get("content", "").strip()
+    return chat_completion_text(
+        prompt=prompt,
+        system=None,
+        temperature=0.2,
+        max_tokens=max_tokens,
+    ).strip()
 
 
 def generar_readme_final(

@@ -11,8 +11,8 @@ Nueva estrategia:
 from __future__ import annotations
 
 from dataclasses import dataclass
-import ollama
 import json
+from poc_it.llm_client import chat_completion_json
 
 
 # ==========================================================
@@ -77,20 +77,12 @@ Descripción técnica de la PoC:
 {descripcion_proyecto}
 """
 
-    response = ollama.chat(
-        model="qwen7b:latest",
-        messages=[
-            {"role": "system", "content": "Responde únicamente con JSON válido."},
-            {"role": "user", "content": prompt},
-        ],
-        format="json",
-        options={
-            "temperature": 0.0,
-            "num_predict": 400,
-        },
+    contenido = chat_completion_json(
+        prompt=prompt,
+        system="Responde únicamente con JSON válido.",
+        temperature=0.0,
+        max_tokens=400,
     )
-
-    contenido = response.get("message", {}).get("content", "{}")
 
     try:
         data = json.loads(contenido)
