@@ -1,44 +1,35 @@
 """
-ScopeGuardian - Generador de Artefactos Robusto con Validación y Reintentos
+PoC-it – Generador Libre de Proyecto Completo (Arquitectura basada en LLM cloud)
 
-Arquitectura definitiva para modelos locales (qwen7b):
+Nueva estrategia:
 
-1) Diseño estructural canónico.
-2) Generación por archivo individual.
-3) Delimitadores obligatorios de salida.
-4) Extracción segura del bloque de código.
-5) Validación sintáctica (AST).
-6) Reintentos automáticos si el código no es válido.
+- El modelo genera el proyecto completo.
+- Devuelve JSON estructurado con lista de archivos.
+- No imponemos arquitectura.
+- No imponemos capas.
+- No imponemos scaffolding.
+- El modelo decide estructura.
+
+Mantenemos:
+- Validación sintáctica AST para cada archivo Python.
+- Reintentos automáticos si hay errores.
 """
 
 from __future__ import annotations
 
 import ast
 import json
-import re
-from typing import Dict, Any
+from typing import Dict, Any, List
 
-from poc_it.llm_client import chat_completion_text
+from poc_it.llm_client import chat_completion_json
 
 
 # ==========================================================
-# UTILIDADES INTERNAS
+# VALIDACIÓN SINTÁCTICA
 # ==========================================================
 
 
-BEGIN = "### BEGIN_CODE"
-END = "### END_CODE"
-
-
-def _extraer_codigo_delimitado(texto: str) -> str:
-    pattern = re.compile(rf"{BEGIN}(.*?){END}", re.DOTALL)
-    match = pattern.search(texto)
-    if not match:
-        return ""
-    return match.group(1).strip()
-
-
-def _codigo_es_valido(codigo: str) -> bool:
+def _codigo_python_valido(codigo: str) -> bool:
     try:
         ast.parse(codigo)
         return True
@@ -46,192 +37,113 @@ def _codigo_es_valido(codigo: str) -> bool:
         return False
 
 
-# (Validación semántica eliminada temporalmente para no bloquear generación)
+def _validar_proyecto(files: List[Dict[str, str]]) -> bool:
+    """
+    Valida sintácticamente todos los archivos .py generados.
+    """
+    for f in files:
+        path = f.get("path", "")
+        content = f.get("content", "")
 
+        if path.endswith(".py"):
+            if not _codigo_python_valido(content):
+                return False
 
-def _llamar_modelo(prompt: str, max_tokens: int = 2500) -> str:
-    return chat_completion_text(
-        prompt=prompt,
-        system=None,
-        temperature=0.0,
-        max_tokens=max_tokens,
-    )
-
-
-def _generar_con_reintentos(
-    prompt: str,
-    max_tokens: int = 2500,
-    intentos: int = 3,
-) -> str:
-    for _ in range(intentos):
-        salida = _llamar_modelo(prompt, max_tokens=max_tokens)
-        codigo = _extraer_codigo_delimitado(salida)
-
-        if codigo and _codigo_es_valido(codigo):
-            return codigo
-
-    return ""
+    return True
 
 
 # ==========================================================
-# FASE 1 — DISEÑO ESTRUCTURAL
+# PROMPT LIBRE DE GENERACIÓN COMPLETA
 # ==========================================================
 
 
-def generar_diseno_estructural(descripcion_global: str) -> Dict[str, Any]:
-    prompt = f"""
-Extrae el diseño estructural de la siguiente PoC.
+def _construir_prompt_proyecto_completo(descripcion_global: str) -> str:
+    return f"""
+Eres un arquitecto backend senior experto en diseño de APIs en Python.
+
+Tu tarea es generar una PoC backend COMPLETA y ejecutable basada en la siguiente descripción.
+
+DESCRIPCIÓN DE LA POC:
+{descripcion_global}
+
+REQUISITOS:
+
+- Usa Python y FastAPI.
+- La arquitectura queda a tu criterio.
+- Puedes organizar carpetas libremente.
+- Debe ser ejecutable con uvicorn.
+- Incluye requirements.txt.
+- Incluye README.md breve.
+- No incluyas comentarios meta.
+- No incluyas texto fuera del JSON.
 
 Devuelve EXCLUSIVAMENTE JSON válido con esta estructura:
 
 {{
-  "entities": [
+  "files": [
     {{
-      "name": "EntityName",
-      "fields": {{
-        "field_name": "str|int|float|bool"
-      }}
+      "path": "ruta/archivo.ext",
+      "content": "contenido completo del archivo"
     }}
   ]
 }}
 
-No generes código.
-No generes texto fuera del JSON.
+Reglas importantes:
+- No generes texto fuera del JSON.
+- Cada archivo debe incluir todo su contenido.
+- Los archivos Python deben ser sintácticamente válidos.
+- No uses bloques ```.
 
-PoC:
-{descripcion_global}
+Genera el proyecto ahora.
 """
-
-    salida = _llamar_modelo(prompt, max_tokens=1200)
-
-    try:
-        return json.loads(salida)
-    except Exception:
-        return {"entities": []}
 
 
 # ==========================================================
-# FASE 2 — GENERACIÓN POR ARCHIVO CON VALIDACIÓN
+# GENERACIÓN PRINCIPAL CON REINTENTOS
 # ==========================================================
 
 
-def generar_schemas_clases(diseno: Dict[str, Any]) -> str:
+def generar_proyecto_completo(
+    descripcion_global: str,
+    intentos: int = 3,
+) -> Dict[str, Any]:
     """
-    Genera únicamente las clases Pydantic (sin imports).
-    Se insertarán dentro de una plantilla fija con BaseModel.
-    """
-
-    prompt = f"""
-Diseño estructural EXACTO:
-
-{json.dumps(diseno, indent=2)}
-
-Genera ÚNICAMENTE las clases usando Pydantic BaseModel.
-
-NO generes:
-- imports
-- texto explicativo
-- otras librerías (NO marshmallow)
-- código fuera de clases
-
-Devuelve SOLO código Python entre estas marcas:
-
-{BEGIN}
-<codigo>
-{END}
-"""
-
-    return _generar_con_reintentos(prompt, max_tokens=2000)
-
-
-def generar_services_py(diseno: Dict[str, Any]) -> str:
-    prompt = f"""
-Diseño estructural EXACTO:
-
-{json.dumps(diseno, indent=2)}
-
-Genera el archivo completo services.py con CRUD en memoria.
-
-Devuelve SOLO código Python entre estas marcas:
-
-{BEGIN}
-<codigo>
-{END}
-"""
-
-    return _generar_con_reintentos(prompt, max_tokens=2500)
-
-
-def generar_api_endpoints(diseno: Dict[str, Any]) -> str:
-    """
-    Genera únicamente los endpoints (sin imports ni creación de router).
-    Se insertarán dentro de una plantilla fija FastAPI.
+    Genera el proyecto completo delegando la arquitectura al modelo.
+    Mantiene validación AST y reintentos.
     """
 
-    prompt = f"""
-Diseño estructural EXACTO:
+    prompt = _construir_prompt_proyecto_completo(descripcion_global)
 
-{json.dumps(diseno, indent=2)}
+    for intento in range(intentos):
+        respuesta_json = chat_completion_json(
+            prompt=prompt,
+            system=None,
+            temperature=0.2,
+            max_tokens=6000,
+        )
 
-Genera ÚNICAMENTE las funciones de endpoints usando:
+        try:
+            data = json.loads(respuesta_json)
+        except Exception:
+            continue
 
-- router (ya existe)
-- schemas
-- services
+        files = data.get("files", [])
 
-NO generes:
-- imports
-- creación de APIRouter
-- creación de FastAPI
-- texto explicativo
+        if not isinstance(files, list) or not files:
+            continue
 
-Devuelve SOLO código Python entre estas marcas:
+        if _validar_proyecto(files):
+            return {"files": files}
 
-{BEGIN}
-<codigo>
-{END}
+        # Si falla validación AST, pedimos corrección explícita
+        prompt = f"""
+El proyecto generado anteriormente tiene errores de sintaxis en archivos Python.
+
+Corrige los errores y devuelve nuevamente el JSON completo siguiendo exactamente el mismo formato.
+
+Proyecto anterior:
+{respuesta_json}
 """
 
-    return _generar_con_reintentos(prompt, max_tokens=3000)
-
-
-def generar_requirements_adicionales(descripcion_global: str) -> str:
-    prompt = f"""
-Analiza la siguiente PoC.
-
-Devuelve SOLO dependencias adicionales (una por línea)
-entre estas marcas:
-
-{BEGIN}
-<dependencias>
-{END}
-
-No incluyas:
-- fastapi
-- uvicorn
-- pydantic
-- python
-- texto explicativo
-
-PoC:
-{descripcion_global}
-"""
-
-    salida = _llamar_modelo(prompt, max_tokens=800)
-    bloque = _extraer_codigo_delimitado(salida)
-
-    # Sanitización básica (sin bloquear generación)
-    lineas_validas = []
-    for linea in bloque.splitlines():
-        linea = linea.strip()
-        if not linea:
-            continue
-        if "<" in linea or ">" in linea:
-            continue
-        if linea.startswith("-"):
-            continue
-        if linea.lower() in {"fastapi", "uvicorn", "pydantic", "python"}:
-            continue
-        lineas_validas.append(linea)
-
-    return "\n".join(lineas_validas)
+    # Si tras reintentos falla, devolvemos estructura mínima
+    return {"files": []}
