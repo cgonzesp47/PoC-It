@@ -16,7 +16,12 @@ Diseñado específicamente para LLM local 7B.
 
 from __future__ import annotations
 
-from poc_it.models import PlantillaUsuario, ResultadoViabilidad
+from poc_it.models import (
+    PlantillaUsuario,
+    ResultadoViabilidad,
+    ProjectContext,
+    ModoGeneracion,
+)
 from poc_it.clasificador import clasificar_viabilidad
 from poc_it.arquitectura import generar_arquitectura
 from poc_it.opciones import generar_opciones
@@ -40,16 +45,33 @@ from poc_it.fases import detectar_fase, FaseProyecto
 
 
 async def analizar_viabilidad(datos: PlantillaUsuario) -> ResultadoViabilidad:
-    modo = clasificar_viabilidad(datos)
+    """
+    Adaptador temporal para mantener compatibilidad con el flujo actual
+    mientras el sistema migra progresivamente a ProjectContext.
+    """
 
-    # Detectar fase (actualmente forzada a FASE_0)
+    # ==========================================================
+    # 1) Construcción de ProjectContext a partir de PlantillaUsuario
+    # ==========================================================
+    context = ProjectContext(plantilla=datos)
+
+    context = clasificar_viabilidad(context)
+
+    # Convertimos la clasificación almacenada en el contexto
+    # al Enum ModoGeneracion esperado por el flujo antiguo.
+    try:
+        modo = ModoGeneracion(context.clasificacion.upper())
+    except Exception:
+        modo = ModoGeneracion.ASESOR
+
+    # ==========================================================
+    # 2) Flujo original conservado
+    # ==========================================================
+
     fase = detectar_fase(datos)
 
-    # NUEVO FLUJO:
-    # En FASE_0 no generamos arquitectura primero.
-    # Generamos directamente opciones estratégicas de arranque.
     if fase == FaseProyecto.FASE_0:
-        arquitectura = ""  # No inducimos sesgo arquitectónico
+        arquitectura = ""
         opciones = generar_opciones(
             arquitectura="",
             limites=datos.limites,
