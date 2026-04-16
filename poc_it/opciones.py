@@ -115,80 +115,87 @@ Tecnologías:
 """
 
     # ==========================================================
-    # VERSIÓN ESTABLE — UN SOLO PASE SIN TECNOLOGÍAS HARDCODEADAS
+    # ASESOR ARQUITECTÓNICO AVANZADO + QUALITY GATE
     # ==========================================================
     prompt_estable = f"""
-Eres un arquitecto software senior encargado de decidir si una PoC es viable o no desde un punto de vista arquitectónico profundo.
+Eres un Principal Engineer especializado en evaluación estructural de sistemas distribuidos y PoCs complejas en entornos cloud.
 
-Tu objetivo NO es hacer un checklist básico.
-Tu objetivo es detectar posibles puntos de fallo estructurales que podrían obligar a rediseñar la solución.
+Tu misión es generar un análisis arquitectónico profundo que aporte el máximo valor técnico posible al usuario, aunque la PoC no pueda generarse automáticamente.
 
-Analiza la siguiente PoC y genera EXACTAMENTE 3 riesgos arquitectónicos críticos.
+No te limites a identificar riesgos.
 
-Un riesgo arquitectónico crítico es aquel que:
-- Puede invalidar el enfoque elegido.
-- Puede requerir cambio de diseño.
-- Puede implicar rediseño de autenticación, integración o despliegue.
-- Puede afectar seguridad, aislamiento, modelo de permisos o arquitectura de ejecución.
+Debes generar un documento estructurado con las siguientes secciones:
 
-Reglas estrictas:
-- No repitas riesgos similares.
-- No generes riesgos operativos triviales.
-- No describas pasos de consola básicos.
-- No generes documentación adicional.
-- No incluyas YAML ni bloques extraños.
-- Basa el análisis únicamente en la descripción proporcionada.
-- Cada riesgo debe incluir una acción concreta de validación técnica real.
-- Cada riesgo debe analizar el modo de fallo (failure mode).
-- Cada riesgo debe indicar qué alternativa arquitectónica existiría si falla.
+1. Resumen Ejecutivo
+2. Supuestos Arquitectónicos Implícitos
+3. Riesgos Estructurales Críticos
+4. Validaciones Técnicas Recomendadas
+5. Estrategia de Implementación Recomendada
+6. Decisión Arquitectónica Sugerida
+
+REGLAS ESTRICTAS:
+
+- No inventes componentes no mencionados en la descripción.
+- No generes riesgos triviales.
+- No repitas conceptos.
+- Basa el análisis exclusivamente en la descripción proporcionada.
+- Evalúa explícitamente:
+  - Identidad y autorización en entorno de ejecución
+  - Dependencia de red y egress
+  - Límites estructurales de plataforma (timeouts, escalado, concurrencia)
+  - Acoplamientos fuertes
+  - Idempotencia
+  - Impacto de fallos parciales
 
 PoC:
 {descripcion_global}
 
-Usa EXACTAMENTE esta estructura:
-
-1)
-Riesgo arquitectónico:
-Hipótesis arquitectónica que se está poniendo a prueba:
-Por qué es crítico en esta PoC:
-Modo de fallo técnico probable:
-Acción de validación técnica:
-Pasos concretos:
-1.
-2.
-3.
-Criterio de confirmación:
-Criterio de invalidación:
-Alternativa arquitectónica si falla:
-Impacto en la decisión final:
-
-2)
-...
-
-3)
-...
-
-No añadas texto fuera de los 3 bloques.
+Genera el análisis completo como documento profesional.
+No añadas texto fuera del análisis.
 """
 
     texto = chat_completion_text(
         prompt=prompt_estable,
         system=None,
         temperature=0.2,
-        max_tokens=1700,
+        max_tokens=3000,
     ).strip()
 
     texto = re.sub(r"```.*?```", "", texto, flags=re.DOTALL)
 
-    bloques = re.split(r"\n(?=\d+\))", texto)
+    # =========================
+    # QUALITY GATE ESTRUCTURAL
+    # =========================
+    def quality_gate_fail(analysis: str) -> bool:
+        analysis_lower = analysis.lower()
+        descripcion_lower = descripcion_global.lower()
 
-    opciones = [
-        bloque.strip()
-        for bloque in bloques
-        if re.match(r"^\d+\)", bloque.strip())
-    ]
+        # Verificar secciones obligatorias
+        required_sections = [
+            "resumen ejecutivo",
+            "supuestos arquitectónicos",
+            "riesgos estructurales",
+            "validaciones técnicas",
+            "estrategia de implementación",
+            "decisión arquitectónica"
+        ]
 
-    if not opciones and texto:
-        return [texto]
+        for section in required_sections:
+            if section not in analysis_lower:
+                return True
 
-    return opciones[:3]
+        return False
+
+    if quality_gate_fail(texto):
+        texto = chat_completion_text(
+            prompt=prompt_estable
+            + "\n\nEl análisis anterior no cumple los requisitos estructurales. "
+              "Reformula con mayor profundidad, sin inventar componentes y respetando todas las secciones obligatorias.",
+            system=None,
+            temperature=0.1,
+            max_tokens=3000,
+        ).strip()
+
+        texto = re.sub(r"```.*?```", "", texto, flags=re.DOTALL)
+
+    return [texto]
