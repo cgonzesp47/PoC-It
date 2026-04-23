@@ -1,0 +1,149 @@
+# NOTE: Keep this file ASCII/UTF-8 clean to avoid Windows cp1252 decode issues.
+model_list:
+  # Context normalization (strict JSON)
+  # Reparto de carga: preferimos Cerebras/Gemini antes que Groq para evitar 429 en cascada.
+  - model_name: ctx-json
+    litellm_params:
+      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      api_key: os.environ/CEREBRAS_API_KEY
+
+  - model_name: ctx-json-gemini
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: ctx-json-groq
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+
+  - model_name: ctx-json-openrouter
+    litellm_params:
+      model: openrouter/gpt-oss-120b
+      api_key: os.environ/OPENROUTER_API_KEY
+
+
+  # Classification/decision (JSON)
+  # Igual: Cerebras primero, Groq segundo, Gemini tercero, OpenRouter último.
+  - model_name: cls-json
+    litellm_params:
+      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      api_key: os.environ/CEREBRAS_API_KEY
+
+  - model_name: cls-json-groq
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+
+  - model_name: cls-json-gemini
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: cls-json-openrouter
+    litellm_params:
+      model: openrouter/gpt-oss-120b
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # Code generation
+  # Primary: Mistral (codestral-latest)
+  # Fallback: Cerebras (llama-3.3-70b) - handled by proxy routing below
+  - model_name: code-gen
+    litellm_params:
+      model: mistral/codestral-latest
+      api_key: os.environ/MISTRAL_API_KEY
+
+  # Code generation fallback target (do not call directly; used by routing)
+  - model_name: code-gen-fallback
+    litellm_params:
+      # Cerebras fallback optimized for code generation
+      # NOTE: Cerebras model IDs are strict; use the exact ID exposed by your account.
+      # From the models shown in your UI, the most code-capable is likely the Qwen 3 235B Instruct family.
+      # Try this canonical ID (common in Cerebras catalogs); adjust if your account uses a different slug.
+      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      api_key: os.environ/CEREBRAS_API_KEY
+
+  # Documentation (text)
+  # Reparto de carga: OpenRouter y Gemini antes que Groq.
+  - model_name: docs
+    litellm_params:
+      model: openrouter/gpt-oss-120b
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: docs-gemini
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: docs-cerebras
+    litellm_params:
+      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      api_key: os.environ/CEREBRAS_API_KEY
+
+  - model_name: docs-groq
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+
+  # Estimates (text/short)
+  - model_name: estimate
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: estimate-cerebras
+    litellm_params:
+      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      api_key: os.environ/CEREBRAS_API_KEY
+
+  - model_name: estimate-groq
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+
+  - model_name: estimate-openrouter
+    litellm_params:
+      model: openrouter/gpt-oss-120b
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # Separate alias for Groq large model (optional)
+  - model_name: groq-big
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+
+# Proxy-level fallback routing (requires LiteLLM Proxy version that supports this field)
+# When calling "code-gen", if Mistral errors, route to "code-gen-fallback" (Cerebras).
+model_group_alias:
+  ctx-json:
+    models:
+      - ctx-json
+      - ctx-json-gemini
+      - ctx-json-groq
+      - ctx-json-openrouter
+  
+  cls-json:
+    models:
+      - cls-json
+      - cls-json-groq
+      - cls-json-gemini
+      - cls-json-openrouter
+
+  docs:
+    models:
+      - docs
+      - docs-gemini
+      - docs-cerebras
+      - docs-groq
+
+  estimate:
+    models:
+      - estimate
+      - estimate-cerebras
+      - estimate-groq
+      - estimate-openrouter
+
+  code-gen:
+    models:
+      - code-gen
+      - code-gen-fallback
