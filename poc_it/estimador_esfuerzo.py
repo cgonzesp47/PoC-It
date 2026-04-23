@@ -117,6 +117,7 @@ Descripción técnica de la PoC:
         system="Responde únicamente con JSON válido.",
         temperature=0.0,
         max_tokens=300,
+        fase="estimacion",
     )
 
     try:
@@ -171,6 +172,7 @@ Métricas estructurales detectadas:
         system="Responde únicamente con JSON válido.",
         temperature=0.0,
         max_tokens=400,
+        fase="estimacion",
     )
 
     try:

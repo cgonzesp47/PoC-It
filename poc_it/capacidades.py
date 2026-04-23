@@ -105,6 +105,7 @@ Descripción de la PoC:
         system=None,
         temperature=0.0,
         max_tokens=800,
+        fase="estimacion",
     )
 
     try:

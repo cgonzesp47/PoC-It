@@ -111,6 +111,7 @@ def clasificar_viabilidad(context: ProjectContext) -> ProjectContext:
         prompt=prompt,
         system=SYSTEM_MESSAGE,
         temperature=0.0,
+        fase="clasificacion",
     )
 
     try:

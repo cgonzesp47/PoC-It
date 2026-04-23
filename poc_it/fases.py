@@ -63,6 +63,7 @@ Usuarios:
         system=None,
         temperature=0.0,
         max_tokens=200,
+        fase="clasificacion",
     )
 
     try:

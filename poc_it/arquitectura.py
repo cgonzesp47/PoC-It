@@ -68,6 +68,7 @@ Límites:
         prompt=prompt,
         temperature=0.2,
         max_tokens=700,
+        fase="documentacion",
     ).strip()
 
     if "END_OF_REPORT" in texto:

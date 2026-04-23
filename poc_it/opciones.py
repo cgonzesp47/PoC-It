@@ -159,6 +159,7 @@ No añadas texto fuera del análisis.
         system=None,
         temperature=0.2,
         max_tokens=3000,
+        fase="documentacion",
     ).strip()
 
     texto = re.sub(r"```.*?```", "", texto, flags=re.DOTALL)
@@ -194,6 +195,7 @@ No añadas texto fuera del análisis.
             system=None,
             temperature=0.1,
             max_tokens=3000,
+            fase="documentacion",
         ).strip()
 
         texto = re.sub(r"```.*?```", "", texto, flags=re.DOTALL)

@@ -68,6 +68,7 @@ Tecnologías declaradas: {plantilla.tecnologias}
         system="Responde exclusivamente con JSON válido.",
         temperature=0.0,
         max_tokens=800,
+        fase="normalizacion_contexto",
     )
 
     try:
