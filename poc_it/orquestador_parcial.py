@@ -18,12 +18,48 @@ Flujo nuevo:
 
 from __future__ import annotations
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
+import os
+import subprocess
 
 from poc_it.generador_artefactos import generar_proyecto_completo
 from poc_it.materializador_archivos import materializar_proyecto
 from poc_it.models import ProjectContext, PlantillaUsuario
 from poc_it.clasificador import clasificar_viabilidad
+
+
+def _runtime_verify_fastapi_project(project_dir: str) -> Tuple[bool, str]:
+    """
+    Verificación runtime mínima (genérica) para proyectos FastAPI generados.
+
+    Objetivo:
+    - Confirmar que el entrypoint `app.main:app` es importable SIN configuración externa.
+
+    Importante:
+    - No valida endpoints concretos (p.ej. /health) porque no siempre existirán.
+    - No valida integraciones externas (Drive, DB, etc.). Solo valida "arranque/import-time".
+    - Devuelve detalles ricos (stdout/stderr + hints) para repair loop.
+    """
+    py = "python"
+
+    p1 = subprocess.run(
+        [py, "-c", "import app.main; print('IMPORT_OK')"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+    )
+    if p1.returncode != 0:
+        out = (p1.stdout or "") + "\n" + (p1.stderr or "")
+        hint = (
+            "HINTS:\n"
+            "- Si el error es ValidationError/BaseSettings: estás validando settings en import-time; usa lazy get_settings().\n"
+            "- Si el error es TypeError missing positional arguments: estás instanciando un servicio/clase en import-time sin pasar args; crea el servicio dentro del endpoint o con Depends.\n"
+            "- Si el error es ImportError: estás importando un símbolo que no existe o tienes imports circulares.\n"
+            "- Si el error es ModuleNotFoundError: falta una dependencia en requirements.txt.\n"
+        )
+        return False, f"[runtime_verify] import app.main failed:\n{out}\n{hint}"
+
+    return True, "IMPORT_OK"
 
 
 class OrquestadorParcial:
@@ -163,54 +199,75 @@ Descripción:
                     estructura=estructura,
                 )
 
-            # ======================================================
-            # GENERACIÓN DE README PROFESIONAL (POST-PROCESADO)
-            # ======================================================
+                # ==========================================
+                # 3.1) Verificación runtime mínima (evita PoCs que no arrancan)
+                # ==========================================
+                # Si falla, intentamos un repair loop dirigido usando el traceback real.
+                project_dir = os.path.join("output", self.nombre_proyecto)
 
-            from poc_it.generador_informes import (
-                generar_readme_final,
-                generar_readme_manual,
-            )
+                max_runtime_repairs = 5
+                for attempt in range(max_runtime_repairs + 1):
+                    ok_runtime, detail = _runtime_verify_fastapi_project(project_dir)
+                    if ok_runtime:
+                        break
 
-            # Detectar endpoints simples a partir de paths
-            endpoints_detectados = [
-                path for path in estructura.keys()
-                if path.endswith(".py")
-            ]
+                    if attempt >= max_runtime_repairs:
+                        raise ValueError(
+                            "El proyecto generado no supera verificación runtime.\n"
+                            + detail
+                            + "\n\n"
+                            + "Sugerencia: evita validar configuración/credenciales en import-time; "
+                              "haz lazy init y valida en runtime (en el endpoint que lo necesite)."
+                        )
 
-            # ======================================================
-            # GENERACIÓN DE DOCUMENTACIÓN EN PARALELO
-            # ======================================================
-            from concurrent.futures import ThreadPoolExecutor
+                    # Repair: pedimos al modelo corregir SOLO los archivos implicados en el traceback.
+                    # Importante: no "inventar" símbolos (p.ej. get_settings / get_drive_service) que luego no existan.
+                    error_context = f"""
+FALLO EN VERIFICACIÓN RUNTIME (import app.main)
+El proyecto debe ser importable sin configuración externa.
 
-            from poc_it.generador_informes import (
-                generar_readme_final,
-                generar_readme_manual,
-                generar_readme_asesor,
-            )
-            from poc_it.opciones import generar_opciones
+Error:
+{detail}
 
-            # Usar primero contexto normalizado si existe
-            if context.contexto_normalizado:
-                arquitectura_real = context.contexto_normalizado.objetivo_tecnico
-                limites_reales = ", ".join(context.contexto_normalizado.restricciones_tecnicas)
-                tecnologias_reales = ", ".join(context.contexto_normalizado.integraciones_externas)
-                funcionalidades_reales = ", ".join(context.contexto_normalizado.funcionalidades_clave)
-                usuarios_reales = ", ".join(context.contexto_normalizado.actores_principales)
-            else:
-                arquitectura_real = context.plantilla.problema
-                limites_reales = context.plantilla.limites or ""
-                tecnologias_reales = context.plantilla.tecnologias or ""
-                funcionalidades_reales = context.plantilla.funcionalidades or ""
-                usuarios_reales = context.plantilla.usuarios or ""
+REGLAS DE REPARACIÓN (MÍNIMAS, CANÓNICAS)
+- Corrige SOLO los archivos del proyecto implicados en el traceback.
+- No cambies la arquitectura ni introduzcas nuevas dependencias innecesarias: corrige wiring/errores.
+- Evita instanciar servicios/configuración en import-time. Haz lazy init dentro de endpoints/funciones.
+- Mantén el patrón FastAPI con routers.
+- Regla general: si importas `from X import Y`, entonces Y DEBE existir en X (no inventar símbolos).
+- Si existe `app/config/settings.py`, el patrón de settings debe ser consistente:
+  - Debe existir `class Settings(BaseSettings)`.
+  - Debe existir `def get_settings() -> Settings` (cacheada con lru_cache) y ser el ÚNICO punto de creación.
+  - Prohibido `settings = Settings()` en import-time si hay campos requeridos.
+  - Si algún módulo hace `from app.config.settings import get_settings`, entonces get_settings DEBE existir.
 
-            opciones_estrategicas = generar_opciones(
-                arquitectura=arquitectura_real,
-                limites=limites_reales,
-                tecnologias=tecnologias_reales,
-            )
+SALIDA
+- Devuelve JSON con la lista completa de archivos corregidos (solo los modificados) con formato:
+  {{ "files": [{{"path":"...", "content":"..."}}] }}
+"""
 
-            t_documentacion_inicio = time.perf_counter()
+                    reparacion = generar_proyecto_completo(
+                        descripcion_global=self.descripcion_global + "\n\n" + error_context,
+                        contexto_normalizado=(
+                            context.contexto_normalizado.model_dump()
+                            if context.contexto_normalizado
+                            else None
+                        ),
+                        intentos=2,
+                    )
+
+                    repaired_files = reparacion.get("files", [])
+                    if not repaired_files:
+                        continue
+
+                    # Aplicar solo los archivos devueltos (parche)
+                    patch = {f["path"]: f["content"] for f in repaired_files if "path" in f and "content" in f}
+                    if patch:
+                        materializar_proyecto(nombre_proyecto=self.nombre_proyecto, estructura=patch)
+                        estructura.update(patch)
+                        archivos_creados.extend(
+                            [os.path.join(project_dir, p.replace("/", os.sep)) for p in patch.keys()]
+                        )
 
             # ======================================================
             # CÁLCULO DE ESTIMACIONES MEDIANTE MÉTODOS MODULARIZADOS
@@ -259,82 +316,156 @@ Descripción:
             if estimacion_manual is None:
                 estimacion_manual = self._estimacion_manual()
 
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                future_final = executor.submit(
+            # ======================================================
+            # GENERACIÓN DE DOCUMENTACIÓN (solo si el proyecto pasó gate import-time)
+            # ======================================================
+
+            # NOTA: si el modo es ASESOR, puede no haber estructura/archivos; en ese caso
+            # seguimos generando documentación porque el objetivo es asesorar, no compilar.
+            generar_docs = True
+            if modo_generacion.upper() != "ASESOR":
+                project_dir = os.path.join("output", self.nombre_proyecto)
+                ok_runtime, detail = _runtime_verify_fastapi_project(project_dir)
+                if not ok_runtime:
+                    generar_docs = False
+                    print("[DOCS] Saltando generación de documentación: el proyecto no es importable aún.")
+                    print(detail)
+
+            if generar_docs:
+                from concurrent.futures import ThreadPoolExecutor
+                from poc_it.generador_informes import (
                     generar_readme_final,
-                    self.nombre_proyecto,
-                    self.descripcion_global,
-                    "Arquitectura generada dinámicamente por LLM",
-                    endpoints_detectados,
-                    modo_generacion.upper(),
-                    self.tecnologias,
-                    estimacion_generada,
-                    estimacion_completa,
-                )
-
-                future_analisis = executor.submit(
+                    generar_readme_manual,
                     generar_readme_asesor,
-                    self.nombre_proyecto,
-                    context.plantilla.problema,
-                    usuarios_reales,
-                    funcionalidades_reales,
-                    limites_reales,
-                    tecnologias_reales,
-                    arquitectura_real,
-                    opciones_estrategicas,
-                    estimacion_manual,
+                )
+                from poc_it.opciones import generar_opciones
+
+                # Detectar endpoints simples a partir de paths
+                endpoints_detectados = [
+                    path for path in estructura.keys()
+                    if path.endswith(".py")
+                ]
+
+                # Usar primero contexto normalizado si existe
+                if context.contexto_normalizado:
+                    arquitectura_real = context.contexto_normalizado.objetivo_tecnico
+                    limites_reales = ", ".join(context.contexto_normalizado.restricciones_tecnicas)
+                    tecnologias_reales = ", ".join(context.contexto_normalizado.integraciones_externas)
+                    funcionalidades_reales = ", ".join(context.contexto_normalizado.funcionalidades_clave)
+                    usuarios_reales = ", ".join(context.contexto_normalizado.actores_principales)
+                else:
+                    arquitectura_real = context.plantilla.problema
+                    limites_reales = context.plantilla.limites or ""
+                    tecnologias_reales = context.plantilla.tecnologias or ""
+                    funcionalidades_reales = context.plantilla.funcionalidades or ""
+                    usuarios_reales = context.plantilla.usuarios or ""
+
+                opciones_estrategicas = generar_opciones(
+                    arquitectura=arquitectura_real,
+                    limites=limites_reales,
+                    tecnologias=tecnologias_reales,
                 )
 
-                future_manual = None
-                if modo_generacion.upper() == "PARCIAL":
-                    future_manual = executor.submit(
-                        generar_readme_manual,
+                t_documentacion_inicio = time.perf_counter()
+
+                # Documentación debe usar el modo/proveedor de DOCS (no el de code-gen)
+                # (Se asume que generador_informes delega en LLM con un modo/fase distinto)
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    future_final = executor.submit(
+                        generar_readme_final,
                         self.nombre_proyecto,
+                        self.descripcion_global,
                         "Arquitectura generada dinámicamente por LLM",
-                        self.tecnologias,
                         endpoints_detectados,
+                        modo_generacion.upper(),
+                        self.tecnologias,
+                        estimacion_generada,
+                        estimacion_completa,
+                        # Fuente de verdad para evitar contradicciones doc/código:
+                        # pasamos el contexto normalizado (si existe). El SPEC interno de generador_artefactos
+                        # no se materializa actualmente como archivo.
+                        spec=(context.contexto_normalizado.model_dump() if context.contexto_normalizado else None),
                     )
 
-                readme_final = future_final.result()
-                readme_analisis = future_analisis.result()
-                readme_manual = future_manual.result() if future_manual else None
+                    future_analisis = executor.submit(
+                        generar_readme_asesor,
+                        self.nombre_proyecto,
+                        context.plantilla.problema,
+                        usuarios_reales,
+                        funcionalidades_reales,
+                        limites_reales,
+                        tecnologias_reales,
+                        arquitectura_real,
+                        opciones_estrategicas,
+                        estimacion_manual,
+                    )
 
-            archivos_readme_final = materializar_proyecto(
-                nombre_proyecto=self.nombre_proyecto,
-                estructura={"README.md": readme_final},
-            )
-            archivos_creados.extend(archivos_readme_final)
+                    future_manual = None
+                    if modo_generacion.upper() == "PARCIAL":
+                        future_manual = executor.submit(
+                            generar_readme_manual,
+                            self.nombre_proyecto,
+                            "Arquitectura generada dinámicamente por LLM",
+                            self.tecnologias,
+                            endpoints_detectados,
+                            estructura,
+                        )
 
-            archivos_readme_analisis = materializar_proyecto(
-                nombre_proyecto=self.nombre_proyecto,
-                estructura={"README_ANALISIS.md": readme_analisis},
-            )
-            archivos_creados.extend(archivos_readme_analisis)
+                    readme_final = future_final.result()
+                    readme_analisis = future_analisis.result()
+                    readme_manual = future_manual.result() if future_manual else None
 
-            if readme_manual:
-                archivos_readme_manual = materializar_proyecto(
+                # IMPORTANTE:
+                # materializar_proyecto() limpia el directorio por defecto para evitar artefactos residuales.
+                # Para escribir documentación debemos NO limpiar, o nos cargamos el código generado.
+                archivos_readme_final = materializar_proyecto(
                     nombre_proyecto=self.nombre_proyecto,
-                    estructura={"README_MANUAL.md": readme_manual},
+                    estructura={"README.md": readme_final},
+                    limpiar_directorio=False,
                 )
-                archivos_creados.extend(archivos_readme_manual)
+                archivos_creados.extend(archivos_readme_final)
 
-            t_documentacion_fin = time.perf_counter()
+                archivos_readme_analisis = materializar_proyecto(
+                    nombre_proyecto=self.nombre_proyecto,
+                    estructura={"README_ANALISIS.md": readme_analisis},
+                    limpiar_directorio=False,
+                )
+                archivos_creados.extend(archivos_readme_analisis)
 
-            print("\n[PERFORMANCE]")
-            print(f"- Clasificación: {t_clasificacion_fin - t_clasificacion_inicio:.2f}s")
-            print(f"- Generación libre: {t_generacion_fin - t_generacion_inicio:.2f}s")
-            print(f"- Documentación: {t_documentacion_fin - t_documentacion_inicio:.2f}s\n")
+                if readme_manual:
+                    archivos_readme_manual = materializar_proyecto(
+                        nombre_proyecto=self.nombre_proyecto,
+                        estructura={"README_MANUAL.md": readme_manual},
+                        limpiar_directorio=False,
+                    )
+                    archivos_creados.extend(archivos_readme_manual)
+
+                t_documentacion_fin = time.perf_counter()
+
+                print("\n[PERFORMANCE]")
+                print(f"- Clasificación: {t_clasificacion_fin - t_clasificacion_inicio:.2f}s")
+                print(f"- Generación libre: {t_generacion_fin - t_generacion_inicio:.2f}s")
+                print(f"- Documentación: {t_documentacion_fin - t_documentacion_inicio:.2f}s\n")
 
         except Exception as exc:
+            # No contaminar el README principal con logs: dejamos un README_ERROR.md
+            # y un README.md mínimo indicando dónde mirar.
             fallback_readme = (
                 f"# {self.nombre_proyecto}\n\n"
+                "## Estado\n\n"
+                "La generación no finalizó correctamente. Revisa `README_ERROR.md` para ver el detalle del error.\n"
+            )
+
+            fallback_error = (
+                f"# {self.nombre_proyecto} – Error de generación\n\n"
                 "## Error durante la generación libre\n\n"
                 f"Error detectado:\n\n```\n{str(exc)}\n```\n"
             )
 
             archivos_creados = materializar_proyecto(
                 nombre_proyecto=self.nombre_proyecto,
-                estructura={"README.md": fallback_readme},
+                estructura={"README.md": fallback_readme, "README_ERROR.md": fallback_error},
+                limpiar_directorio=True,
             )
 
             return {
