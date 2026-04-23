@@ -33,6 +33,19 @@ load_dotenv()
 # CONFIGURACIÓN BÁSICA
 # ==========================================================
 
+# ==========================================================
+# LiteLLM Proxy (recomendado para gestionar múltiples proveedores)
+# ==========================================================
+# En Windows, "localhost" puede resolver a IPv6 (::1) y provocar cuelgues si el servicio solo está accesible por IPv4.
+# Por defecto preferimos 127.0.0.1 para entorno local.
+_default_proxy_url = "http://127.0.0.1:4000" if os.name == "nt" else "http://localhost:4000"
+LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", _default_proxy_url).strip().rstrip("/")
+LITELLM_PROXY_KEY = os.getenv("LITELLM_PROXY_KEY")  # opcional (si proteges el proxy)
+
+# Si quieres forzar que NUNCA se hagan llamadas directas a proveedores (solo proxy), activa:
+#   LITELLM_PROXY_ONLY=1
+LITELLM_PROXY_ONLY = os.getenv("LITELLM_PROXY_ONLY", "0").strip() in ("1", "true", "True", "yes", "YES")
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
@@ -44,8 +57,9 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "codestral-latest")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# OpenAI deshabilitado (requiere crédito / insufficient_quota en este entorno)
+OPENAI_API_KEY = None
+OPENAI_MODEL = None
 
 CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
 CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "llama-3.3-70b")
@@ -55,8 +69,11 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Usamos API estable v1 (no v1beta)
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1/models"
 MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
-OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_URL = None
 CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
+
+# LiteLLM Proxy (OpenAI-compatible)
+LITELLM_CHAT_URL = f"{LITELLM_BASE_URL}/v1/chat/completions"
 
 # Ollama (fallback local mediante librería oficial)
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen7b:latest")
@@ -89,15 +106,17 @@ LLM_METRICS = {
 # POLÍTICA DE MODELOS POR FASE (Multi‑modelo)
 # ==========================================================
 
+# Política por fase usando ALIAS del proxy (ver litellm_config.yaml)
 LLM_POLICY: Dict[str, str] = {
-    "normalizacion_contexto": "gemini",
-    "clasificacion": "gemini",
-    "generacion_codigo": "mistral",   # ahora usamos Mistral para código
-    "documentacion": "gemini",
-    "estimacion": "gemini",
+    "normalizacion_contexto": "ctx-json",
+    "clasificacion": "cls-json",
+    "generacion_codigo": "code-gen",
+    "documentacion": "docs",
+    "estimacion": "estimate",
 }
 
-FALLBACK_PROVIDER = "gemini"
+# Si no hay hint, este alias suele ser un buen “generalista” barato
+FALLBACK_PROVIDER = "docs"
 
 # ==========================================================
 # CIRCUIT BREAKER SIMPLE POR PROVEEDOR
@@ -107,6 +126,15 @@ import time as _time
 
 PROVIDER_COOLDOWN: Dict[str, float] = {}
 COOLDOWN_SECONDS = 60  # desactiva proveedor 60s tras rate limit crítico
+
+# Si un provider devuelve 429, NO hacemos retries (pasamos a fallback) para no
+# quemar tokens/tiempo en la misma ejecución.
+NO_RETRY_ON_429 = True
+
+# “Circuit breaker” por ejecución: si un provider entra en cooldown una vez durante
+# esta ejecución, se evita en el resto de llamadas del proceso (además del cooldown temporal).
+# Esto es útil cuando varias fases (cls-json/ctx-json/docs/estimate) comparten el mismo provider upstream.
+SESSION_PROVIDER_DISABLED: Dict[str, bool] = {}
 
 
 # ==========================================================
@@ -141,7 +169,11 @@ def _call_groq(
         resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
 
         if resp.status_code == 429:
-            print("[RATE LIMIT] Groq 429 detected. Applying backoff...")
+            # Política: 429 => no reintentar en este provider, saltar al fallback
+            print("[RATE LIMIT] Groq 429 detected.")
+            if NO_RETRY_ON_429:
+                raise LLMError("Groq 429 rate limit")
+            print("[RATE LIMIT] Applying backoff...")
             exponential_backoff_sleep(attempt)
             continue
 
@@ -240,39 +272,8 @@ def _call_mistral(
         raise LLMError(f"Respuesta Mistral inesperada: {data}") from exc
 
 
-def _call_openai(
-    messages: List[Dict[str, str]],
-    model: Optional[str] = None,
-    temperature: float = 0.0,
-    max_tokens: Optional[int] = None,
-    **extra: Any,
-) -> str:
-    if not OPENAI_API_KEY:
-        raise LLMError("OPENAI_API_KEY no está configurada en el entorno")
-
-    payload: Dict[str, Any] = {
-        "model": model or OPENAI_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-    }
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    resp = requests.post(OPENAI_URL, headers=headers, json=payload, timeout=60)
-
-    if resp.status_code == 429:
-        raise LLMError("OpenAI 429 rate limit")
-
-    if resp.status_code != 200:
-        raise LLMError(f"Error OpenAI {resp.status_code}: {resp.text}")
-
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
+def _call_openai(*args: Any, **kwargs: Any) -> str:
+    raise LLMError("OpenAI deshabilitado en este entorno (requiere crédito).")
 
 
 def _call_cerebras(
@@ -341,7 +342,10 @@ def _call_openrouter(
         resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
 
         if resp.status_code == 429:
-            print("[RATE LIMIT] OpenRouter 429 detected. Applying backoff...")
+            print("[RATE LIMIT] OpenRouter 429 detected.")
+            if NO_RETRY_ON_429:
+                raise LLMError("OpenRouter 429 rate limit")
+            print("[RATE LIMIT] Applying backoff...")
             exponential_backoff_sleep(attempt)
             continue
 
@@ -359,6 +363,107 @@ def _call_openrouter(
         return data["choices"][0]["message"]["content"]
     except Exception as exc:  # pragma: no cover - fallback defensivo
         raise LLMError(f"Respuesta OpenRouter inesperada: {data}") from exc
+
+
+def _call_litellm_proxy(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.0,
+    max_tokens: Optional[int] = None,
+    timeout: int = 70,
+    **extra: Any,
+) -> str:
+    """
+    Llama a LiteLLM Proxy (OpenAI-compatible) para centralizar proveedores/routing.
+
+    Espera endpoint:
+      POST {LITELLM_BASE_URL}/v1/chat/completions
+
+    Body OpenAI:
+      { "model": "<alias o provider/model>", "messages": [...], ... }
+
+    Response OpenAI:
+      { "choices": [ { "message": { "content": "..." } } ] }
+    """
+    payload: Dict[str, Any] = {
+        "model": model or FALLBACK_PROVIDER,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    headers = {"Content-Type": "application/json"}
+    if LITELLM_PROXY_KEY:
+        headers["Authorization"] = f"Bearer {LITELLM_PROXY_KEY}"
+
+    # Reutilizamos tu bucket global como protección “cliente”
+    for attempt in range(MAX_RETRIES):
+        GLOBAL_BUCKET.consume(payload.get("max_tokens", 1000))
+        try:
+            resp = requests.post(
+                LITELLM_CHAT_URL,
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            )
+        except requests.exceptions.ReadTimeout as exc:
+            # Timeout hablando con el PROXY (no con el upstream directamente).
+            # Para diagnosticar qué upstream está atascado, activa logs del proxy (ver README).
+            alias = model or FALLBACK_PROVIDER
+            print(
+                f"[TIMEOUT] LiteLLM Proxy ReadTimeout (alias={alias}, timeout={timeout}s, url={LITELLM_CHAT_URL}). "
+                f"Esto suele indicar que el proxy está esperando respuesta de un upstream lento/bloqueado."
+            )
+            raise LLMError(f"LiteLLM Proxy timeout (alias={alias})") from exc
+        except requests.exceptions.ConnectTimeout as exc:
+            alias = model or FALLBACK_PROVIDER
+            print(
+                f"[TIMEOUT] LiteLLM Proxy ConnectTimeout (alias={alias}, timeout={timeout}s, url={LITELLM_CHAT_URL}). "
+                f"Esto suele indicar problema de red/host/puerto o saturación."
+            )
+            raise LLMError(f"LiteLLM Proxy connect-timeout (alias={alias})") from exc
+
+        if resp.status_code == 429:
+            print("[RATE LIMIT] LiteLLM Proxy 429 detected.")
+            # El body suele incluir el upstream/provider real que rate-limitó.
+            try:
+                body = (resp.text or "")[:500]
+            except Exception:
+                body = ""
+            if body:
+                print(f"[RATE LIMIT] LiteLLM Proxy 429 body (trunc): {body}")
+            if NO_RETRY_ON_429:
+                raise LLMError("LiteLLM Proxy 429 rate limit")
+            print("[RATE LIMIT] Applying backoff...")
+            exponential_backoff_sleep(attempt)
+            continue
+
+        handle_rate_limit_headers(resp)
+
+        if resp.status_code != 200:
+            # Muy útil para 400/404 del proxy indicando upstream/model inválido.
+            try:
+                body = (resp.text or "")[:2000]
+            except Exception:
+                body = ""
+            raise LLMError(f"Error LiteLLM Proxy {resp.status_code}: {body}")
+
+        data = resp.json()
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except Exception as exc:
+            raise LLMError(f"Respuesta LiteLLM Proxy inesperada: {data}") from exc
+
+        # Si el proxy responde 200 pero el content viene vacío/None, lo tratamos como fallo
+        # para permitir fallback (suele pasar si el upstream devolvió respuesta sin texto).
+        if content is None or (isinstance(content, str) and not content.strip()):
+            alias = model or FALLBACK_PROVIDER
+            raise LLMError(f"LiteLLM Proxy empty content (alias={alias})")
+
+        return content
+
+    raise LLMError("LiteLLM Proxy failed after retries (rate limit).")
 
 
 def _call_ollama(
@@ -413,6 +518,7 @@ def chat_completion_text(
     temperature: float = 0.0,
     max_tokens: Optional[int] = None,
     provider_hint: Optional[str] = None,
+    fase: Optional[str] = None,
 ) -> str:
     """
     Obtiene una respuesta de texto libre del LLM.
@@ -420,6 +526,65 @@ def chat_completion_text(
     - Intenta primero con Groq.
     - Si falla y hay API key de OpenRouter, usa OpenRouter como fallback.
     """
+
+    # Si el caller nos pasa una fase, resolvemos el alias del proxy por política multi-modelo.
+    # Esto evita que todo caiga en el alias FALLBACK_PROVIDER="docs".
+    if fase and not provider_hint:
+        provider_hint = LLM_POLICY.get(fase)
+
+    # ----------------------------------------------------------
+    # Fallbacks por fase (ALIAS del proxy) ante rate limit/fallo.
+    # Objetivo: si falla el alias primario (p.ej. ctx-json en Groq),
+    # probamos con otros aliases del proxy antes de saltar a proveedores directos.
+    #
+    # Importante:
+    # - Esto NO hardcodea proveedores, solo aliases definidos en litellm_config.yaml
+    # - Permite que API Park/LiteLLM haga routing interno o use fallbacks configurados
+    # ----------------------------------------------------------
+    PHASE_ALIAS_FALLBACKS: Dict[str, List[str]] = {
+        # JSON pequeños y rápidos
+        "normalizacion_contexto": ["ctx-json", "ctx-json-gemini", "ctx-json-groq", "ctx-json-openrouter"],
+        "clasificacion": ["cls-json", "cls-json-groq", "cls-json-gemini", "cls-json-openrouter"],
+        # Docs (texto): probar explícitamente TODOS los aliases definidos en litellm_config.yaml
+        # Orden deseado: openrouter -> gemini -> cerebras -> groq
+        "documentacion": ["docs", "docs-gemini", "docs-cerebras", "docs-groq"],
+        # Estimaciones: idem (según litellm_config.yaml)
+        "estimacion": ["estimate", "estimate-cerebras", "estimate-groq", "estimate-openrouter"],
+        # Generación de código: si el alias principal falla, probamos fallback explícito
+        "generacion_codigo": ["code-gen", "code-gen-fallback"],
+    }
+
+    # Si estamos usando el proxy, construimos una lista de aliases a intentar
+    # en el propio proxy (reintentos "horizontales" por alias).
+    proxy_aliases: List[Optional[str]] = []
+    if fase:
+        candidates = PHASE_ALIAS_FALLBACKS.get(fase, [])
+        if provider_hint:
+            # Prioriza el alias pedido (si es un alias)
+            if provider_hint in candidates:
+                proxy_aliases = [provider_hint] + [c for c in candidates if c != provider_hint]
+            else:
+                proxy_aliases = [provider_hint] + candidates
+        else:
+            proxy_aliases = candidates
+    else:
+        proxy_aliases = [provider_hint] if provider_hint else []
+
+    # Si no se pasan fase/candidates pero se pasa provider_hint con un alias "principal",
+    # inferimos fase para aplicar el set completo de fallbacks de ese grupo.
+    if not fase and provider_hint:
+        inferred = {
+            "docs": "documentacion",
+            "ctx-json": "normalizacion_contexto",
+            "cls-json": "clasificacion",
+            "estimate": "estimacion",
+            "code-gen": "generacion_codigo",
+        }.get(provider_hint)
+        if inferred:
+            candidates = PHASE_ALIAS_FALLBACKS.get(inferred, [])
+            if candidates:
+                proxy_aliases = [provider_hint] + [c for c in candidates if c != provider_hint]
+                fase = inferred
 
     messages = _build_messages(prompt, system)
 
@@ -430,9 +595,13 @@ def chat_completion_text(
     ollama_error: Optional[Exception] = None
 
     # Cadena base de proveedores
-    default_chain = [
+    # - Por defecto: proxy primero y luego fallbacks directos (para resiliencia).
+    # - Si LITELLM_PROXY_ONLY=1: SOLO proxy (útil para validar que todo pasa por API Park/LiteLLM).
+    default_chain = ["litellm_proxy"] if LITELLM_PROXY_ONLY else [
+        # Proxy centralizado (recomendado)
+        "litellm_proxy",
+        # Fallbacks directos (por si el proxy o el routing están degradados)
         "groq",
-        "openai",
         "cerebras",
         "mistral",
         "gemini",
@@ -440,13 +609,7 @@ def chat_completion_text(
         "ollama",
     ]
 
-    # Si se especifica provider_hint, se prioriza ese proveedor
-    if provider_hint and provider_hint in default_chain:
-        providers = [provider_hint] + [
-            p for p in default_chain if p != provider_hint
-        ]
-    else:
-        providers = default_chain
+    providers = default_chain
 
     LLM_METRICS["total_calls"] += 1
 
@@ -456,22 +619,54 @@ def chat_completion_text(
         # Circuit breaker: proveedor en cooldown
         # -------------------------------
         now = _time.time()
+        if SESSION_PROVIDER_DISABLED.get(provider):
+            print(f"[LLM] {provider.upper()} deshabilitado en esta ejecución. Saltando proveedor.")
+            continue
+
         cooldown_until = PROVIDER_COOLDOWN.get(provider, 0)
         if now < cooldown_until:
             print(f"[LLM] {provider.upper()} en cooldown. Saltando proveedor.")
             continue
 
         try:
-            if provider == "groq":
+            if provider == "litellm_proxy":
+                # provider_hint aquí es "model alias" del proxy (p.ej. code-gen).
+                # Implementamos fallback por alias ANTES de saltar a proveedores directos.
+                # IMPORTANTE: evitar bug de precedencia de operadores.
+                # Queremos: si hay proxy_aliases úsalo, si no y hay provider_hint úsalo, si no [None]
+                if proxy_aliases:
+                    aliases_to_try = proxy_aliases
+                elif provider_hint:
+                    aliases_to_try = [provider_hint]
+                else:
+                    aliases_to_try = [None]
+
+                if not aliases_to_try:
+                    aliases_to_try = [None]
+
+                proxy_last_exc: Optional[Exception] = None
+                for alias in aliases_to_try:
+                    print(f"[LLM] Provider: LITELLM_PROXY (model={alias or FALLBACK_PROVIDER})")
+                    try:
+                        return _call_litellm_proxy(
+                            messages,
+                            model=alias or None,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            timeout=70,
+                        )
+                    except Exception as exc:
+                        proxy_last_exc = exc
+                        # Si es rate limit/fallo, probamos el siguiente alias
+                        print(f"[LLM] ERROR en LITELLM_PROXY (model={alias or FALLBACK_PROVIDER}): {exc}")
+                        continue
+
+                # Si todos los aliases fallan (p.ej. timeouts en docs), saltamos al siguiente proveedor
+                # del chain (groq/cerebras/mistral/gemini/openrouter/ollama).
+                raise proxy_last_exc or LLMError("LiteLLM Proxy failed for all aliases.")
+            elif provider == "groq":
                 print("[LLM] Provider: GROQ")
                 return _call_groq(
-                    messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-            elif provider == "openai":
-                print("[LLM] Provider: OPENAI")
-                return _call_openai(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -518,10 +713,18 @@ def chat_completion_text(
             # Si es error fuerte de rate limit, activar cooldown
             if "rate limit" in str(exc).lower() or "429" in str(exc):
                 PROVIDER_COOLDOWN[provider] = _time.time() + COOLDOWN_SECONDS
-                print(f"[LLM] {provider.upper()} desactivado durante {COOLDOWN_SECONDS}s por rate limit.")
+                SESSION_PROVIDER_DISABLED[provider] = True
+                print(
+                    f"[LLM] {provider.upper()} desactivado durante {COOLDOWN_SECONDS}s por rate limit "
+                    f"y deshabilitado para el resto de esta ejecución."
+                )
 
             # Métricas de fallo por proveedor
-            if provider == "groq":
+            if provider == "litellm_proxy":
+                # Contabilizamos fallo del proxy como "fallback" potencial y dejamos evidencia.
+                # Si falla el proxy, DEBE saltar al siguiente proveedor del chain.
+                pass
+            elif provider == "groq":
                 groq_error = exc
                 LLM_METRICS["groq_failures"] += 1
             elif provider == "openai":
@@ -535,14 +738,17 @@ def chat_completion_text(
             elif provider == "openrouter":
                 openrouter_error = exc
                 LLM_METRICS["openrouter_failures"] += 1
-            else:
+            elif provider == "ollama":
                 ollama_error = exc
                 LLM_METRICS["ollama_failures"] += 1
+            else:
+                # proveedor no reconocido (defensivo)
+                pass
 
             # Si no es el último proveedor, cuenta como fallback
             if idx < len(providers) - 1:
                 LLM_METRICS["fallbacks"] += 1
-                print(f"[LLM] → Activando fallback al siguiente proveedor...")
+                print("[LLM] → Activando fallback al siguiente proveedor...")
 
             continue
 
@@ -567,6 +773,7 @@ def chat_completion_json(
     temperature: float = 0.0,
     max_tokens: Optional[int] = None,
     provider_hint: Optional[str] = None,
+    fase: Optional[str] = None,
 ) -> str:
     """
     Igual que chat_completion_text, pero reforzado para devolver JSON.
@@ -584,6 +791,7 @@ def chat_completion_json(
         temperature=temperature,
         max_tokens=max_tokens,
         provider_hint=provider_hint,
+        fase=fase,
     )
 
     # Blindaje contra respuestas None o no-string
