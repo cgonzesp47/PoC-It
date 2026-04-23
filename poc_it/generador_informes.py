@@ -11,7 +11,9 @@ Prompts concisos, estructurados y orientados a valor.
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Dict, Any, Optional
+import re
+
 from poc_it.llm_client import chat_completion_text
 from poc_it.estimador_esfuerzo import (
     generar_bloque_markdown,
@@ -27,6 +29,7 @@ def _llamar_modelo(prompt: str, max_tokens: int = 1200) -> str:
         system=None,
         temperature=0.2,
         max_tokens=max_tokens,
+        fase="documentacion",
     )
 
     # Blindaje contra respuestas None o no-string del modelo
@@ -45,12 +48,25 @@ def generar_readme_final(
     tecnologias: str,
     estimacion_generada,
     estimacion_completa,
+    spec: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Genera README_FINAL dinámico.
+
+    Si se proporciona `spec`, se utiliza como fuente de verdad para evitar
+    contradicciones doc/código (p.ej. request.type json vs multipart).
     """
 
     endpoints_str = "\n".join(f"- {e}" for e in endpoints_generados) or "- (No detectados)"
+
+    spec = spec or {}
+    spec_json = ""
+    try:
+        # Compacto para no inflar tokens
+        import json as _json
+        spec_json = _json.dumps(spec, ensure_ascii=False)
+    except Exception:
+        spec_json = str(spec)
 
     prompt = f"""
 Genera un README_FINAL profesional, técnico y orientado a arquitectura.
@@ -72,6 +88,11 @@ Descripción de la PoC:
 
 Arquitectura inferida:
 {arquitectura}
+
+SPEC (FUENTE DE VERDAD - NO CONTRADECIR)
+- Este SPEC describe el contrato objetivo (endpoints, request/response, env/deps y notas).
+- El README debe ser CONSISTENTE con este SPEC.
+{spec_json}
 
 Endpoints generados:
 {endpoints_str}
@@ -162,17 +183,73 @@ No repitas información trivial.
     return contenido + "\n\n---\n\n" + seccion_estimacion
 
 
+def _extraer_variables_entorno_desde_codigo(estructura: Dict[str, str]) -> List[str]:
+    """
+    Heurística agnóstica: detecta variables de entorno usadas en el código generado.
+    - os.getenv("X"), os.environ["X"], os.environ.get("X")
+    - sin hardcodear proveedores
+    """
+    vars_encontradas = set()
+
+    rx_getenv = re.compile(r"os\.getenv\(\s*[\"']([A-Z0-9_]+)[\"']\s*\)")
+    rx_environ_get = re.compile(r"os\.environ\.get\(\s*[\"']([A-Z0-9_]+)[\"']\s*\)")
+    rx_environ_idx = re.compile(r"os\.environ\[\s*[\"']([A-Z0-9_]+)[\"']\s*\]")
+
+    for path, content in estructura.items():
+        if not path.endswith(".py"):
+            continue
+        content = content or ""
+        for rx in (rx_getenv, rx_environ_get, rx_environ_idx):
+            for m in rx.findall(content):
+                vars_encontradas.add(m)
+
+    return sorted(vars_encontradas)
+
+
+def _extraer_todos_placeholders(estructura: Dict[str, str]) -> List[str]:
+    """
+    Heurística agnóstica: detecta TODO/FIXME/PLACEHOLDER/CHANGEME y patrones típicos
+    que requieren intervención manual.
+    """
+    hallazgos: List[str] = []
+    rx = re.compile(r"(TODO|FIXME|PLACEHOLDER|CHANGEME|<your-[^>]+>|REPLACE_ME)", re.IGNORECASE)
+
+    for path, content in estructura.items():
+        if not isinstance(content, str):
+            continue
+        for i, line in enumerate(content.splitlines(), start=1):
+            if rx.search(line):
+                hallazgos.append(f"- {path}:{i}: {line.strip()[:160]}")
+        if len(hallazgos) > 30:
+            break
+    return hallazgos
+
+
 def generar_readme_manual(
     nombre: str,
     arquitectura: str,
     tecnologias: str,
     endpoints_generados: List[str],
+    estructura: Dict[str, str] | None = None,
 ) -> str:
     """
     Genera README_MANUAL solo cuando hay generación PARCIAL.
-    """
 
+    Mejora agnóstica:
+    - Si se proporciona `estructura` (path->content), extrae heurísticas locales:
+      * variables de entorno detectadas
+      * TODO/FIXME/PLACEHOLDER
+    - Usa esas señales como “capabilities gap” para que el manual sea accionable
+      sin hardcodear proveedores (GCP/AWS/etc).
+    """
     endpoints_str = "\n".join(f"- {e}" for e in endpoints_generados) or "- (No detectados)"
+
+    estructura = estructura or {}
+    env_vars = _extraer_variables_entorno_desde_codigo(estructura)
+    todos = _extraer_todos_placeholders(estructura)
+
+    env_vars_str = "\n".join(f"- {v}" for v in env_vars) or "- (No detectadas automáticamente)"
+    todos_str = "\n".join(todos) or "- (No se detectaron TODO/FIXME/PLACEHOLDER)"
 
     prompt = f"""
 Genera un README_MANUAL técnico, estructurado y orientado a implementación real.
@@ -183,8 +260,9 @@ IMPORTANTE:
 - No repitas el README_FINAL.
 - No generes texto genérico.
 - No inventes tecnologías no declaradas.
+- No inventes nombres de variables de entorno: usa las detectadas o indica que no se detectaron.
 - No incluyas el framework principal como dependencia externa.
-- Indica explícitamente que las dependencias externas deben añadirse manualmente a `requirements.txt` porque el sistema está en modo PARCIAL.
+- Si el sistema está en modo PARCIAL, céntrate en: permisos, credenciales, despliegue, configuración de runtime, y validación operativa.
 
 Proyecto: {nombre}
 
@@ -197,44 +275,42 @@ Tecnologías declaradas:
 Endpoints generados automáticamente:
 {endpoints_str}
 
+SEÑALES DETECTADAS EN EL CÓDIGO (FUENTE DE VERDAD)
+Variables de entorno detectadas:
+{env_vars_str}
+
+TODO/FIXME/PLACEHOLDER detectados:
+{todos_str}
+
 Estructura obligatoria (profesional y sin redundancias):
 
 # Implementación manual requerida
 
-## 1. Contexto
-- Qué partes no han sido automatizadas
-- Por qué requieren intervención manual
+## 1. Qué funciona ya (generado automáticamente)
+Lista breve de lo que está implementado y arrancable.
 
-## 2. Modelo de Configuración Esperado
-- Modelo de identidad/autenticación
-- Servicios externos implicados
-- Dependencias de red si aplican
+## 2. Qué NO está garantizado / puede requerir intervención
+Lista de gaps típicos: permisos/credenciales del entorno, IDs/URLs reales, configuración de red/egress, etc.
 
-## 3. Configuración Técnica Paso a Paso
-- Habilitación de servicios necesarios
-- Creación y configuración de credenciales
-- Variables de entorno obligatorias
-- Permisos e IAM requeridos
-- Despliegue en entorno cloud si aplica
+## 3. Configuración de runtime (variables de entorno)
+- Lista EXACTA de variables de entorno detectadas (si hay).
+- Para cada una: qué representa, ejemplo de valor, y cómo validarla.
+- Si no hay variables detectadas, indica qué parámetros suelen ser necesarios para integraciones externas.
 
-## 4. Dependencias Externas
-- Librerías que deben añadirse manualmente
-- Configuración adicional necesaria
-- Riesgos de mala configuración
+## 4. Dependencias externas y permisos (pasos manuales)
+- Qué habilitar/configurar fuera del código (permisos/roles, activación de APIs, secretos, etc.) de forma genérica.
+- Qué comprobar para evitar 401/403/404.
 
-## 5. Validación Post-Configuración
-- Cómo comprobar que la integración funciona
-- Errores comunes esperables
-- Señales de fallo típicas
+## 5. Validación post-configuración
+- Pasos de prueba del endpoint y señales claras de fallo.
 
-## 6. Checklist Técnico Final
-Checklist breve, claro y no duplicado que permita validar que todo está correctamente configurado.
+## 6. Checklist final
+Checklist breve y accionable.
 
-El documento debe ser claro, técnico y útil para implementación real.
 No incluyas contenido redundante.
 """
 
-    contenido = _llamar_modelo(prompt, max_tokens=650)
+    contenido = _llamar_modelo(prompt, max_tokens=750)
 
     # Eliminación de repeticiones accidentales del modelo
     marcador = "# Implementación manual requerida"
