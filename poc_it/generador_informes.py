@@ -231,6 +231,7 @@ def generar_readme_manual(
     tecnologias: str,
     endpoints_generados: List[str],
     estructura: Dict[str, str] | None = None,
+    spec: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Genera README_MANUAL solo cuando hay generación PARCIAL.
@@ -250,6 +251,14 @@ def generar_readme_manual(
 
     env_vars_str = "\n".join(f"- {v}" for v in env_vars) or "- (No detectadas automáticamente)"
     todos_str = "\n".join(todos) or "- (No se detectaron TODO/FIXME/PLACEHOLDER)"
+
+    spec = spec or {}
+    spec_json = ""
+    try:
+        import json as _json
+        spec_json = _json.dumps(spec, ensure_ascii=False)
+    except Exception:
+        spec_json = str(spec)
 
     prompt = f"""
 Genera un README_MANUAL técnico, estructurado y orientado a implementación real.
@@ -274,6 +283,11 @@ Tecnologías declaradas:
 
 Endpoints generados automáticamente:
 {endpoints_str}
+
+SPEC (FUENTE DE VERDAD - NO CONTRADECIR)
+- Este SPEC describe el contrato objetivo (endpoints, request/response, env/deps y notas).
+- El README_MANUAL debe ser CONSISTENTE con este SPEC.
+{spec_json}
 
 SEÑALES DETECTADAS EN EL CÓDIGO (FUENTE DE VERDAD)
 Variables de entorno detectadas:
@@ -331,6 +345,7 @@ def generar_readme_asesor(
     arquitectura: str,
     opciones: list[str],
     estimacion_manual,
+    spec: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     README_ANALISIS optimizado:
@@ -341,6 +356,14 @@ def generar_readme_asesor(
     """
 
     from poc_it.estimador_esfuerzo import generar_bloque_markdown
+
+    spec = spec or {}
+    spec_json = ""
+    try:
+        import json as _json
+        spec_json = _json.dumps(spec, ensure_ascii=False)
+    except Exception:
+        spec_json = str(spec)
 
     contenido = f"# Análisis Técnico-Estratégico – {nombre}\n\n"
 
@@ -367,6 +390,15 @@ def generar_readme_asesor(
         "- Nivel de complejidad inferido: derivado de integraciones externas, "
         "necesidad de autenticación, persistencia y despliegue.\n\n"
     )
+
+    contenido += "### 2.1 SPEC de referencia (fuente de verdad)\n\n"
+    contenido += (
+        "El siguiente SPEC describe el contrato objetivo (endpoints, modelos de datos, "
+        "variables de entorno y dependencias). Las conclusiones deben ser coherentes con él.\n\n"
+    )
+    contenido += "```json\n"
+    contenido += f"{spec_json}\n"
+    contenido += "```\n\n"
 
     # ------------------------------------------------------
     # 3. Riesgos estructurales reales

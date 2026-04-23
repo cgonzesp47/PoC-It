@@ -387,6 +387,9 @@ SALIDA
                         spec=(context.contexto_normalizado.model_dump() if context.contexto_normalizado else None),
                     )
 
+                    # SPEC de referencia: usamos el contexto normalizado si existe
+                    spec_dict = context.contexto_normalizado.model_dump() if context.contexto_normalizado else None
+
                     future_analisis = executor.submit(
                         generar_readme_asesor,
                         self.nombre_proyecto,
@@ -398,6 +401,7 @@ SALIDA
                         arquitectura_real,
                         opciones_estrategicas,
                         estimacion_manual,
+                        spec_dict,
                     )
 
                     future_manual = None
@@ -409,6 +413,7 @@ SALIDA
                             self.tecnologias,
                             endpoints_detectados,
                             estructura,
+                            spec_dict,
                         )
 
                     readme_final = future_final.result()
