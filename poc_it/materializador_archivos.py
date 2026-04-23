@@ -15,6 +15,7 @@ Mantiene:
 from __future__ import annotations
 
 import os
+import shutil
 from typing import Dict, List
 
 
@@ -37,6 +38,7 @@ def _asegurar_directorio(ruta: str) -> None:
 def materializar_proyecto(
     nombre_proyecto: str,
     estructura: Dict[str, str],
+    limpiar_directorio: bool = True,
 ) -> List[str]:
     """
     Materializa en disco el proyecto generado por el LLM.
@@ -47,6 +49,11 @@ def materializar_proyecto(
     """
 
     base_path = os.path.join("output", nombre_proyecto)
+
+    # Si el proyecto ya existía (reintentos / regeneraciones), limpiamos para evitar
+    # artefactos residuales (p.ej. README_ERROR.md antiguo) que desincronicen el estado.
+    if limpiar_directorio and os.path.isdir(base_path):
+        shutil.rmtree(base_path)
 
     os.makedirs(base_path, exist_ok=True)
 
