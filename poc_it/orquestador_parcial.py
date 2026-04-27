@@ -180,6 +180,22 @@ Descripción:
                     ),
                 )
 
+                # ------------------------------------------
+                # Persistir SPEC.json como artefacto del proyecto
+                # Fuente de verdad para documentación y auditoría
+                # ------------------------------------------
+                try:
+                    spec = resultado.get("spec")
+                    if isinstance(spec, dict) and spec:
+                        spec_path = os.path.join("output", self.nombre_proyecto, "SPEC.json")
+                        os.makedirs(os.path.dirname(spec_path), exist_ok=True)
+                        with open(spec_path, "w", encoding="utf-8") as f:
+                            import json as _json
+                            f.write(_json.dumps(spec, ensure_ascii=False, indent=2))
+                        archivos_creados.append(spec_path)
+                except Exception as _e:
+                    print(f"[DEBUG] No se pudo persistir SPEC.json: {_e}")
+
                 t_generacion_fin = time.perf_counter()
                 tiempo_generacion_horas = (t_generacion_fin - t_generacion_inicio) / 3600
 
@@ -371,6 +387,17 @@ SALIDA
                 # Documentación debe usar el modo/proveedor de DOCS (no el de code-gen)
                 # (Se asume que generador_informes delega en LLM con un modo/fase distinto)
                 with ThreadPoolExecutor(max_workers=3) as executor:
+                    # SPEC fuente de verdad:
+                    # - Preferimos el SPEC de generación (resultado["spec"]) si existe
+                    # - Si no existe, fallback al ContextoNormalizado
+                    spec_dict = None
+                    try:
+                        spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
+                    except Exception:
+                        spec_dict = None
+                    if not isinstance(spec_dict, dict) or not spec_dict:
+                        spec_dict = context.contexto_normalizado.model_dump() if context.contexto_normalizado else None
+
                     future_final = executor.submit(
                         generar_readme_final,
                         self.nombre_proyecto,
@@ -381,14 +408,8 @@ SALIDA
                         self.tecnologias,
                         estimacion_generada,
                         estimacion_completa,
-                        # Fuente de verdad para evitar contradicciones doc/código:
-                        # pasamos el contexto normalizado (si existe). El SPEC interno de generador_artefactos
-                        # no se materializa actualmente como archivo.
-                        spec=(context.contexto_normalizado.model_dump() if context.contexto_normalizado else None),
+                        spec=spec_dict,
                     )
-
-                    # SPEC de referencia: usamos el contexto normalizado si existe
-                    spec_dict = context.contexto_normalizado.model_dump() if context.contexto_normalizado else None
 
                     future_analisis = executor.submit(
                         generar_readme_asesor,

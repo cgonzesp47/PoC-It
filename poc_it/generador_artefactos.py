@@ -78,8 +78,18 @@ def _validar_proyecto(files: List[Dict[str, str]]) -> bool:
 
 def _extraer_json_tolerante(respuesta: str) -> Optional[dict]:
     """
-    Intenta parsear JSON. Si hay texto extra, extrae el primer bloque {...} y reintenta.
+    Intenta parsear JSON de forma tolerante.
+
+    Casos soportados:
+    - JSON limpio
+    - Texto extra antes/después del JSON
+    - Respuestas con múltiples bloques: extrae el primer {...} que parezca JSON
+
+    Nota: si el JSON está truncado (no hay '}'), no se puede recuperar aquí.
     """
+    if not isinstance(respuesta, str) or "{" not in respuesta:
+        return None
+
     try:
         return json.loads(respuesta)
     except Exception:
@@ -90,6 +100,170 @@ def _extraer_json_tolerante(respuesta: str) -> Optional[dict]:
             return json.loads(match.group())
         except Exception:
             return None
+
+
+def _reparar_spec_prompt(
+    prompt_spec_base: str,
+    raw_resp: str,
+    errores: List[str] | None = None,
+) -> str:
+    """
+    Construye un prompt de reparación de SPEC, usando como entrada la respuesta cruda previa.
+
+    Objetivo: evitar reintentos completos "desde cero" cuando el modelo devolvió JSON truncado
+    o inválido. Pedimos reconstruir el mismo SPEC, completo y parseable.
+    """
+    errores = errores or []
+
+    return f"""
+La respuesta anterior pretendía ser un SPEC en JSON pero NO es parseable o está truncada.
+
+Errores detectados:
+- {chr(10).join(errores) if errores else "(no disponibles)"}
+
+RESPUESTA CRUDA ANTERIOR (entrada a reparar):
+{raw_resp}
+
+TAREA
+Devuelve de nuevo el SPEC COMPLETO como JSON válido.
+
+IMPORTANTE (ANTI-TRUNCADO)
+- La respuesta anterior puede estar TRUNCADA. Reconstruye el JSON COMPLETO.
+- Asegura que se cierran TODOS los corchetes y llaves.
+- Asegura que no quedan strings sin cerrar.
+- Si el JSON es largo, prioriza completar la estructura y campos antes que añadir texto descriptivo.
+
+REGLAS NO NEGOCIABLES
+- Devuelve EXCLUSIVAMENTE JSON válido.
+- Prohibido usar fences Markdown (``` o ```json).
+- Prohibido incluir texto fuera del JSON.
+- Mantén la MISMA estructura lógica requerida por el prompt original.
+- Si faltan campos, inclúyelos aunque sea con valores vacíos razonables:
+  - strings vacíos "", listas vacías [], objetos vacíos {{}}.
+- No inventes nuevos endpoints o archivos no coherentes con la respuesta cruda.
+
+PROMPT ORIGINAL (referencia; NO lo repitas en la salida):
+{prompt_spec_base}
+""".strip()
+
+
+def _alinear_spec_con_contexto(
+    spec: dict,
+    contexto_normalizado: dict,
+    intentos: int = 1,
+) -> Tuple[Optional[dict], List[str]]:
+    """
+    Fase 1.5: Alineación de SPEC con ContextoNormalizado (fuente de verdad del usuario).
+
+    Objetivo:
+    - Detectar y corregir inconsistencias de alto nivel SIN hardcodear guardrails por PoC.
+    - Evitar SPECs que cumplen formato pero contradicen explícitamente la plantilla
+      (endpoints, request type, restricciones, integraciones, etc.).
+
+    Estrategia:
+    - LLM auditor devuelve JSON con:
+      - ok: bool
+      - errors: [string]
+      - patched_spec: object|null (si puede devolver el SPEC corregido)
+
+    Si patched_spec es parseable, lo devolvemos; si no, devolvemos None + errores
+    para alimentar el repair prompt.
+    """
+    if not isinstance(spec, dict) or not isinstance(contexto_normalizado, dict):
+        return None, ["spec/contexto_normalizado inválidos para alineación"]
+
+    prompt = f"""
+TAREA
+Eres un auditor de consistencia. Compara el CONTEXTO_NORMALIZADO (fuente de verdad del usuario) con el SPEC (plan de generación).
+Si el SPEC contradice el contexto, corrígelo.
+
+CONTEXTO_NORMALIZADO (FUENTE DE VERDAD):
+{json.dumps(contexto_normalizado, ensure_ascii=False)}
+
+SPEC A AUDITAR:
+{json.dumps(spec, ensure_ascii=False)}
+
+CHECKLIST 
+- Funcionalidades explícitas: cualquier funcionalidad descrita en el contexto debe estar representada en el SPEC (como endpoint/contrato/archivo/regla), sin omisiones silenciosas.
+- Contratos de entrada/salida: si el contexto describe un tipo de entrada (JSON, multipart, query, none) o ejemplos, el SPEC debe reflejarlo en `endpoints[].request` / `endpoints[].response`.
+- Restricciones técnicas: el SPEC no debe exigir ni asumir nada contrario al contexto (p.ej. credenciales embebidas si se pide “sin credenciales en código”).
+- Integraciones externas: el SPEC no debe inventar integraciones ajenas; debe incluir las integraciones mencionadas si impactan dependencias/env/contratos.
+- Archivos/rutas: el SPEC debe ser coherente internamente:
+  - `endpoints[].file` debe existir en `files`
+  - `bundle_files` (si existe) debe estar incluido en `files`
+  - no debe haber rutas fuera de `app/` para Python
+
+SALIDA (EXCLUSIVAMENTE JSON válido)
+{{
+  "ok": true,
+  "errors": [],
+  "patched_spec": null
+}}
+
+REGLAS DE SALIDA
+- Devuelve SOLO JSON.
+- Si detectas problemas:
+  - ok=false
+  - errors: lista de strings concisos y accionables
+  - patched_spec: devuelve el SPEC completo corregido si puedes; si no, null
+- No uses Markdown.
+""".strip()
+
+    last_errors: List[str] = []
+    for _ in range(max(1, intentos)):
+        raw = chat_completion_json(
+            prompt=prompt,
+            system=None,
+            temperature=0.0,
+            max_tokens=1400,
+            provider_hint="docs",
+            fase="documentacion",
+        )
+        data = _extraer_json_tolerante(raw)
+        if not isinstance(data, dict):
+            last_errors = ["auditor: salida no parseable"]
+            continue
+
+        ok = bool(data.get("ok"))
+        errors = data.get("errors") if isinstance(data.get("errors"), list) else []
+        patched = data.get("patched_spec")
+
+        if ok:
+            return spec, []
+
+        last_errors = [str(e) for e in errors if str(e).strip()] or ["auditor: inconsistencias detectadas"]
+
+        if isinstance(patched, dict):
+            return patched, last_errors
+
+    return None, last_errors
+
+
+def _persistir_spec_debug(
+    nombre_archivo: str,
+    spec: dict,
+    descripcion_global: str,
+    contexto_normalizado: dict | None,
+) -> None:
+    """
+    Persiste un SPEC como artefacto trazable en output/_debug.
+    (Persistencia en el directorio final del proyecto se hará en el orquestador,
+    cuando se conozca nombre_proyecto y se materialicen archivos.)
+    """
+    try:
+        debug_dir = Path("output/_debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        debug_path = debug_dir / nombre_archivo
+        payload = {
+            "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+            "descripcion_global": descripcion_global,
+            "contexto_normalizado": contexto_normalizado,
+            "spec": spec,
+        }
+        debug_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[DEBUG] SPEC persistido en: {debug_path.as_posix()}")
+    except Exception as e:
+        print(f"[DEBUG] No se pudo persistir SPEC: {e}")
 
 
 def _normalizar_paths(files: List[Dict[str, str]]) -> List[str]:
@@ -442,6 +616,44 @@ def _validar_imports_internos(
     return (len(errores) == 0), errores
 
 
+def _sanitizar_restrictions(restrictions: List[dict]) -> List[dict]:
+    """
+    Limpieza defensiva y GENÉRICA de restrictions (enforcement-ready).
+
+    Política acordada:
+    - Mantener `must_not_contain` (prohibiciones): suelen ser universales y poco frágiles.
+    - Eliminar `must_contain_any` cuando la regla aplica a un scope overbroad ("*" o "*.py"),
+      ya que fuerza tokens específicos en TODOS los módulos (falsos positivos masivos).
+    - Mantener `must_contain_any` solo si `applies_to` es específico (archivo/carpeta).
+    """
+    if not isinstance(restrictions, list):
+        return []
+
+    def _is_overbroad(applies_to_val: Any) -> bool:
+        if not isinstance(applies_to_val, list) or not applies_to_val:
+            return True
+        norm = [str(x).strip() for x in applies_to_val if str(x).strip()]
+        return norm == ["*"] or norm == ["*.py"] or "*" in norm
+
+    cleaned: List[dict] = []
+    for r in restrictions:
+        if not isinstance(r, dict):
+            continue
+
+        applies_to = r.get("applies_to")
+        must_any = r.get("must_contain_any") or []
+
+        # Si es overbroad, anulamos must_contain_any (pero conservamos must_not_contain).
+        if must_any and _is_overbroad(applies_to):
+            rr = dict(r)
+            rr["must_contain_any"] = []
+            cleaned.append(rr)
+        else:
+            cleaned.append(r)
+
+    return cleaned
+
+
 def _compilar_restricciones(
     spec: dict,
     contexto_normalizado: dict | None,
@@ -461,8 +673,9 @@ def _compilar_restricciones(
         restricciones = [r for r in spec.get("restrictions", []) if isinstance(r, dict)]
 
     # Si ya hay restricciones ejecutables, las respetamos y no gastamos tokens.
+    # PERO: aplicamos una sanitización genérica para evitar falsos positivos masivos.
     if restricciones:
-        return restricciones
+        return _sanitizar_restrictions(restricciones)
 
     restricciones_tecnicas = []
     if isinstance(contexto_normalizado, dict):
@@ -619,7 +832,7 @@ REGLA (GENÉRICA) - EVITAR RESTRICCIONES INÚTILES/FRÁGILES
 
                 cleaned.append(rr)
 
-            return cleaned
+            return _sanitizar_restrictions(cleaned)
     return []
 
 def _guardrails_por_spec(
@@ -941,7 +1154,7 @@ Devuelve EXCLUSIVAMENTE JSON válido con la estructura:
 }}
 
 REGLAS
-- Devuelve JSON en una ÚNICA línea (sin pretty print, sin saltos de línea innecesarios).
+- Devuelve EXCLUSIVAMENTE JSON válido.
 - Prohibido usar fences Markdown (``` o ```json).
 - No incluyas texto fuera del JSON.
 - No inventes archivos Python fuera de app/.
@@ -996,40 +1209,100 @@ def generar_proyecto_completo(
     spec: Optional[dict] = None
     errores_spec: List[str] = []
 
-    for _ in range(max(1, intentos)):
+    # Política:
+    # - Intento 1: generar SPEC desde prompt base
+    # - Si no parsea o no valida: NO reintentamos "desde cero"; pedimos REPARAR
+    prompt_spec_base = prompt_spec
+
+    for intento_spec in range(max(1, intentos)):
         resp = chat_completion_json(
             prompt=prompt_spec,
             system=None,
             temperature=0.1,
-            max_tokens=1500,
+            max_tokens=1800,
             provider_hint="docs",
             fase="documentacion",
         )
         spec = _extraer_json_tolerante(resp)
+
         if not spec:
-            # Si no parsea, dejamos trazabilidad para el dump final
             errores_spec = ["SPEC no parseable (JSON inválido/truncado o texto extra no extraíble)"]
+
+            # Guardar RAW del SPEC para diagnóstico (timeouts / truncados / rate-limit)
+            try:
+                debug_dir = Path("output/_debug")
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                (debug_dir / f"spec_raw_{ts}.txt").write_text(resp or "", encoding="utf-8")
+            except Exception:
+                pass
+
+            # En vez de regenerar todo, pedimos reparar la respuesta cruda.
+            prompt_spec = _reparar_spec_prompt(
+                prompt_spec_base=prompt_spec_base,
+                raw_resp=resp,
+                errores=errores_spec,
+            )
             continue
+
         ok, errores = _validar_spec(spec)
-        if ok:
-            break
-        errores_spec = errores
-        # reparación corta del spec
-        prompt_spec = f"""
-El SPEC anterior no cumple los invariantes o es inválido.
+        if not ok:
+            errores_spec = errores
+            prompt_spec = _reparar_spec_prompt(
+                prompt_spec_base=prompt_spec_base,
+                raw_resp=resp,
+                errores=errores_spec,
+            )
+            spec = None
+            continue
 
-Errores:
-- {chr(10).join(errores)}
+        # -------------------------
+        # FASE 1.5: alineación SPEC vs ContextoNormalizado (si existe)
+        # -------------------------
+        if isinstance(contexto_normalizado, dict) and contexto_normalizado:
+            patched, audit_errors = _alinear_spec_con_contexto(spec, contexto_normalizado, intentos=1)
+            if isinstance(patched, dict):
+                spec = patched
 
-RESPUESTA CRUDA anterior (puede contener truncado o texto extra):
-{resp}
+                ok2, errores2 = _validar_spec(spec)
+                if ok2:
+                    # Persistimos el SPEC alineado para diagnóstico (en debug).
+                    _persistir_spec_debug(
+                        nombre_archivo=f"spec_ok_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        spec=spec,
+                        descripcion_global=descripcion_global,
+                        contexto_normalizado=contexto_normalizado,
+                    )
+                    break
 
-SPEC parseado anterior:
-{json.dumps(spec, ensure_ascii=False)}
+                # si el patch rompe invariantes estructurales, pedimos reparación guiada
+                errores_spec = (audit_errors or []) + errores2
+                prompt_spec = _reparar_spec_prompt(
+                    prompt_spec_base=prompt_spec_base,
+                    raw_resp=resp,
+                    errores=errores_spec,
+                )
+                spec = None
+                continue
+            else:
+                # auditor no pudo parchear, pedimos reparación guiada por errores
+                errores_spec = audit_errors or ["auditor: no pudo alinear SPEC con contexto"]
+                prompt_spec = _reparar_spec_prompt(
+                    prompt_spec_base=prompt_spec_base,
+                    raw_resp=resp,
+                    errores=errores_spec,
+                )
+                spec = None
+                continue
 
-Devuelve un SPEC corregido. Recuerda: entrypoint=app.main:app, run_command='uvicorn app.main:app --reload', imports_policy='absolute_from_app'.
-"""
-        spec = None
+        # si no hay contexto_normalizado, ya es válido estructuralmente
+        _persistir_spec_debug(
+            nombre_archivo=f"spec_ok_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            spec=spec,
+            descripcion_global=descripcion_global,
+            contexto_normalizado=contexto_normalizado,
+        )
+        break
 
     if not spec:
         print("[DEBUG] No se pudo generar un SPEC válido.")
@@ -1395,6 +1668,24 @@ REGLAS:
             return {"files": []}
 
     # 3) Guardrails por SPEC (contrato usuario): si fallan, intentamos repair dirigido
+    # DEBUG: confirmar restrictions finales (post-compilación + sanitización)
+    try:
+        rs = spec.get("restrictions", [])
+        if isinstance(rs, list) and rs:
+            resumen = [
+                {
+                    "id": r.get("id"),
+                    "applies_to": r.get("applies_to"),
+                    "must_any_len": len(r.get("must_contain_any") or []),
+                    "must_not_len": len(r.get("must_not_contain") or []),
+                }
+                for r in rs
+                if isinstance(r, dict)
+            ]
+            print("[DEBUG] Restrictions finales (resumen):", json.dumps(resumen, ensure_ascii=False))
+    except Exception:
+        pass
+
     ok_guard, e_guard, repair_paths = _guardrails_por_spec(spec, files_generados)
     if not ok_guard:
         print("[DEBUG] Fallo guardrails SPEC:", e_guard)
@@ -1463,4 +1754,4 @@ REGLA CRÍTICA restrictions.must_contain_any (GENÉRICA)
         else:
             return {"files": []}
 
-    return {"files": files_generados}
+    return {"files": files_generados, "spec": spec}
