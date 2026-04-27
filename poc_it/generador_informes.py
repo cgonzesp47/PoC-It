@@ -324,7 +324,7 @@ Checklist breve y accionable.
 No incluyas contenido redundante.
 """
 
-    contenido = _llamar_modelo(prompt, max_tokens=750)
+    contenido = _llamar_modelo(prompt, max_tokens=1200)
 
     # Eliminación de repeticiones accidentales del modelo
     marcador = "# Implementación manual requerida"
@@ -390,15 +390,6 @@ def generar_readme_asesor(
         "- Nivel de complejidad inferido: derivado de integraciones externas, "
         "necesidad de autenticación, persistencia y despliegue.\n\n"
     )
-
-    contenido += "### 2.1 SPEC de referencia (fuente de verdad)\n\n"
-    contenido += (
-        "El siguiente SPEC describe el contrato objetivo (endpoints, modelos de datos, "
-        "variables de entorno y dependencias). Las conclusiones deben ser coherentes con él.\n\n"
-    )
-    contenido += "```json\n"
-    contenido += f"{spec_json}\n"
-    contenido += "```\n\n"
 
     # ------------------------------------------------------
     # 3. Riesgos estructurales reales
