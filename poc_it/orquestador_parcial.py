@@ -23,6 +23,7 @@ import os
 import subprocess
 
 from poc_it.generador_artefactos import generar_proyecto_completo
+from poc_it.generador_tests_unitarios import generar_tests_unitarios_minimos
 from poc_it.materializador_archivos import materializar_proyecto
 from poc_it.models import ProjectContext, PlantillaUsuario
 from poc_it.clasificador import clasificar_viabilidad
@@ -214,6 +215,40 @@ Descripción:
                     nombre_proyecto=self.nombre_proyecto,
                     estructura=estructura,
                 )
+
+                # ==========================================
+                # 3.2) Generación de pruebas unitarias mínimas
+                # ==========================================
+                # Módulo independiente: basado en SPEC (si existe) y en la estructura generada.
+                # Controlado por flag, para no añadir coste si no se desea.
+                generar_tests = os.getenv("GENERAR_TESTS_UNITARIOS", "1").strip() in (
+                    "1",
+                    "true",
+                    "True",
+                    "yes",
+                    "YES",
+                )
+                if generar_tests:
+                    try:
+                        spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
+                        tests_result = generar_tests_unitarios_minimos(
+                            nombre_proyecto=self.nombre_proyecto,
+                            spec=spec_dict if isinstance(spec_dict, dict) else None,
+                            estructura_generada=estructura,
+                            intentos=1,
+                        )
+                        if tests_result.errores:
+                            print("[TESTS] Aviso: generación de tests con warnings:", tests_result.errores)
+
+                        if tests_result.estructura_tests:
+                            archivos_tests = materializar_proyecto(
+                                nombre_proyecto=self.nombre_proyecto,
+                                estructura=tests_result.estructura_tests,
+                                limpiar_directorio=False,
+                            )
+                            archivos_creados.extend(archivos_tests)
+                    except Exception as _e:
+                        print(f"[TESTS] Error generando/materializando tests: {_e}")
 
                 # ==========================================
                 # 3.1) Verificación runtime mínima (evita PoCs que no arrancan)
