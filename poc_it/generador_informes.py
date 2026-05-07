@@ -324,7 +324,7 @@ Checklist breve y accionable.
 No incluyas contenido redundante.
 """
 
-    contenido = _llamar_modelo(prompt, max_tokens=1200)
+    contenido = _llamar_modelo(prompt, max_tokens=1500)
 
     # Eliminación de repeticiones accidentales del modelo
     marcador = "# Implementación manual requerida"
