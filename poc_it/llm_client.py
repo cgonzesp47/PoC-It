@@ -44,11 +44,16 @@ LITELLM_PROXY_KEY = os.getenv("LITELLM_PROXY_KEY")  # opcional (si proteges el p
 
 # Si quieres forzar que NUNCA se hagan llamadas directas a proveedores (solo proxy), activa:
 #   LITELLM_PROXY_ONLY=1
+#
+# A petición del proyecto: por defecto SIEMPRE usamos el proxy (API Park / LiteLLM Proxy).
+# Esto garantiza que el routing/fallback centralizado se aplique y evita llamadas directas a proveedores.
+# Por defecto: permitimos fallback manual como último recurso (tras fallo del proxy).
+# Si quremos que NUNCA se hagan llamadas directas, exporta LITELLM_PROXY_ONLY=1.
 LITELLM_PROXY_ONLY = os.getenv("LITELLM_PROXY_ONLY", "0").strip() in ("1", "true", "True", "yes", "YES")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/gpt-oss-120b")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -443,10 +448,16 @@ def _call_litellm_proxy(
 
         if resp.status_code != 200:
             # Muy útil para 400/404 del proxy indicando upstream/model inválido.
+            # Caso especial: 402 (insufficient credits / max_tokens demasiado alto) -> tratamos como "no fatal"
+            # para permitir fallback al siguiente alias/proveedor.
             try:
                 body = (resp.text or "")[:2000]
             except Exception:
                 body = ""
+
+            if resp.status_code == 402:
+                raise LLMError(f"LiteLLM Proxy 402 (insufficient credits / max_tokens too high): {body}")
+
             raise LLMError(f"Error LiteLLM Proxy {resp.status_code}: {body}")
 
         data = resp.json()
@@ -543,14 +554,15 @@ def chat_completion_text(
     # ----------------------------------------------------------
     PHASE_ALIAS_FALLBACKS: Dict[str, List[str]] = {
         # JSON pequeños y rápidos
+        # Preferimos que el fallback se gestione PRINCIPALMENTE en el proxy (router_settings.fallbacks).
+        # Por eso el alias de grupo (ctx-json / cls-json / docs / estimate / code-gen) debe ir primero.
         "normalizacion_contexto": ["ctx-json", "ctx-json-gemini", "ctx-json-groq", "ctx-json-openrouter"],
-        "clasificacion": ["cls-json", "cls-json-groq", "cls-json-gemini", "cls-json-openrouter"],
-        # Docs (texto): probar explícitamente TODOS los aliases definidos en litellm_config.yaml
-        # Orden deseado: openrouter -> gemini -> cerebras -> groq
+        "clasificacion": ["cls-json", "cls-json-gemini", "cls-json-groq", "cls-json-openrouter"],
+        # Docs (texto): SIEMPRE empezar por el model group 'docs' para que el proxy aplique sus fallbacks internos.
+        # Sólo si el proxy en sí falla para 'docs' probamos deployments concretos (último recurso).
         "documentacion": ["docs", "docs-gemini", "docs-cerebras", "docs-groq"],
-        # Estimaciones: idem (según litellm_config.yaml)
         "estimacion": ["estimate", "estimate-cerebras", "estimate-groq", "estimate-openrouter"],
-        # Generación de código: si el alias principal falla, probamos fallback explícito
+        # Generación de código: group primero (y que el proxy rote), luego fallback explícito como último recurso.
         "generacion_codigo": ["code-gen", "code-gen-fallback"],
     }
 
@@ -595,21 +607,18 @@ def chat_completion_text(
     ollama_error: Optional[Exception] = None
 
     # Cadena base de proveedores
-    # - Por defecto: proxy primero y luego fallbacks directos (para resiliencia).
-    # - Si LITELLM_PROXY_ONLY=1: SOLO proxy (útil para validar que todo pasa por API Park/LiteLLM).
-    default_chain = ["litellm_proxy"] if LITELLM_PROXY_ONLY else [
-        # Proxy centralizado (recomendado)
-        "litellm_proxy",
-        # Fallbacks directos (por si el proxy o el routing están degradados)
-        "groq",
-        "cerebras",
-        "mistral",
-        "gemini",
-        "openrouter",
-        "ollama",
-    ]
+    # - Política: primero LiteLLM Proxy (API Park).
+    # - Si el proxy (incluyendo sus fallbacks internos) no consigue respuesta útil,
+    #   activamos un fallback manual de ÚLTIMO RECURSO a proveedores directos.
+    default_chain = ["litellm_proxy"]
 
-    providers = default_chain
+    # IMPORTANTE:
+    # - Fallback manual SOLO tras fallo del proxy.
+    # - Si quieres desactivar completamente llamadas directas, exporta LITELLM_PROXY_ONLY=1.
+    if LITELLM_PROXY_ONLY:
+        providers = default_chain
+    else:
+        providers = default_chain + ["groq", "gemini", "mistral", "cerebras", "openrouter", "ollama"]
 
     LLM_METRICS["total_calls"] += 1
 
