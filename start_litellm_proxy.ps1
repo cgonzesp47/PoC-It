@@ -50,8 +50,15 @@ Get-Content $envFile | ForEach-Object {
 }
 
 # Validaciones mínimas (no imprimimos los secretos)
-# OPENAI_API_KEY puede no ser necesario si no usas modelos OpenAI.
-$required = @("MISTRAL_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY")
+# Nota: OPENAI_API_KEY puede no ser necesario si no usas modelos OpenAI.
+# En este repo, el proxy define deployments para: Mistral, Groq, Cerebras, Gemini y OpenRouter.
+$required = @(
+  "MISTRAL_API_KEY",
+  "GROQ_API_KEY",
+  "CEREBRAS_API_KEY",
+  "GEMINI_API_KEY",
+  "OPENROUTER_API_KEY"
+)
 $missing = @()
 foreach ($k in $required) {
   $val = [System.Environment]::GetEnvironmentVariable($k, "Process")
