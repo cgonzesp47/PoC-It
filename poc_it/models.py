@@ -5,7 +5,7 @@ Responsabilidad única: estructuras de datos.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -16,6 +16,26 @@ class PlantillaUsuario(BaseModel):
     funcionalidades: str = Field(...)
     limites: str = Field(...)
     tecnologias: str = Field(...)
+
+
+class ContratoAPIRequest(BaseModel):
+    type: str = Field(default="none", description="json | multipart | query | none")
+    schema_hint: Dict[str, Any] = Field(default_factory=dict)
+    evidence: str = ""
+    assumption: str = ""
+
+
+class ContratoAPIResponse(BaseModel):
+    json_example: Dict[str, Any] = Field(default_factory=dict)
+    evidence: str = ""
+
+
+class ContratoAPI(BaseModel):
+    method: str
+    path: str
+    request: ContratoAPIRequest = Field(default_factory=ContratoAPIRequest)
+    response: ContratoAPIResponse = Field(default_factory=ContratoAPIResponse)
+    notes: str = ""
 
 
 class ContextoNormalizado(BaseModel):
@@ -33,6 +53,9 @@ class ContextoNormalizado(BaseModel):
     riesgos_inherentes: List[str] = Field(default_factory=list)
     complejidad_inferida: str = "MEDIA"
     modo_recomendado: str = "PARCIAL"
+
+    # Contratos estructurados (fuente de verdad para request/response cuando exista evidencia)
+    contratos_api: List[ContratoAPI] = Field(default_factory=list)
 
 
 class ModoGeneracion(str, Enum):
