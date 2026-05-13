@@ -38,7 +38,7 @@ from poc_it.materializador_archivos import materializar_proyecto
 from poc_it.models import ContextoNormalizado, PlantillaUsuario, ProjectContext
 from poc_it.normalizador_contexto import normalizar_plantilla
 from poc_it.opciones import generar_opciones
-from poc_it.postprocesador_alineacion import AlignmentIssue, postprocesar_alineacion_llm
+from poc_it.orquestacion.postprocesado_alineacion import postprocesar_alineacion_por_pytest
 
 logger = logging.getLogger(__name__)
 
@@ -157,77 +157,6 @@ Descripción:
         return estructura, archivos_creados, tiempo_generacion_horas, resultado
 
 
-    def _postprocesar_alineacion(
-        self,
-        project_dir: str,
-        resultado: Dict[str, Any],
-        estructura: Dict[str, str],
-        archivos_creados: list[str],
-    ) -> None:
-        try:
-            max_repairs = int(os.getenv("POSTPROCESADO_MAX_REPAIRS", "2"))
-
-            for attempt in range(max_repairs + 1):
-                issues: list[AlignmentIssue] = []
-
-                try:
-                    tests_dir = os.path.join(project_dir, "tests")
-                    if os.path.isdir(tests_dir):
-                        p = subprocess.run(
-                            ["python", "-m", "pytest", "-q"],
-                            cwd=project_dir,
-                            capture_output=True,
-                            text=True,
-                        )
-                        if p.returncode != 0:
-                            out = (p.stdout or "") + "\n" + (p.stderr or "")
-                            issues.append(
-                                AlignmentIssue(
-                                    code="PYTEST_FAILURE",
-                                    severity="error",
-                                    file="tests",
-                                    message="Errores residuales: pytest falla; alinear tests/handlers/modelos.",
-                                    hint=out[:8000],
-                                )
-                            )
-                except Exception as e:
-                    logger.info("[POST] Aviso: pytest no ejecutable: %s", e)
-
-                if not issues:
-                    break
-
-                if attempt >= max_repairs:
-                    logger.info("[POST] Reparación por pytest agotada; se continúa sin bloquear.")
-                    break
-
-                logger.info(
-                    "[POST] Pytest falló; ejecutando post-procesado (attempt %s/%s)",
-                    attempt + 1,
-                    max_repairs,
-                )
-
-                spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
-                pp = postprocesar_alineacion_llm(
-                    estructura=estructura,
-                    spec=spec_dict if isinstance(spec_dict, dict) else None,
-                    issues=issues,
-                    max_files=6,
-                )
-                if not pp.patched_files:
-                    logger.info("[POST] El modelo no devolvió patch; se continúa.")
-                    break
-
-                materializar_proyecto(
-                    nombre_proyecto=self.nombre_proyecto,
-                    estructura=pp.patched_files,
-                    limpiar_directorio=False,
-                )
-                estructura.update(pp.patched_files)
-                archivos_creados.extend(
-                    [os.path.join(project_dir, p.replace("/", os.sep)) for p in pp.patched_files.keys()]
-                )
-        except Exception as _e:
-            logger.info("[POST] Aviso: post-procesado de alineación falló (se continúa): %s", _e)
 
     def _runtime_repair_loop(
         self,
@@ -494,7 +423,13 @@ SALIDA
                 project_dir = os.path.join("output", self.nombre_proyecto)
 
                 generar_tests = generar_tests_unitarios(self.nombre_proyecto, resultado, estructura, archivos_creados)
-                self._postprocesar_alineacion(project_dir, resultado, estructura, archivos_creados)
+                postprocesar_alineacion_por_pytest(
+                    nombre_proyecto=self.nombre_proyecto,
+                    project_dir=project_dir,
+                    resultado=resultado,
+                    estructura=estructura,
+                    archivos_creados=archivos_creados,
+                )
                 self._runtime_repair_loop(
                     project_dir=project_dir,
                     context=context,
