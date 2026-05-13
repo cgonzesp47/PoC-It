@@ -7,8 +7,8 @@ from typing import Any, Dict
 from poc_it.generador_artefactos import generar_proyecto_completo
 from poc_it.materializador_archivos import materializar_proyecto
 from poc_it.models import ProjectContext
-from poc_it.orquestacion.runtime_verifier import runtime_verify_fastapi_project
-from poc_it.orquestacion.tests_generation import generar_tests_unitarios
+from poc_it.orquestacion.verificador_runtime import runtime_verify_fastapi_project
+from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
 
 logger = logging.getLogger(__name__)
 

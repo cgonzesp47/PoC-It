@@ -26,15 +26,15 @@ from typing import Any, Dict, Tuple
 
 from poc_it.clasificador import clasificar_viabilidad
 from poc_it.generador_artefactos import generar_proyecto_completo
-from poc_it.orquestacion.runtime_verifier import runtime_verify_fastapi_project
+from poc_it.orquestacion.verificador_runtime import runtime_verify_fastapi_project
 from poc_it.orquestacion.reparacion_runtime import ejecutar_reparacion_runtime
-from poc_it.orquestacion.spec_persistence import persist_spec_json
+from poc_it.orquestacion.persistencia_spec import persist_spec_json
 from poc_it.generador_informes import (
     generar_readme_asesor,
     generar_readme_final,
     generar_readme_manual,
 )
-from poc_it.orquestacion.tests_generation import generar_tests_unitarios
+from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
 from poc_it.materializador_archivos import materializar_proyecto
 from poc_it.models import ContextoNormalizado, PlantillaUsuario, ProjectContext
 from poc_it.normalizador_contexto import normalizar_plantilla
