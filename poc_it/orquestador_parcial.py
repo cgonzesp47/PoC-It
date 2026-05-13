@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Tuple
 
 from poc_it.clasificador import clasificar_viabilidad
+from poc_it.orquestacion.runtime_verifier import runtime_verify_fastapi_project
 from poc_it.generador_artefactos import generar_proyecto_completo
 from poc_it.generador_informes import (
     generar_readme_asesor,
@@ -41,38 +42,6 @@ from poc_it.postprocesador_alineacion import AlignmentIssue, postprocesar_alinea
 logger = logging.getLogger(__name__)
 
 
-def _runtime_verify_fastapi_project(project_dir: str) -> Tuple[bool, str]:
-    """
-    Verificación runtime mínima (genérica) para proyectos FastAPI generados.
-
-    Objetivo:
-    - Confirmar que el entrypoint `app.main:app` es importable SIN configuración externa.
-
-    Importante:
-    - No valida endpoints concretos (p.ej. /health) porque no siempre existirán.
-    - No valida integraciones externas (Drive, DB, etc.). Solo valida "arranque/import-time".
-    - Devuelve detalles ricos (stdout/stderr + hints) para repair loop.
-    """
-    py = "python"
-
-    p1 = subprocess.run(
-        [py, "-c", "import app.main; print('IMPORT_OK')"],
-        cwd=project_dir,
-        capture_output=True,
-        text=True,
-    )
-    if p1.returncode != 0:
-        out = (p1.stdout or "") + "\n" + (p1.stderr or "")
-        hint = (
-            "HINTS:\n"
-            "- Si el error es ValidationError/BaseSettings: estás validando settings en import-time; usa lazy get_settings().\n"
-            "- Si el error es TypeError missing positional arguments: estás instanciando un servicio/clase en import-time sin pasar args; crea el servicio dentro del endpoint o con Depends.\n"
-            "- Si el error es ImportError: estás importando un símbolo que no existe o tienes imports circulares.\n"
-            "- Si el error es ModuleNotFoundError: falta una dependencia en requirements.txt.\n"
-        )
-        return False, f"[runtime_verify] import app.main failed:\n{out}\n{hint}"
-
-    return True, "IMPORT_OK"
 
 
 class OrquestadorParcial:
@@ -323,7 +292,7 @@ Descripción:
 
         max_runtime_repairs = 5
         for attempt in range(max_runtime_repairs + 1):
-            ok_runtime, detail = _runtime_verify_fastapi_project(project_dir)
+            ok_runtime, detail = runtime_verify_fastapi_project(project_dir)
             if ok_runtime:
                 break
 
@@ -416,7 +385,7 @@ SALIDA
         generar_docs = True
         if modo_generacion.upper() != "ASESOR":
             project_dir = os.path.join("output", self.nombre_proyecto)
-            ok_runtime, detail = _runtime_verify_fastapi_project(project_dir)
+            ok_runtime, detail = runtime_verify_fastapi_project(project_dir)
             if not ok_runtime:
                 generar_docs = False
                 logger.info("[DOCS] Saltando generación de documentación: el proyecto no es importable aún.")
