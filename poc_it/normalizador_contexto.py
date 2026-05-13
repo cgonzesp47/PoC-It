@@ -62,19 +62,27 @@ Devuelve ÚNICAMENTE JSON válido con la siguiente estructura:
   ]
 }
 
-Reglas:
-- No inventes información que no esté implícita.
-- Si un campo no aplica, devuelve lista vacía.
+Reglas (campos generales):
+- Sí debes inferir y sintetizar a partir de la plantilla (Problema/Usuarios/Funcionalidades/Límites/Tecnologías):
+  - actores_principales
+  - funcionalidades_clave
+  - integraciones_externas
+  - restricciones_tecnicas
+  - requisitos_no_funcionales
+  - riesgos_inherentes
+- No hace falta evidencia literal para estos campos: deben salir de una lectura razonable del texto.
+- Si algo no se menciona ni se puede inferir razonablemente, entonces devuelve lista vacía.
 - No añadas texto fuera del JSON.
 
-Reglas específicas para contratos_api (MUY IMPORTANTE):
-- Solo incluye endpoints que el usuario haya descrito explícitamente (método y/o ruta).
-- Evidencia (OBLIGATORIO):
-  - Para cada contrato, rellena request.evidence y/o response.evidence con una CITA LITERAL (copiada tal cual) de la plantilla.
-  - Si NO existe evidencia literal suficiente para fijar request.type o schema_hint:
-    - usa request.type="none" y schema_hint vacío,
-    - y explica en request.assumption por qué no se pudo inferir.
-- Prohibido “inventar” type/schema_hint sin evidence.
+Reglas específicas para contratos_api (IMPORTANTE):
+- Si el usuario describe explícitamente endpoints (método y ruta), inclúyelos como contratos_api.
+  - Para cada contrato, incluye request.evidence y/o response.evidence con una CITA LITERAL (copiada tal cual) de la plantilla.
+- Si el usuario NO describe endpoints explícitos, puedes PROPONER contratos_api típicos coherentes con la PoC,
+  pero entonces:
+  - request.evidence debe quedar vacío,
+  - y debes explicar claramente en request.assumption que son endpoints propuestos para materializar el requisito.
+- Prohibido inventar type/schema_hint como si fuera evidencia: si no hay evidencia, usa request.assumption.
+- Si no hay payload descrito, usa request.type="none" y schema_hint vacío.
 - Si el usuario menciona ejemplo de respuesta, refleja response.json_example y añade response.evidence con la cita literal.
 """
 
@@ -101,7 +109,7 @@ Tecnologías declaradas: {plantilla.tecnologias}
         prompt=prompt,
         system="Responde exclusivamente con JSON válido.",
         temperature=0.0,
-        max_tokens=900,
+        max_tokens=1400,
         fase="normalizacion_contexto",
     )
 
