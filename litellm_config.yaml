@@ -8,22 +8,22 @@ model_list:
       model: mistral/codestral-latest
       api_key: os.environ/MISTRAL_API_KEY
 
-  - model_name: ctx-json-gemini
-    hidden: false
-    litellm_params:
-      model: gemini/gemini-2.5-flash
-      api_key: os.environ/GEMINI_API_KEY
-
   - model_name: ctx-json-groq
     hidden: false
     litellm_params:
       model: groq/llama-3.3-70b-versatile
       api_key: os.environ/GROQ_API_KEY
 
+  - model_name: ctx-json-gemini
+    hidden: false
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
   - model_name: ctx-json-openrouter
     hidden: false
     litellm_params:
-      model: openrouter/gpt-oss-120b
+      model: openrouter/openai/gpt-oss-120b:free
       api_key: os.environ/OPENROUTER_API_KEY
 
 
@@ -50,7 +50,7 @@ model_list:
   - model_name: cls-json-openrouter
     hidden: false
     litellm_params:
-      model: openrouter/gpt-oss-120b
+      model: openrouter/openai/gpt-oss-120b:free
       api_key: os.environ/OPENROUTER_API_KEY
 
   # Code generation
@@ -78,7 +78,7 @@ model_list:
   - model_name: docs
     hidden: false
     litellm_params:
-      model: openrouter/gpt-oss-120b
+      model: openrouter/openai/gpt-oss-120b:free
       api_key: os.environ/OPENROUTER_API_KEY
 
   - model_name: docs-gemini
@@ -121,7 +121,7 @@ model_list:
   - model_name: estimate-openrouter
     hidden: false
     litellm_params:
-      model: openrouter/gpt-oss-120b
+      model: openrouter/openai/gpt-oss-120b:free
       api_key: os.environ/OPENROUTER_API_KEY
 
   # Separate alias for Groq large model (optional)
@@ -170,13 +170,13 @@ router_settings:
   #       { "<model_group>": ["fallback1", "fallback2", ...] }
   fallbacks:
     - ctx-json:
-        - ctx-json-gemini
         - ctx-json-groq
+        - ctx-json-gemini
         - ctx-json-openrouter
 
     - cls-json:
-        - cls-json-gemini
         - cls-json-groq
+        - cls-json-gemini
         - cls-json-openrouter
 
     - docs:

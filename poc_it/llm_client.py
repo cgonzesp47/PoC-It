@@ -53,7 +53,7 @@ LITELLM_PROXY_ONLY = os.getenv("LITELLM_PROXY_ONLY", "0").strip() in ("1", "true
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/gpt-oss-120b")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-120b:free")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -530,6 +530,7 @@ def chat_completion_text(
     max_tokens: Optional[int] = None,
     provider_hint: Optional[str] = None,
     fase: Optional[str] = None,
+    timeout: Optional[int] = None,
 ) -> str:
     """
     Obtiene una respuesta de texto libre del LLM.
@@ -544,26 +545,24 @@ def chat_completion_text(
         provider_hint = LLM_POLICY.get(fase)
 
     # ----------------------------------------------------------
-    # Fallbacks por fase (ALIAS del proxy) ante rate limit/fallo.
-    # Objetivo: si falla el alias primario (p.ej. ctx-json en Groq),
-    # probamos con otros aliases del proxy antes de saltar a proveedores directos.
+    # Fallbacks por fase (punto medio):
     #
-    # Importante:
-    # - Esto NO hardcodea proveedores, solo aliases definidos en litellm_config.yaml
-    # - Permite que API Park/LiteLLM haga routing interno o use fallbacks configurados
+    # Queremos que el PROXY haga el routing/fallback principal (por model group alias),
+    # y mantener un fallback manual a proveedores directos solo como último recurso.
+    #
+    # Por eso aquí SOLO probamos el alias de GRUPO (ctx-json/cls-json/docs/estimate/code-gen)
+    # dentro del proxy, dejando que `router_settings.fallbacks` del proxy elija
+    # docs-gemini/docs-cerebras/docs-groq, etc.
+    #
+    # Esto mejora trazabilidad (un solo alias por fase) y evita solapar el fallback del proxy
+    # con el fallback manual del cliente.
     # ----------------------------------------------------------
     PHASE_ALIAS_FALLBACKS: Dict[str, List[str]] = {
-        # JSON pequeños y rápidos
-        # Preferimos que el fallback se gestione PRINCIPALMENTE en el proxy (router_settings.fallbacks).
-        # Por eso el alias de grupo (ctx-json / cls-json / docs / estimate / code-gen) debe ir primero.
-        "normalizacion_contexto": ["ctx-json", "ctx-json-gemini", "ctx-json-groq", "ctx-json-openrouter"],
-        "clasificacion": ["cls-json", "cls-json-gemini", "cls-json-groq", "cls-json-openrouter"],
-        # Docs (texto): SIEMPRE empezar por el model group 'docs' para que el proxy aplique sus fallbacks internos.
-        # Sólo si el proxy en sí falla para 'docs' probamos deployments concretos (último recurso).
-        "documentacion": ["docs", "docs-gemini", "docs-cerebras", "docs-groq"],
-        "estimacion": ["estimate", "estimate-cerebras", "estimate-groq", "estimate-openrouter"],
-        # Generación de código: group primero (y que el proxy rote), luego fallback explícito como último recurso.
-        "generacion_codigo": ["code-gen", "code-gen-fallback"],
+        "normalizacion_contexto": ["ctx-json"],
+        "clasificacion": ["cls-json"],
+        "documentacion": ["docs"],
+        "estimacion": ["estimate"],
+        "generacion_codigo": ["code-gen"],
     }
 
     # Si estamos usando el proxy, construimos una lista de aliases a intentar
@@ -650,10 +649,23 @@ def chat_completion_text(
                 else:
                     aliases_to_try = [None]
 
+                # Safety-net: si el alias de grupo (p.ej. "docs") timeoutea de forma recurrente,
+                # permitimos reintentar en el proxy con deployments concretos.
+                # Esto mantiene al proxy en el centro, pero evita quedar bloqueados si el routing interno
+                # no llega a ejecutar fallbacks antes de que el cliente corte.
+                #
+                # NOTA: sólo aplica a documentación, porque es donde más se observan timeouts.
+                if fase == "documentacion":
+                    extra_doc_aliases = ["docs-gemini", "docs-cerebras", "docs-groq"]
+                    for a in extra_doc_aliases:
+                        if a not in aliases_to_try:
+                            aliases_to_try.append(a)
+
                 if not aliases_to_try:
                     aliases_to_try = [None]
 
                 proxy_last_exc: Optional[Exception] = None
+                effective_timeout = timeout if isinstance(timeout, int) and timeout > 0 else 70
                 for alias in aliases_to_try:
                     print(f"[LLM] Provider: LITELLM_PROXY (model={alias or FALLBACK_PROVIDER})")
                     try:
@@ -662,7 +674,7 @@ def chat_completion_text(
                             model=alias or None,
                             temperature=temperature,
                             max_tokens=max_tokens,
-                            timeout=70,
+                            timeout=effective_timeout,
                         )
                     except Exception as exc:
                         proxy_last_exc = exc
@@ -783,6 +795,7 @@ def chat_completion_json(
     max_tokens: Optional[int] = None,
     provider_hint: Optional[str] = None,
     fase: Optional[str] = None,
+    timeout: Optional[int] = None,
 ) -> str:
     """
     Igual que chat_completion_text, pero reforzado para devolver JSON.
@@ -801,6 +814,7 @@ def chat_completion_json(
         max_tokens=max_tokens,
         provider_hint=provider_hint,
         fase=fase,
+        timeout=timeout,
     )
 
     # Blindaje contra respuestas None o no-string
