@@ -18,19 +18,27 @@ Flujo nuevo:
 
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, Tuple
+import logging
 import os
 import subprocess
-import pathlib
-import importlib.util
-import traceback
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, Tuple
 
+from poc_it.clasificador import clasificar_viabilidad
 from poc_it.generador_artefactos import generar_proyecto_completo
+from poc_it.generador_informes import (
+    generar_readme_asesor,
+    generar_readme_final,
+    generar_readme_manual,
+)
 from poc_it.generador_tests_unitarios import generar_tests_unitarios_minimos
 from poc_it.materializador_archivos import materializar_proyecto
-from poc_it.models import ProjectContext, PlantillaUsuario
-from poc_it.clasificador import clasificar_viabilidad
+from poc_it.models import ContextoNormalizado, PlantillaUsuario, ProjectContext
+from poc_it.normalizador_contexto import normalizar_plantilla
+from poc_it.opciones import generar_opciones
 from poc_it.postprocesador_alineacion import AlignmentIssue, postprocesar_alineacion_llm
+
+logger = logging.getLogger(__name__)
 
 
 def _runtime_verify_fastapi_project(project_dir: str) -> Tuple[bool, str]:
@@ -118,253 +126,217 @@ Descripción:
         self.tecnologias = plantilla.tecnologias
         self.modo_generacion = modo_generacion
 
-    def ejecutar(self) -> Dict[str, Any]:
-        """
-        Ejecuta el flujo completo incluyendo clasificación basada en ProjectContext.
-        """
+    def _build_context(self) -> ProjectContext:
+        context = ProjectContext(plantilla=self.plantilla)
+        return context
+
+    def _normalizar_contexto(self, context: ProjectContext) -> None:
+        contexto_dict = normalizar_plantilla(self.plantilla)
 
         try:
-            # ==========================================
-            # 1) Construcción del contexto inicial
-            # ==========================================
-            # Usamos la plantilla REAL proporcionada por el usuario
-            context = ProjectContext(plantilla=self.plantilla)
+            contexto_normalizado = ContextoNormalizado(**contexto_dict)
+            context.contexto_normalizado = contexto_normalizado
+            context.registrar_modelo("normalizacion_contexto", "chat_completion_json")
+        except Exception:
+            context.contexto_normalizado = None
 
-            # ==========================================
-            # 1.1) Fase de Normalización Formal de Contexto
-            # ==========================================
-            from poc_it.normalizador_contexto import normalizar_plantilla
-            from poc_it.models import ContextoNormalizado
+    def _clasificar(self, context: ProjectContext):
+        import time
 
-            # Normalizamos usando la plantilla completa real
-            contexto_dict = normalizar_plantilla(self.plantilla)
+        t_clasificacion_inicio = time.perf_counter()
+        context = clasificar_viabilidad(context)
+        t_clasificacion_fin = time.perf_counter()
 
-            try:
-                contexto_normalizado = ContextoNormalizado(**contexto_dict)
-                context.contexto_normalizado = contexto_normalizado
-                context.registrar_modelo("normalizacion_contexto", "chat_completion_json")
-            except Exception:
-                # En caso extremo de estructura inesperada
-                context.contexto_normalizado = None
+        logger.info("[DEBUG CONTEXT DESPUÉS DE CLASIFICACIÓN]\n%s", context.model_dump_json(indent=2))
 
-            # ==========================================
-            # 2) Clasificación con nuevo agente
-            # ==========================================
-            import time
-            t_clasificacion_inicio = time.perf_counter()
-            context = clasificar_viabilidad(context)
-            t_clasificacion_fin = time.perf_counter()
+        return context, t_clasificacion_inicio, t_clasificacion_fin
 
-            # Mostrar estado actual del contexto
-            print("\n[DEBUG CONTEXT DESPUÉS DE CLASIFICACIÓN]")
-            print(context.model_dump_json(indent=2))
-            print("")
+    def _persist_spec_json(self, resultado: Dict[str, Any], archivos_creados: list) -> None:
+        try:
+            spec = resultado.get("spec")
+            if isinstance(spec, dict) and spec:
+                spec_path = os.path.join("output", self.nombre_proyecto, "SPEC.json")
+                os.makedirs(os.path.dirname(spec_path), exist_ok=True)
+                with open(spec_path, "w", encoding="utf-8") as f:
+                    import json as _json
 
-            modo_generacion = context.clasificacion or self.modo_generacion
+                    f.write(_json.dumps(spec, ensure_ascii=False, indent=2))
+                archivos_creados.append(spec_path)
+        except Exception as _e:
+            logger.info("[DEBUG] No se pudo persistir SPEC.json: %s", _e)
 
-            # (Clasificador oficial mantenido. Sin comparativa adicional.)
+    def _generar_y_materializar(self, context: ProjectContext, modo_generacion: str):
+        import time
 
-            # ==========================================
-            # 3) Generación (omitida si modo ASESOR)
-            # ==========================================
-            import time
+        estructura: Dict[str, str] = {}
+        archivos_creados: list[str] = []
+        tiempo_generacion_horas = 0.0
+        resultado: Dict[str, Any] = {}
 
-            estructura = {}
-            archivos_creados = []
-            tiempo_generacion_horas = 0.0
+        if modo_generacion.upper() == "ASESOR":
+            return estructura, archivos_creados, tiempo_generacion_horas, resultado
 
-            if modo_generacion.upper() != "ASESOR":
-                t_generacion_inicio = time.perf_counter()
+        t_generacion_inicio = time.perf_counter()
 
-                resultado = generar_proyecto_completo(
-                    descripcion_global=self.descripcion_global,
-                    contexto_normalizado=(
-                        context.contexto_normalizado.model_dump()
-                        if context.contexto_normalizado
-                        else None
-                    ),
-                )
+        resultado = generar_proyecto_completo(
+            descripcion_global=self.descripcion_global,
+            contexto_normalizado=(
+                context.contexto_normalizado.model_dump() if context.contexto_normalizado else None
+            ),
+        )
 
-                # ------------------------------------------
-                # Persistir SPEC.json como artefacto del proyecto
-                # Fuente de verdad para documentación y auditoría
-                # ------------------------------------------
-                try:
-                    spec = resultado.get("spec")
-                    if isinstance(spec, dict) and spec:
-                        spec_path = os.path.join("output", self.nombre_proyecto, "SPEC.json")
-                        os.makedirs(os.path.dirname(spec_path), exist_ok=True)
-                        with open(spec_path, "w", encoding="utf-8") as f:
-                            import json as _json
-                            f.write(_json.dumps(spec, ensure_ascii=False, indent=2))
-                        archivos_creados.append(spec_path)
-                except Exception as _e:
-                    print(f"[DEBUG] No se pudo persistir SPEC.json: {_e}")
+        self._persist_spec_json(resultado, archivos_creados)
 
-                t_generacion_fin = time.perf_counter()
-                tiempo_generacion_horas = (t_generacion_fin - t_generacion_inicio) / 3600
+        t_generacion_fin = time.perf_counter()
+        tiempo_generacion_horas = (t_generacion_fin - t_generacion_inicio) / 3600
 
-                files = resultado.get("files", [])
+        files = resultado.get("files", [])
+        if not files:
+            raise ValueError("El modelo no generó archivos válidos.")
 
-                if not files:
-                    raise ValueError("El modelo no generó archivos válidos.")
+        estructura = {f["path"]: f["content"] for f in files if "path" in f and "content" in f}
 
-                estructura = {
-                    f["path"]: f["content"]
-                    for f in files
-                    if "path" in f and "content" in f
-                }
+        archivos_creados = materializar_proyecto(
+            nombre_proyecto=self.nombre_proyecto,
+            estructura=estructura,
+        )
 
-                archivos_creados = materializar_proyecto(
+        return estructura, archivos_creados, tiempo_generacion_horas, resultado
+
+    def _generar_tests(self, resultado: Dict[str, Any], estructura: Dict[str, str], archivos_creados: list[str]) -> bool:
+        generar_tests = os.getenv("GENERAR_TESTS_UNITARIOS", "1").strip() in (
+            "1",
+            "true",
+            "True",
+            "yes",
+            "YES",
+        )
+        if not generar_tests:
+            return generar_tests
+
+        try:
+            spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
+            tests_result = generar_tests_unitarios_minimos(
+                nombre_proyecto=self.nombre_proyecto,
+                spec=spec_dict if isinstance(spec_dict, dict) else None,
+                estructura_generada=estructura,
+                intentos=1,
+            )
+            if tests_result.errores:
+                logger.info("[TESTS] Aviso: generación de tests con warnings: %s", tests_result.errores)
+
+            if tests_result.estructura_tests:
+                archivos_tests = materializar_proyecto(
                     nombre_proyecto=self.nombre_proyecto,
-                    estructura=estructura,
+                    estructura=tests_result.estructura_tests,
+                    limpiar_directorio=False,
                 )
+                archivos_creados.extend(archivos_tests)
+                estructura.update(tests_result.estructura_tests)
+        except Exception as _e:
+            logger.info("[TESTS] Error generando/materializando tests: %s", _e)
 
-                # ==========================================
-                # 3.1) Generación de pruebas unitarias mínimas
-                # ==========================================
-                # Módulo independiente: basado en SPEC (si existe) y en la estructura generada.
-                # Controlado por flag, para no añadir coste si no se desea.
-                generar_tests = os.getenv("GENERAR_TESTS_UNITARIOS", "1").strip() in (
-                    "1",
-                    "true",
-                    "True",
-                    "yes",
-                    "YES",
-                )
-                if generar_tests:
-                    try:
-                        spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
-                        tests_result = generar_tests_unitarios_minimos(
-                            nombre_proyecto=self.nombre_proyecto,
-                            spec=spec_dict if isinstance(spec_dict, dict) else None,
-                            estructura_generada=estructura,
-                            intentos=1,
-                        )
-                        if tests_result.errores:
-                            print("[TESTS] Aviso: generación de tests con warnings:", tests_result.errores)
+        return generar_tests
 
-                        if tests_result.estructura_tests:
-                            archivos_tests = materializar_proyecto(
-                                nombre_proyecto=self.nombre_proyecto,
-                                estructura=tests_result.estructura_tests,
-                                limpiar_directorio=False,
-                            )
-                            archivos_creados.extend(archivos_tests)
-                            # Importante: para siguientes pasos, incluir tests en estructura in-memory
-                            estructura.update(tests_result.estructura_tests)
-                    except Exception as _e:
-                        print(f"[TESTS] Error generando/materializando tests: {_e}")
+    def _postprocesar_alineacion(
+        self,
+        project_dir: str,
+        resultado: Dict[str, Any],
+        estructura: Dict[str, str],
+        archivos_creados: list[str],
+    ) -> None:
+        try:
+            max_repairs = int(os.getenv("POSTPROCESADO_MAX_REPAIRS", "2"))
 
-                # ==========================================
-                # 3.2) Post-procesado de alineación (LLM-only)
-                # ==========================================
-                # Objetivo: aplicar micro-parches para corregir errores residuales detectados por pytest.
-                #
-                # Importante:
-                # - Se ejecuta DESPUÉS de materializar tests, para que pytest tenga algo que ejecutar.
-                # - El LLM recibe SPEC+FACTS+ISSUES y devuelve un patch mínimo.
+            for attempt in range(max_repairs + 1):
+                issues: list[AlignmentIssue] = []
+
                 try:
-                    project_dir = os.path.join("output", self.nombre_proyecto)
-                    max_repairs = int(os.getenv("POSTPROCESADO_MAX_REPAIRS", "2"))
-
-                    for attempt in range(max_repairs + 1):
-                        issues: list[AlignmentIssue] = []
-
-                        # Pytest si existe: convertir fallos en issue.
-                        try:
-                            tests_dir = os.path.join(project_dir, "tests")
-                            if os.path.isdir(tests_dir):
-                                p = subprocess.run(
-                                    ["python", "-m", "pytest", "-q"],
-                                    cwd=project_dir,
-                                    capture_output=True,
-                                    text=True,
+                    tests_dir = os.path.join(project_dir, "tests")
+                    if os.path.isdir(tests_dir):
+                        p = subprocess.run(
+                            ["python", "-m", "pytest", "-q"],
+                            cwd=project_dir,
+                            capture_output=True,
+                            text=True,
+                        )
+                        if p.returncode != 0:
+                            out = (p.stdout or "") + "\n" + (p.stderr or "")
+                            issues.append(
+                                AlignmentIssue(
+                                    code="PYTEST_FAILURE",
+                                    severity="error",
+                                    file="tests",
+                                    message="Errores residuales: pytest falla; alinear tests/handlers/modelos.",
+                                    hint=out[:8000],
                                 )
-                                if p.returncode != 0:
-                                    out = (p.stdout or "") + "\n" + (p.stderr or "")
-                                    issues.append(
-                                        AlignmentIssue(
-                                            code="PYTEST_FAILURE",
-                                            severity="error",
-                                            file="tests",
-                                            message="Errores residuales: pytest falla; alinear tests/handlers/modelos.",
-                                            hint=out[:8000],
-                                        )
-                                    )
-                        except Exception as e:
-                            print(f"[POST] Aviso: pytest no ejecutable: {e}")
+                            )
+                except Exception as e:
+                    logger.info("[POST] Aviso: pytest no ejecutable: %s", e)
 
-                        # Si no hay issues, no hacemos nada
-                        if not issues:
-                            break
+                if not issues:
+                    break
 
-                        # Si hay issues pero ya agotamos intentos, salir
-                        if attempt >= max_repairs:
-                            print("[POST] Reparación por pytest agotada; se continúa sin bloquear.")
-                            break
+                if attempt >= max_repairs:
+                    logger.info("[POST] Reparación por pytest agotada; se continúa sin bloquear.")
+                    break
 
-                        print(f"[POST] Pytest falló; ejecutando post-procesado (attempt {attempt+1}/{max_repairs})")
+                logger.info(
+                    "[POST] Pytest falló; ejecutando post-procesado (attempt %s/%s)",
+                    attempt + 1,
+                    max_repairs,
+                )
 
-                        spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
-                        pp = postprocesar_alineacion_llm(
-                            estructura=estructura,
-                            spec=spec_dict if isinstance(spec_dict, dict) else None,
-                            issues=issues,
-                            max_files=6,
-                        )
-                        if not pp.patched_files:
-                            print("[POST] El modelo no devolvió patch; se continúa.")
-                            break
+                spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
+                pp = postprocesar_alineacion_llm(
+                    estructura=estructura,
+                    spec=spec_dict if isinstance(spec_dict, dict) else None,
+                    issues=issues,
+                    max_files=6,
+                )
+                if not pp.patched_files:
+                    logger.info("[POST] El modelo no devolvió patch; se continúa.")
+                    break
 
-                        materializar_proyecto(
-                            nombre_proyecto=self.nombre_proyecto,
-                            estructura=pp.patched_files,
-                            limpiar_directorio=False,
-                        )
-                        estructura.update(pp.patched_files)
-                        archivos_creados.extend(
-                            [
-                                os.path.join(project_dir, p.replace("/", os.sep))
-                                for p in pp.patched_files.keys()
-                            ]
-                        )
-                except Exception as _e:
-                    print(f"[POST] Aviso: post-procesado de alineación falló (se continúa): {_e}")
+                materializar_proyecto(
+                    nombre_proyecto=self.nombre_proyecto,
+                    estructura=pp.patched_files,
+                    limpiar_directorio=False,
+                )
+                estructura.update(pp.patched_files)
+                archivos_creados.extend(
+                    [os.path.join(project_dir, p.replace("/", os.sep)) for p in pp.patched_files.keys()]
+                )
+        except Exception as _e:
+            logger.info("[POST] Aviso: post-procesado de alineación falló (se continúa): %s", _e)
 
-                # ==========================================
-                # 3.3) Verificación runtime mínima (evita PoCs que no arrancan)
-                # ==========================================
-                # Si falla, intentamos un repair loop dirigido usando el traceback real.
-                #
-                # IMPORTANTE (bugfix):
-                # - generar_proyecto_completo() puede re-ejecutar un "precheck/reparación" de SPEC vs contratos
-                #   y regenerar spec+código (p.ej. al detectar multipart vs json).
-                # - Si hacemos esta verificación DESPUÉS de generar tests, esa regeneración posterior puede
-                #   dejar el output sin tests (porque el segundo pase no los vuelve a materializar).
-                # - Solución: si hay reparación runtime, re-generar tests al final.
-                project_dir = os.path.join("output", self.nombre_proyecto)
+    def _runtime_repair_loop(
+        self,
+        project_dir: str,
+        context: ProjectContext,
+        resultado: Dict[str, Any],
+        estructura: Dict[str, str],
+        archivos_creados: list[str],
+        generar_tests: bool,
+    ) -> None:
+        runtime_repaired = False
 
-                runtime_repaired = False
+        max_runtime_repairs = 5
+        for attempt in range(max_runtime_repairs + 1):
+            ok_runtime, detail = _runtime_verify_fastapi_project(project_dir)
+            if ok_runtime:
+                break
 
-                max_runtime_repairs = 5
-                for attempt in range(max_runtime_repairs + 1):
-                    ok_runtime, detail = _runtime_verify_fastapi_project(project_dir)
-                    if ok_runtime:
-                        break
+            if attempt >= max_runtime_repairs:
+                raise ValueError(
+                    "El proyecto generado no supera verificación runtime.\n"
+                    + detail
+                    + "\n\n"
+                    + "Sugerencia: evita validar configuración/credenciales en import-time; "
+                    + "haz lazy init y valida en runtime (en el endpoint que lo necesite)."
+                )
 
-                    if attempt >= max_runtime_repairs:
-                        raise ValueError(
-                            "El proyecto generado no supera verificación runtime.\n"
-                            + detail
-                            + "\n\n"
-                            + "Sugerencia: evita validar configuración/credenciales en import-time; "
-                              "haz lazy init y valida en runtime (en el endpoint que lo necesite)."
-                        )
-
-                    # Repair: pedimos al modelo corregir SOLO los archivos implicados en el traceback.
-                    # Importante: no "inventar" símbolos (p.ej. get_settings / get_drive_service) que luego no existan.
-                    error_context = f"""
+            error_context = f"""
 FALLO EN VERIFICACIÓN RUNTIME (import app.main)
 El proyecto debe ser importable sin configuración externa.
 
@@ -388,256 +360,274 @@ SALIDA
   {{ "files": [{{"path":"...", "content":"..."}}] }}
 """
 
-                    reparacion = generar_proyecto_completo(
-                        descripcion_global=self.descripcion_global + "\n\n" + error_context,
-                        contexto_normalizado=(
-                            context.contexto_normalizado.model_dump()
-                            if context.contexto_normalizado
-                            else None
-                        ),
-                        intentos=2,
+            reparacion = generar_proyecto_completo(
+                descripcion_global=self.descripcion_global + "\n\n" + error_context,
+                contexto_normalizado=(
+                    context.contexto_normalizado.model_dump() if context.contexto_normalizado else None
+                ),
+                intentos=2,
+            )
+
+            repaired_files = reparacion.get("files", [])
+            if not repaired_files:
+                continue
+
+            patch = {f["path"]: f["content"] for f in repaired_files if "path" in f and "content" in f}
+            if patch:
+                runtime_repaired = True
+                materializar_proyecto(nombre_proyecto=self.nombre_proyecto, estructura=patch)
+                estructura.update(patch)
+                archivos_creados.extend([os.path.join(project_dir, p.replace("/", os.sep)) for p in patch.keys()])
+
+        if runtime_repaired and generar_tests:
+            try:
+                spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
+                tests_result = generar_tests_unitarios_minimos(
+                    nombre_proyecto=self.nombre_proyecto,
+                    spec=spec_dict if isinstance(spec_dict, dict) else None,
+                    estructura_generada=estructura,
+                    intentos=1,
+                )
+                if tests_result.estructura_tests:
+                    archivos_tests = materializar_proyecto(
+                        nombre_proyecto=self.nombre_proyecto,
+                        estructura=tests_result.estructura_tests,
+                        limpiar_directorio=False,
                     )
+                    archivos_creados.extend(archivos_tests)
+                    estructura.update(tests_result.estructura_tests)
+            except Exception as _e:
+                logger.info("[TESTS] Error regenerando tests tras reparación runtime: %s", _e)
 
-                    repaired_files = reparacion.get("files", [])
-                    if not repaired_files:
-                        continue
+    def _generar_documentacion(
+        self,
+        context: ProjectContext,
+        modo_generacion: str,
+        estructura: Dict[str, str],
+        resultado: Dict[str, Any],
+        estimacion_generada,
+        estimacion_completa,
+        estimacion_manual,
+        t_clasificacion_inicio: float,
+        t_clasificacion_fin: float,
+        t_generacion_inicio: float,
+        t_generacion_fin: float,
+    ) -> None:
+        generar_docs = True
+        if modo_generacion.upper() != "ASESOR":
+            project_dir = os.path.join("output", self.nombre_proyecto)
+            ok_runtime, detail = _runtime_verify_fastapi_project(project_dir)
+            if not ok_runtime:
+                generar_docs = False
+                logger.info("[DOCS] Saltando generación de documentación: el proyecto no es importable aún.")
+                logger.info(detail)
 
-                    # Aplicar solo los archivos devueltos (parche)
-                    patch = {f["path"]: f["content"] for f in repaired_files if "path" in f and "content" in f}
-                    if patch:
-                        runtime_repaired = True
-                        materializar_proyecto(nombre_proyecto=self.nombre_proyecto, estructura=patch)
-                        estructura.update(patch)
-                        archivos_creados.extend(
-                            [os.path.join(project_dir, p.replace("/", os.sep)) for p in patch.keys()]
-                        )
+        if not generar_docs:
+            return
 
-                # Si hubo reparación runtime (posible regeneración spec+código), asegurar tests presentes al final.
-                if runtime_repaired and generar_tests:
-                    try:
-                        spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
-                        tests_result = generar_tests_unitarios_minimos(
-                            nombre_proyecto=self.nombre_proyecto,
-                            spec=spec_dict if isinstance(spec_dict, dict) else None,
-                            estructura_generada=estructura,
-                            intentos=1,
-                        )
-                        if tests_result.estructura_tests:
-                            archivos_tests = materializar_proyecto(
-                                nombre_proyecto=self.nombre_proyecto,
-                                estructura=tests_result.estructura_tests,
-                                limpiar_directorio=False,
-                            )
-                            archivos_creados.extend(archivos_tests)
-                            estructura.update(tests_result.estructura_tests)
-                    except Exception as _e:
-                        print(f"[TESTS] Error regenerando tests tras reparación runtime: {_e}")
+        endpoints_detectados = [path for path in estructura.keys() if path.endswith(".py")]
 
-            # ======================================================
-            # CÁLCULO DE ESTIMACIONES MEDIANTE MÉTODOS MODULARIZADOS
-            # ======================================================
-            # DESACTIVADO TEMPORALMENTE (ahorro de tokens):
-            # Las llamadas a calcular_estimacion_llm consumen tokens.
-            # Para reactivarlo, descomenta el bloque original completo.
+        if context.contexto_normalizado:
+            arquitectura_real = context.contexto_normalizado.objetivo_tecnico
+            limites_reales = ", ".join(context.contexto_normalizado.restricciones_tecnicas)
+            tecnologias_reales = ", ".join(context.contexto_normalizado.integraciones_externas)
+            funcionalidades_reales = ", ".join(context.contexto_normalizado.funcionalidades_clave)
+            usuarios_reales = ", ".join(context.contexto_normalizado.actores_principales)
+        else:
+            arquitectura_real = context.plantilla.problema
+            limites_reales = context.plantilla.limites or ""
+            tecnologias_reales = context.plantilla.tecnologias or ""
+            funcionalidades_reales = context.plantilla.funcionalidades or ""
+            usuarios_reales = context.plantilla.usuarios or ""
+
+        opciones_estrategicas = generar_opciones(
+            arquitectura=arquitectura_real,
+            limites=limites_reales,
+            tecnologias=tecnologias_reales,
+        )
+
+        import time
+
+        t_documentacion_inicio = time.perf_counter()
+
+        spec_dict = None
+        try:
+            spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
+        except Exception:
+            spec_dict = None
+        if not isinstance(spec_dict, dict) or not spec_dict:
+            spec_dict = context.contexto_normalizado.model_dump() if context.contexto_normalizado else None
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future_final = executor.submit(
+                generar_readme_final,
+                self.nombre_proyecto,
+                self.descripcion_global,
+                "Arquitectura generada dinámicamente por LLM",
+                endpoints_detectados,
+                modo_generacion.upper(),
+                self.tecnologias,
+                estimacion_generada,
+                estimacion_completa,
+                spec=spec_dict,
+            )
+
+            future_analisis = executor.submit(
+                generar_readme_asesor,
+                self.nombre_proyecto,
+                context.plantilla.problema,
+                usuarios_reales,
+                funcionalidades_reales,
+                limites_reales,
+                tecnologias_reales,
+                arquitectura_real,
+                opciones_estrategicas,
+                estimacion_manual,
+                spec_dict,
+            )
+
+            future_manual = None
+            if modo_generacion.upper() == "PARCIAL":
+                future_manual = executor.submit(
+                    generar_readme_manual,
+                    self.nombre_proyecto,
+                    "Arquitectura generada dinámicamente por LLM",
+                    self.tecnologias,
+                    endpoints_detectados,
+                    estructura,
+                    spec_dict,
+                )
+
+            readme_final = future_final.result()
+            readme_analisis = future_analisis.result()
+            readme_manual = future_manual.result() if future_manual else None
+
+        archivos_readme_final = materializar_proyecto(
+            nombre_proyecto=self.nombre_proyecto,
+            estructura={"README.md": readme_final},
+            limpiar_directorio=False,
+        )
+
+        archivos_readme_analisis = materializar_proyecto(
+            nombre_proyecto=self.nombre_proyecto,
+            estructura={"README_ANALISIS.md": readme_analisis},
+            limpiar_directorio=False,
+        )
+
+        if readme_manual:
+            archivos_readme_manual = materializar_proyecto(
+                nombre_proyecto=self.nombre_proyecto,
+                estructura={"README_MANUAL.md": readme_manual},
+                limpiar_directorio=False,
+            )
+        else:
+            archivos_readme_manual = []
+
+        t_documentacion_fin = time.perf_counter()
+
+        logger.info("\n[PERFORMANCE]")
+        logger.info("- Clasificación: %.2fs", t_clasificacion_fin - t_clasificacion_inicio)
+        logger.info("- Generación libre: %.2fs", t_generacion_fin - t_generacion_inicio)
+        logger.info("- Documentación: %.2fs\n", t_documentacion_fin - t_documentacion_inicio)
+
+    def _build_fallback_docs(self, exc: Exception) -> Tuple[str, str]:
+        fallback_readme = (
+            f"# {self.nombre_proyecto}\n\n"
+            "## Estado\n\n"
+            "La generación no finalizó correctamente. Revisa `README_ERROR.md` para ver el detalle del error.\n"
+        )
+
+        fallback_error = (
+            f"# {self.nombre_proyecto} – Error de generación\n\n"
+            "## Error durante la generación libre\n\n"
+            f"Error detectado:\n\n```\n{str(exc)}\n```\n"
+        )
+
+        return fallback_readme, fallback_error
+
+    def ejecutar(self) -> Dict[str, Any]:
+        """
+        Ejecuta el flujo completo incluyendo clasificación basada en ProjectContext.
+        """
+        try:
+            context = self._build_context()
+            self._normalizar_contexto(context)
+
+            context, t_clasificacion_inicio, t_clasificacion_fin = self._clasificar(context)
+
+            modo_generacion = context.clasificacion or self.modo_generacion
+
+            estructura, archivos_creados, tiempo_generacion_horas, resultado = self._generar_y_materializar(
+                context=context,
+                modo_generacion=modo_generacion,
+            )
+
+            t_generacion_inicio = 0.0
+            t_generacion_fin = 0.0
+            if modo_generacion.upper() != "ASESOR":
+                import time
+
+                # Mantener comportamiento: el tiempo real se medía solo si se generaba.
+                # (Aquí solo preservamos el contrato, no re-medimos; se usa para PERFORMANCE log)
+                t_generacion_inicio = time.perf_counter()
+                t_generacion_fin = t_generacion_inicio
+
+                project_dir = os.path.join("output", self.nombre_proyecto)
+
+                generar_tests = self._generar_tests(resultado, estructura, archivos_creados)
+                self._postprocesar_alineacion(project_dir, resultado, estructura, archivos_creados)
+                self._runtime_repair_loop(
+                    project_dir=project_dir,
+                    context=context,
+                    resultado=resultado,
+                    estructura=estructura,
+                    archivos_creados=archivos_creados,
+                    generar_tests=generar_tests,
+                )
 
             modo_upper = modo_generacion.upper()
 
-            # Inicialización segura (evita errores en ejecución paralela)
             estimacion_generada = None
             estimacion_completa = None
             estimacion_manual = None
 
             if modo_upper == "PARCIAL":
-                estimacion_generada = self._estimacion_generada(
-                    modo_generacion,
-                    tiempo_generacion_horas,
-                )
-                estimacion_completa = self._estimacion_completa(
-                    tiempo_generacion_horas,
-                )
+                estimacion_generada = self._estimacion_generada(modo_generacion, tiempo_generacion_horas)
+                estimacion_completa = self._estimacion_completa(tiempo_generacion_horas)
                 estimacion_manual = self._estimacion_manual()
-
             elif modo_upper == "COMPLETO":
-                estimacion_generada = self._estimacion_generada(
-                    modo_generacion,
-                    tiempo_generacion_horas,
-                )
-                estimacion_completa = self._estimacion_completa(
-                    tiempo_generacion_horas,
-                )
-                estimacion_manual = None  # explícito
-
+                estimacion_generada = self._estimacion_generada(modo_generacion, tiempo_generacion_horas)
+                estimacion_completa = self._estimacion_completa(tiempo_generacion_horas)
+                estimacion_manual = None
             elif modo_upper == "ASESOR":
                 estimacion_manual = self._estimacion_manual()
                 estimacion_generada = None
                 estimacion_completa = None
 
-            # Blindaje adicional: asegurar que las estimaciones sean objetos válidos
-            # Nunca sustituimos por string porque generar_bloque_markdown espera atributos
             if estimacion_generada is None:
                 estimacion_generada = self._estimacion_manual()
-
             if estimacion_completa is None:
                 estimacion_completa = self._estimacion_manual()
-
             if estimacion_manual is None:
                 estimacion_manual = self._estimacion_manual()
 
-            # ======================================================
-            # GENERACIÓN DE DOCUMENTACIÓN (solo si el proyecto pasó gate import-time)
-            # ======================================================
-
-            # NOTA: si el modo es ASESOR, puede no haber estructura/archivos; en ese caso
-            # seguimos generando documentación porque el objetivo es asesorar, no compilar.
-            generar_docs = True
-            if modo_generacion.upper() != "ASESOR":
-                project_dir = os.path.join("output", self.nombre_proyecto)
-                ok_runtime, detail = _runtime_verify_fastapi_project(project_dir)
-                if not ok_runtime:
-                    generar_docs = False
-                    print("[DOCS] Saltando generación de documentación: el proyecto no es importable aún.")
-                    print(detail)
-
-            if generar_docs:
-                from concurrent.futures import ThreadPoolExecutor
-                from poc_it.generador_informes import (
-                    generar_readme_final,
-                    generar_readme_manual,
-                    generar_readme_asesor,
-                )
-                from poc_it.opciones import generar_opciones
-
-                # Detectar endpoints simples a partir de paths
-                endpoints_detectados = [
-                    path for path in estructura.keys()
-                    if path.endswith(".py")
-                ]
-
-                # Usar primero contexto normalizado si existe
-                if context.contexto_normalizado:
-                    arquitectura_real = context.contexto_normalizado.objetivo_tecnico
-                    limites_reales = ", ".join(context.contexto_normalizado.restricciones_tecnicas)
-                    tecnologias_reales = ", ".join(context.contexto_normalizado.integraciones_externas)
-                    funcionalidades_reales = ", ".join(context.contexto_normalizado.funcionalidades_clave)
-                    usuarios_reales = ", ".join(context.contexto_normalizado.actores_principales)
-                else:
-                    arquitectura_real = context.plantilla.problema
-                    limites_reales = context.plantilla.limites or ""
-                    tecnologias_reales = context.plantilla.tecnologias or ""
-                    funcionalidades_reales = context.plantilla.funcionalidades or ""
-                    usuarios_reales = context.plantilla.usuarios or ""
-
-                opciones_estrategicas = generar_opciones(
-                    arquitectura=arquitectura_real,
-                    limites=limites_reales,
-                    tecnologias=tecnologias_reales,
-                )
-
-                t_documentacion_inicio = time.perf_counter()
-
-                # Documentación debe usar el modo/proveedor de DOCS (no el de code-gen)
-                # (Se asume que generador_informes delega en LLM con un modo/fase distinto)
-                with ThreadPoolExecutor(max_workers=3) as executor:
-                    # SPEC fuente de verdad:
-                    # - Preferimos el SPEC de generación (resultado["spec"]) si existe
-                    # - Si no existe, fallback al ContextoNormalizado
-                    spec_dict = None
-                    try:
-                        spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
-                    except Exception:
-                        spec_dict = None
-                    if not isinstance(spec_dict, dict) or not spec_dict:
-                        spec_dict = context.contexto_normalizado.model_dump() if context.contexto_normalizado else None
-
-                    future_final = executor.submit(
-                        generar_readme_final,
-                        self.nombre_proyecto,
-                        self.descripcion_global,
-                        "Arquitectura generada dinámicamente por LLM",
-                        endpoints_detectados,
-                        modo_generacion.upper(),
-                        self.tecnologias,
-                        estimacion_generada,
-                        estimacion_completa,
-                        spec=spec_dict,
-                    )
-
-                    future_analisis = executor.submit(
-                        generar_readme_asesor,
-                        self.nombre_proyecto,
-                        context.plantilla.problema,
-                        usuarios_reales,
-                        funcionalidades_reales,
-                        limites_reales,
-                        tecnologias_reales,
-                        arquitectura_real,
-                        opciones_estrategicas,
-                        estimacion_manual,
-                        spec_dict,
-                    )
-
-                    future_manual = None
-                    if modo_generacion.upper() == "PARCIAL":
-                        future_manual = executor.submit(
-                            generar_readme_manual,
-                            self.nombre_proyecto,
-                            "Arquitectura generada dinámicamente por LLM",
-                            self.tecnologias,
-                            endpoints_detectados,
-                            estructura,
-                            spec_dict,
-                        )
-
-                    readme_final = future_final.result()
-                    readme_analisis = future_analisis.result()
-                    readme_manual = future_manual.result() if future_manual else None
-
-                # IMPORTANTE:
-                # materializar_proyecto() limpia el directorio por defecto para evitar artefactos residuales.
-                # Para escribir documentación debemos NO limpiar, o nos cargamos el código generado.
-                archivos_readme_final = materializar_proyecto(
-                    nombre_proyecto=self.nombre_proyecto,
-                    estructura={"README.md": readme_final},
-                    limpiar_directorio=False,
-                )
-                archivos_creados.extend(archivos_readme_final)
-
-                archivos_readme_analisis = materializar_proyecto(
-                    nombre_proyecto=self.nombre_proyecto,
-                    estructura={"README_ANALISIS.md": readme_analisis},
-                    limpiar_directorio=False,
-                )
-                archivos_creados.extend(archivos_readme_analisis)
-
-                if readme_manual:
-                    archivos_readme_manual = materializar_proyecto(
-                        nombre_proyecto=self.nombre_proyecto,
-                        estructura={"README_MANUAL.md": readme_manual},
-                        limpiar_directorio=False,
-                    )
-                    archivos_creados.extend(archivos_readme_manual)
-
-                t_documentacion_fin = time.perf_counter()
-
-                print("\n[PERFORMANCE]")
-                print(f"- Clasificación: {t_clasificacion_fin - t_clasificacion_inicio:.2f}s")
-                print(f"- Generación libre: {t_generacion_fin - t_generacion_inicio:.2f}s")
-                print(f"- Documentación: {t_documentacion_fin - t_documentacion_inicio:.2f}s\n")
+            # Generación docs
+            self._generar_documentacion(
+                context=context,
+                modo_generacion=modo_generacion,
+                estructura=estructura,
+                resultado=resultado,
+                estimacion_generada=estimacion_generada,
+                estimacion_completa=estimacion_completa,
+                estimacion_manual=estimacion_manual,
+                t_clasificacion_inicio=t_clasificacion_inicio,
+                t_clasificacion_fin=t_clasificacion_fin,
+                t_generacion_inicio=t_generacion_inicio,
+                t_generacion_fin=t_generacion_fin,
+            )
 
         except Exception as exc:
-            # No contaminar el README principal con logs: dejamos un README_ERROR.md
-            # y un README.md mínimo indicando dónde mirar.
-            fallback_readme = (
-                f"# {self.nombre_proyecto}\n\n"
-                "## Estado\n\n"
-                "La generación no finalizó correctamente. Revisa `README_ERROR.md` para ver el detalle del error.\n"
-            )
-
-            fallback_error = (
-                f"# {self.nombre_proyecto} – Error de generación\n\n"
-                "## Error durante la generación libre\n\n"
-                f"Error detectado:\n\n```\n{str(exc)}\n```\n"
-            )
+            fallback_readme, fallback_error = self._build_fallback_docs(exc)
 
             archivos_creados = materializar_proyecto(
                 nombre_proyecto=self.nombre_proyecto,
@@ -651,7 +641,4 @@ SALIDA
                 "error": str(exc),
             }
 
-        return {
-            "nombre_proyecto": self.nombre_proyecto,
-            "archivos_creados": archivos_creados,
-        }
+        return {"nombre_proyecto": self.nombre_proyecto, "archivos_creados": archivos_creados}
