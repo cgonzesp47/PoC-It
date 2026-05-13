@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -83,23 +84,39 @@ def _extraer_json_tolerante(respuesta: str) -> Optional[dict]:
     Casos soportados:
     - JSON limpio
     - Texto extra antes/después del JSON
+    - Respuestas con bloques Markdown (```json ... ```)
     - Respuestas con múltiples bloques: extrae el primer {...} que parezca JSON
 
-    Nota: si el JSON está truncado (no hay '}'), no se puede recuperar aquí.
+    Nota:
+    - Si el JSON está truncado y NO hay cierre '}', no se puede recuperar aquí.
+    - Si el JSON está truncado pero contiene al menos una '}' final de algún objeto,
+      intentamos extraer el mayor bloque {...} posible.
     """
     if not isinstance(respuesta, str) or "{" not in respuesta:
         return None
 
+    s = respuesta.strip()
+
+    # 1) strip de fences Markdown si existen
+    if "```" in s:
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, re.DOTALL | re.IGNORECASE)
+        if m:
+            s = m.group(1).strip()
+
+    # 2) intento directo
     try:
-        return json.loads(respuesta)
+        return json.loads(s)
     except Exception:
-        match = re.search(r"\{.*\}", respuesta, re.DOTALL)
-        if not match:
-            return None
-        try:
-            return json.loads(match.group())
-        except Exception:
-            return None
+        pass
+
+    # 3) fallback "greedy": del primer '{' al último '}' (si existe)
+    try:
+        start = s.index("{")
+        end = s.rindex("}")
+        candidate = s[start : end + 1]
+        return json.loads(candidate)
+    except Exception:
+        return None
 
 
 def _reparar_spec_prompt(
@@ -147,10 +164,84 @@ PROMPT ORIGINAL (referencia; NO lo repitas en la salida):
 """.strip()
 
 
+def _reparar_spec_desde_spec(
+    prompt_spec_base: str,
+    spec_actual: dict | None,
+    errores: List[str] | None = None,
+    contexto_normalizado: dict | None = None,
+) -> str:
+    """
+    Construye un prompt de reparación de SPEC aplicando cambios sobre el SPEC ACTUAL (patch-style).
+
+    Fuente de verdad:
+    - CONTEXTO_NORMALIZADO (incluye contratos_api) es el contrato del usuario.
+    - El SPEC debe alinearse con ese contrato; no al revés.
+
+    Objetivo:
+    - Evitar reconstrucciones “desde cero” que reintroducen patrones por defecto (p.ej. multipart upload).
+    - Forzar cambios mínimos y convergentes sobre el spec_actual.
+    """
+    errores = errores or []
+
+    ctx_block = ""
+    if isinstance(contexto_normalizado, dict) and contexto_normalizado:
+        ctx_block = f"""
+
+CONTEXTO_NORMALIZADO (FUENTE DE VERDAD; el SPEC DEBE cumplirlo):
+{json.dumps(contexto_normalizado, ensure_ascii=False)}
+"""
+
+    spec_block = ""
+    if isinstance(spec_actual, dict) and spec_actual:
+        spec_block = f"""
+
+SPEC_ACTUAL (a corregir; aplica cambios MINIMOS aquí):
+{json.dumps(spec_actual, ensure_ascii=False)}
+"""
+
+    return f"""
+TAREA
+Corrige el SPEC_ACTUAL para que cumpla el CONTEXTO_NORMALIZADO (contratos) y los errores MUST indicados.
+NO reconstruyas desde cero: modifica el SPEC_ACTUAL lo mínimo imprescindible.
+
+Errores MUST detectados:
+- {chr(10).join(errores) if errores else "(no disponibles)"}
+{ctx_block}
+{spec_block}
+
+REGLAS NO NEGOCIABLES
+- Devuelve EXCLUSIVAMENTE JSON válido (el SPEC completo).
+- Prohibido Markdown, fences o texto fuera del JSON.
+- No inventes endpoints/archivos no coherentes con el CONTEXTO_NORMALIZADO.
+- Mantén invariantes estructurales:
+  - entrypoint: app.main:app
+  - run_command: uvicorn app.main:app --reload
+  - imports_policy: absolute_from_app
+
+REGLAS ESPECÍFICAS DE CONTRATOS (CRÍTICO)
+- Debes comparar CONTEXTO_NORMALIZADO.contratos_api (FUENTE DE VERDAD) con SPEC.endpoints.
+- Para cada contrato_api (method + path):
+  - Debe existir un endpoint equivalente en SPEC.endpoints.
+  - Sus campos contractuales deben ser consistentes (al menos request.type y response.json_example si existen).
+- Si hay discrepancias entre contrato_api y SPEC.endpoints:
+  - Debes tomar como referencia SIEMPRE el contrato_api.
+  - Modifica el SPEC_ACTUAL con cambios mínimos para que SPEC.endpoints coincida con contratos_api.
+- Si el SPEC tiene endpoints extra que NO están en contratos_api y el contexto parece enumerar explícitamente los endpoints esperados:
+  - Elimina esos endpoints extra del SPEC (cambios mínimos).
+- Ajusta SPEC.dependencies/env/contracts para que no contradigan los contratos.
+- NO reconstruyas el SPEC desde cero.
+
+PROMPT ORIGINAL (referencia de estructura; NO lo repitas en la salida):
+{prompt_spec_base}
+""".strip()
+
+
 def _alinear_spec_con_contexto(
     spec: dict,
     contexto_normalizado: dict,
     intentos: int = 1,
+    provider_hint: str = "docs",
+    max_tokens: int = 1400,
 ) -> Tuple[Optional[dict], List[str]]:
     """
     Fase 1.5: Alineación de SPEC con ContextoNormalizado (fuente de verdad del usuario).
@@ -161,21 +252,111 @@ def _alinear_spec_con_contexto(
       (endpoints, request type, restricciones, integraciones, etc.).
 
     Estrategia:
-    - LLM auditor devuelve JSON con:
+    - 1) Precheck determinista (local): si existe `contexto_normalizado.contratos_api`,
+         cualquier mismatch con `spec.endpoints` se considera MUST error y fuerza repair.
+         Esto evita depender del auditor LLM cuando hay timeouts/429 o salida no parseable.
+    - 2) LLM auditor devuelve JSON con:
       - ok: bool
       - errors: [string]
       - patched_spec: object|null (si puede devolver el SPEC corregido)
 
-    Si patched_spec es parseable, lo devolvemos; si no, devolvemos None + errores
-    para alimentar el repair prompt.
+    Si patched_spec es parseable, lo devolvemos; si no, devolvemos el SPEC actual + errores
+    para alimentar el repair patch-style.
     """
     if not isinstance(spec, dict) or not isinstance(contexto_normalizado, dict):
         return None, ["spec/contexto_normalizado inválidos para alineación"]
+
+    # ----------------------------------------------------------
+    # PRECHECK determinista: contratos_api vs spec.endpoints
+    # ----------------------------------------------------------
+    contratos_api = contexto_normalizado.get("contratos_api") if isinstance(contexto_normalizado, dict) else None
+    if isinstance(contratos_api, list) and contratos_api:
+        spec_endpoints = spec.get("endpoints")
+        if not isinstance(spec_endpoints, list):
+            print("[DEBUG] Precheck contratos_api vs spec.endpoints: spec.endpoints no es lista; forzando repair.")
+            return spec, ["MUST: spec.endpoints debe ser lista para compararse con contratos_api"]
+
+        def _k(method: str, path: str) -> Tuple[str, str]:
+            return (str(method or "").upper().strip(), str(path or "").strip())
+
+        spec_by_key: Dict[Tuple[str, str], dict] = {}
+        for ep in spec_endpoints:
+            if not isinstance(ep, dict):
+                continue
+            kk = _k(ep.get("method"), ep.get("path"))
+            if kk[0] and kk[1]:
+                spec_by_key[kk] = ep
+
+        errors_contract: List[str] = []
+
+        for c in contratos_api:
+            if not isinstance(c, dict):
+                continue
+            ck = _k(c.get("method"), c.get("path"))
+            if not ck[0] or not ck[1]:
+                continue
+
+            ep = spec_by_key.get(ck)
+            if not isinstance(ep, dict):
+                errors_contract.append(f"MUST: falta endpoint en SPEC para contrato_api {ck[0]} {ck[1]}")
+                continue
+
+            c_req = c.get("request") if isinstance(c.get("request"), dict) else {}
+            e_req = ep.get("request") if isinstance(ep.get("request"), dict) else {}
+            c_type = str((c_req or {}).get("type") or "").strip()
+            e_type = str((e_req or {}).get("type") or "").strip()
+
+            if c_type and e_type and c_type != e_type:
+                errors_contract.append(
+                    f"MUST: mismatch request.type en {ck[0]} {ck[1]} (contrato_api='{c_type}' vs spec='{e_type}')"
+                )
+            elif c_type and not e_type:
+                errors_contract.append(f"MUST: spec.request.type vacío en {ck[0]} {ck[1]} (contrato_api='{c_type}')")
+
+            c_resp = c.get("response") if isinstance(c.get("response"), dict) else {}
+            e_resp = ep.get("response") if isinstance(ep.get("response"), dict) else {}
+            if isinstance(c_resp, dict) and "json_example" in c_resp:
+                if not (isinstance(e_resp, dict) and "json_example" in e_resp):
+                    errors_contract.append(f"MUST: falta response.json_example en SPEC para {ck[0]} {ck[1]}")
+                else:
+                    if c_resp.get("json_example") != e_resp.get("json_example"):
+                        errors_contract.append(
+                            f"MUST: mismatch response.json_example en {ck[0]} {ck[1]} (SPEC debe seguir contratos_api)"
+                        )
+
+        contract_keys = {
+            _k(c.get("method"), c.get("path"))
+            for c in contratos_api
+            if isinstance(c, dict) and c.get("method") and c.get("path")
+        }
+        extras = sorted([f"{m} {p}" for (m, p) in spec_by_key.keys() if (m, p) not in contract_keys])
+        if extras:
+            errors_contract.append("MUST: spec contiene endpoints no listados en contratos_api: " + ", ".join(extras))
+
+        if errors_contract:
+            print("[DEBUG] Precheck contratos_api vs spec.endpoints: mismatch detectado; forzando repair.")
+            return spec, errors_contract
+
+    auditor_compact = os.getenv("AUDITOR_COMPACT", "0").strip() in ("1", "true", "True", "yes", "YES")
+
+    compact_rules = ""
+    if auditor_compact:
+        compact_rules = """
+MODO COMPACTO (ANTI-TRUNCADO) - OBLIGATORIO
+- NO devuelvas `patched_spec` completo si su tamaño puede ser grande o incluye listas largas (files/endpoints/contracts/restrictions).
+- Si hay inconsistencias, devuelve:
+  - ok=false
+  - errors: lista accionable de cambios
+  - patched_spec: null
+- Solo puedes devolver `patched_spec` si es MUY pequeño (p.ej. un cambio menor de 1-2 campos) y estás seguro de no truncarte.
+"""
 
     prompt = f"""
 TAREA
 Eres un auditor de consistencia. Compara el CONTEXTO_NORMALIZADO (fuente de verdad del usuario) con el SPEC (plan de generación).
 Si el SPEC contradice el contexto, corrígelo.
+
+{compact_rules}
 
 CONTEXTO_NORMALIZADO (FUENTE DE VERDAD):
 {json.dumps(contexto_normalizado, ensure_ascii=False)}
@@ -205,20 +386,25 @@ REGLAS DE SALIDA
 - Si detectas problemas:
   - ok=false
   - errors: lista de strings concisos y accionables
-  - patched_spec: devuelve el SPEC completo corregido si puedes; si no, null
+  - patched_spec:
+    - En modo compacto: null (salvo patch MUY pequeño)
+    - Si no compacto: devuelve el SPEC completo corregido si puedes; si no, null
 - No uses Markdown.
 """.strip()
 
     last_errors: List[str] = []
+    last_raw: str = ""
+
     for _ in range(max(1, intentos)):
         raw = chat_completion_json(
             prompt=prompt,
             system=None,
             temperature=0.0,
-            max_tokens=1400,
-            provider_hint="docs",
+            max_tokens=max_tokens,
+            provider_hint=provider_hint,
             fase="documentacion",
         )
+        last_raw = raw or ""
         data = _extraer_json_tolerante(raw)
         if not isinstance(data, dict):
             last_errors = ["auditor: salida no parseable"]
@@ -235,6 +421,18 @@ REGLAS DE SALIDA
 
         if isinstance(patched, dict):
             return patched, last_errors
+
+        # ok=false + patched_spec=null (modo compacto): devolvemos spec + errores accionables
+        return spec, last_errors
+
+    # Persistimos RAW para diagnóstico si todo fue no-parseable
+    try:
+        debug_dir = Path("output/_debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        (debug_dir / f"audit_raw_{ts}.txt").write_text(last_raw or "", encoding="utf-8")
+    except Exception:
+        pass
 
     return None, last_errors
 
@@ -942,31 +1140,40 @@ def _guardrails_por_spec(
             errores.append(f"Falta logging obligatorio (logger.exception) en: {p}")
             reparar.add(p)
 
-    # --- 4) Determinismo: si response.json_example existe para path y request.type=none, debe devolver exactamente ese JSON ---
-    # Heurística mínima: si el ejemplo es dict pequeño, buscamos 'return {..}' literal
-    for ep_path, example in response_example_by_path.items():
-        rt = request_type_by_path.get(ep_path)
-        if rt != "none":
+    # --- 4) Respuesta coherente con json_example (GENÉRICO / PRAGMÁTICO) ---
+    # Problema con la regla anterior:
+    # - Un json_example es un EJEMPLO, no un valor determinista.
+    # - En PoCs típicas (CRUD/DB/externos) el contenido varía y el endpoint puede necesitar try/except.
+    #
+    # Nueva regla:
+    # - Para endpoints con request.type == "none" y response.json_example == dict:
+    #   - NO se exige "return exacto"
+    #   - Se valida de forma suave que el código menciona las claves esperadas (heurística)
+    #   - Mantiene un guardrail útil sin bloquear PoCs realistas
+    for path, json_example in response_example_by_path.items():
+        request_type = request_type_by_path.get(path)
+        if request_type != "none":
             continue
-        if not isinstance(example, dict):
+        if not isinstance(json_example, dict) or not json_example:
             continue
 
-        # busca en todos los endpoints si aparece ese ep_path como decorator
-        for p, src in by_path.items():
-            if not p.startswith("app/endpoints/") or not p.endswith(".py"):
+        expected_keys = [str(k) for k in json_example.keys()]
+
+        for file_path, source_code in by_path.items():
+            if not file_path.startswith("app/endpoints/") or not file_path.endswith(".py"):
                 continue
-            if ep_path in src and "@router" in src:
-                if "try:" in src and "except" in src:
-                    errores.append(f"Endpoint {ep_path} debería ser determinista (sin try/except) según SPEC: {p}")
-                    reparar.add(p)
-                # check muy simple del return
-                if f"return {json.dumps(example)}" not in src.replace(" ", ""):
-                    # normaliza comparación (sin espacios)
-                    ex_norm = json.dumps(example, separators=(",", ":"))
-                    src_norm = src.replace(" ", "").replace("\\t", "")
-                    if f"return{ex_norm}" not in src_norm:
-                        errores.append(f"Endpoint {ep_path} no devuelve exactamente el json_example del SPEC: {p}")
-                        reparar.add(p)
+            if path not in source_code or "@router" not in source_code:
+                continue
+
+            # Si el endpoint NO menciona ninguna key del ejemplo, es muy probable que no cumpla el contrato.
+            mentions_any_key = any(
+                f"\"{key}\"" in source_code or f"'{key}'" in source_code for key in expected_keys
+            )
+            if not mentions_any_key:
+                errores.append(
+                    f"Endpoint {path} no parece incluir ninguna de las claves esperadas {expected_keys} (json_example del SPEC): {file_path}"
+                )
+                reparar.add(file_path)
 
     # --- 5) Enforce restricciones genéricas (SPEC.restrictions) ---
     # Formato esperado (flexible):
@@ -1260,7 +1467,28 @@ def generar_proyecto_completo(
         # FASE 1.5: alineación SPEC vs ContextoNormalizado (si existe)
         # -------------------------
         if isinstance(contexto_normalizado, dict) and contexto_normalizado:
-            patched, audit_errors = _alinear_spec_con_contexto(spec, contexto_normalizado, intentos=1)
+            patched, audit_errors = _alinear_spec_con_contexto(
+                spec,
+                contexto_normalizado,
+                intentos=1,
+                provider_hint="docs",
+                max_tokens=1400,
+            )
+
+            # Caso clave: el precheck determinista o el auditor en modo compacto pueden devolver:
+            # - patched == spec (dict) + audit_errors (lista MUST)
+            # En ese caso, NO podemos aceptar el SPEC tal cual: debemos repair patch-style y reintentar.
+            if isinstance(patched, dict) and audit_errors:
+                errores_spec = audit_errors
+                prompt_spec = _reparar_spec_desde_spec(
+                    prompt_spec_base=prompt_spec_base,
+                    spec_actual=patched,
+                    errores=errores_spec,
+                    contexto_normalizado=contexto_normalizado,
+                )
+                spec = None
+                continue
+
             if isinstance(patched, dict):
                 spec = patched
 
@@ -1284,16 +1512,16 @@ def generar_proyecto_completo(
                 )
                 spec = None
                 continue
-            else:
-                # auditor no pudo parchear, pedimos reparación guiada por errores
-                errores_spec = audit_errors or ["auditor: no pudo alinear SPEC con contexto"]
-                prompt_spec = _reparar_spec_prompt(
-                    prompt_spec_base=prompt_spec_base,
-                    raw_resp=resp,
-                    errores=errores_spec,
-                )
-                spec = None
-                continue
+
+            # patched no dict => auditor no concluyente
+            errores_spec = audit_errors or ["auditor: no pudo alinear SPEC con contexto"]
+            prompt_spec = _reparar_spec_prompt(
+                prompt_spec_base=prompt_spec_base,
+                raw_resp=resp,
+                errores=errores_spec,
+            )
+            spec = None
+            continue
 
         # si no hay contexto_normalizado, ya es válido estructuralmente
         _persistir_spec_debug(
@@ -1448,7 +1676,7 @@ Reglas:
                 prompt=prompt_lote,
                 system=None,
                 temperature=0.2,
-                max_tokens=1600,
+                max_tokens=2500,
                 fase="generacion_codigo",
             )
             ultimo_raw = raw
@@ -1611,6 +1839,14 @@ Devuelve nuevamente el JSON con los archivos corregidos (solo los del lote).
                 p = err.split(":", 1)[0].strip()
                 if p and p not in repair_paths:
                     repair_paths.append(p)
+
+            # Caso especial: from-import inválido por símbolo inexistente.
+            # Incluimos también el módulo TARGET (el que está entre paréntesis) para reparar ambos a la vez.
+            m = re.search(r"\((app\/[^\)]+\.py)\)", str(err))
+            if m:
+                target_path = m.group(1).replace("\\", "/").strip()
+                if target_path and target_path not in repair_paths:
+                    repair_paths.append(target_path)
 
         if not repair_paths:
             return {"files": []}
