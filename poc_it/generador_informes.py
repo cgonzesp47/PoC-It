@@ -18,18 +18,22 @@ from poc_it.llm_client import chat_completion_text
 from poc_it.estimador_esfuerzo import (
     generar_bloque_markdown,
 )
+from poc_it.poc_facts_extractor import extract_poc_facts_from_structure
 
 
 # Modelo gestionado centralmente por llm_client
 
 
 def _llamar_modelo(prompt: str, max_tokens: int = 1200) -> str:
+    # Docs tienden a ser llamadas largas; damos más margen para que el proxy
+    # pueda ejecutar sus fallbacks internos sin que el cliente corte demasiado pronto.
     raw = chat_completion_text(
         prompt=prompt,
         system=None,
         temperature=0.2,
         max_tokens=max_tokens,
         fase="documentacion",
+        timeout=180,
     )
 
     # Blindaje contra respuestas None o no-string del modelo
@@ -249,6 +253,29 @@ def generar_readme_manual(
     env_vars = _extraer_variables_entorno_desde_codigo(estructura)
     todos = _extraer_todos_placeholders(estructura)
 
+    # Facts deterministas desde código (endpoints reales, stubs, etc.)
+    facts = extract_poc_facts_from_structure(estructura).to_dict()
+    stubs = facts.get("stubs") or []
+    endpoints_facts = facts.get("endpoints") or []
+
+    stubs_str = (
+        "\n".join(
+            f"- {s.get('file')}::{s.get('symbol')} -> {', '.join(s.get('signals') or [])}"
+            for s in stubs
+            if isinstance(s, dict)
+        )
+        or "- (No se detectaron stubs de forma determinista)"
+    )
+
+    endpoints_facts_str = (
+        "\n".join(
+            f"- {e.get('method')} {e.get('path')} ({e.get('module_path')}::{e.get('func_name')})"
+            for e in endpoints_facts
+            if isinstance(e, dict)
+        )
+        or "- (No detectados)"
+    )
+
     env_vars_str = "\n".join(f"- {v}" for v in env_vars) or "- (No detectadas automáticamente)"
     todos_str = "\n".join(todos) or "- (No se detectaron TODO/FIXME/PLACEHOLDER)"
 
@@ -290,11 +317,17 @@ SPEC (FUENTE DE VERDAD - NO CONTRADECIR)
 {spec_json}
 
 SEÑALES DETECTADAS EN EL CÓDIGO (FUENTE DE VERDAD)
+Endpoints detectados en el código (FACTS):
+{endpoints_facts_str}
+
 Variables de entorno detectadas:
 {env_vars_str}
 
 TODO/FIXME/PLACEHOLDER detectados:
 {todos_str}
+
+Stubs detectados (FACTS):
+{stubs_str}
 
 Estructura obligatoria (profesional y sin redundancias):
 
