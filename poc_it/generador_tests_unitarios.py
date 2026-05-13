@@ -64,6 +64,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from poc_it.llm_client import chat_completion_json
+from poc_it.poc_facts_extractor import extract_poc_facts_from_structure
 
 
 @dataclass(frozen=True)
@@ -83,24 +84,34 @@ def _spec_endpoints(spec: Optional[dict]) -> List[dict]:
 def _build_prompt_tests(spec: Optional[dict], estructura_generada: Dict[str, str]) -> str:
     endpoints = _spec_endpoints(spec)
 
+    # Facts deterministas desde el código: evita alucinaciones (símbolos inexistentes, endpoints que no existen, etc.)
+    facts = extract_poc_facts_from_structure(estructura_generada).to_dict()
+
     paths = sorted(list(estructura_generada.keys()))
     main_py = estructura_generada.get("app/main.py", "")
 
     return f"""
 TAREA
-Genera tests unitarios para un proyecto FastAPI basados en el SPEC.
+Genera tests unitarios para un proyecto FastAPI basados en el SPEC y el CÓDIGO materializado.
 
 OBJETIVO
 - Los tests deben PASAR con alta probabilidad según el código existente.
-- Basarse ÚNICAMENTE en el SPEC recibido; NO asumas endpoints por defecto.
+- Usar el SPEC como contrato de intención, pero NO inventar símbolos: usa FACTS (extraído del código) como fuente de verdad para imports/monkeypatch/paths reales.
 - Mejorar la cobertura respecto a “assert status_code < 500” sin volverlos frágiles.
 - No modifiques archivos de la app (solo genera archivos de tests + pytest.ini).
-- No inventes endpoints que no existan en el SPEC.
 
-FUENTE DE VERDAD: SPEC.endpoints
+FUENTES DE VERDAD
+- SPEC.endpoints: describe lo que se pretendía generar.
+- FACTS.endpoints: describe lo que realmente existe en el código (rutas, métodos, módulos, dependencias).
+  Si hay conflicto, los tests deben alinearse con FACTS para que pasen, y reflejar en asserts sólo lo que el código garantiza.
+
+FACTS (extraído del código; JSON):
+{json.dumps(facts, ensure_ascii=False)}
+
+FUENTE DE VERDAD: SPEC.endpoints (intención)
 {json.dumps(endpoints, ensure_ascii=False)}
 
-CONTEXTO (solo referencia para imports/paths; no inventar nada)
+CONTEXTO (referencia; no inventar nada)
 - Paths existentes:
 {json.dumps(paths, ensure_ascii=False)}
 
@@ -124,16 +135,17 @@ REGLAS DE GENERACIÓN (OBLIGATORIAS)
 - pytest.ini NO debe incluir opciones de cobertura (`--cov`, `--cov-report`) porque pytest-cov puede no estar instalado.
   Usa como addopts mínimo: `-q`.
 
-- NO generes "smoke tests". Aquí "smoke test" significa: tests que solo verifican que no rompe o que el status es <500.
-  En su lugar genera **tests unitarios de contrato** basados en SPEC:
-  - Cada endpoint del SPEC debe tener tests que verifiquen:
-    (A) request building según `request.type` y `request.schema` (si existe)
-    (B) codes esperados para casos válidos e inválidos
-    (C) estructura de respuesta si existe `response.json_example`
+- NO inventes símbolos para monkeypatch:
+  - Si necesitas aislar integraciones externas, usa FACTS.endpoints[*].module_path y FACTS.endpoints[*].depends para localizar el punto real de inyección.
+  - Si no existe un símbolo real, NO lo uses.
+
+- En endpoints parciales/no deterministas:
+  - No asumas que la respuesta de 200 tendrá un JSON exacto (puede ser {{}} o {{"status":"ok"}}).
+  - En su lugar, valida invariantes: status code, tipo (dict), y claves mínimas si el SPEC da json_example.
+
 - Si el endpoint depende de integraciones externas o env vars, NO exijas 200 “real”.
-  En su lugar, **aísla la dependencia con monkeypatch** para convertir el test en unitario y determinista.
-  Ejemplo: si el endpoint usa `DriveService` o `SomeClient`, monkeypatch del método que llama a la API para que devuelva un valor fijo.
-  Si no hay punto de inyección, entonces el test debe validar el comportamiento con configuración ausente (4xx) según el SPEC.
+  En su lugar, **aísla la dependencia con monkeypatch del dependency (Depends)** para convertir el test en unitario y determinista.
+  Si no hay punto de inyección, el test debe validar el comportamiento con configuración ausente (4xx) según el SPEC.
 
 - Incluye SIEMPRE `test_import_app_main`: `import app.main` debe pasar. (Este es el único test “arranque”.)
 
