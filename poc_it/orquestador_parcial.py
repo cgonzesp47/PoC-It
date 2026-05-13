@@ -25,14 +25,15 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Tuple
 
 from poc_it.clasificador import clasificar_viabilidad
-from poc_it.orquestacion.runtime_verifier import runtime_verify_fastapi_project
 from poc_it.generador_artefactos import generar_proyecto_completo
+from poc_it.orquestacion.runtime_verifier import runtime_verify_fastapi_project
+from poc_it.orquestacion.spec_persistence import persist_spec_json
 from poc_it.generador_informes import (
     generar_readme_asesor,
     generar_readme_final,
     generar_readme_manual,
 )
-from poc_it.generador_tests_unitarios import generar_tests_unitarios_minimos
+from poc_it.orquestacion.tests_generation import generar_tests_unitarios
 from poc_it.materializador_archivos import materializar_proyecto
 from poc_it.models import ContextoNormalizado, PlantillaUsuario, ProjectContext
 from poc_it.normalizador_contexto import normalizar_plantilla
@@ -40,8 +41,6 @@ from poc_it.opciones import generar_opciones
 from poc_it.postprocesador_alineacion import AlignmentIssue, postprocesar_alineacion_llm
 
 logger = logging.getLogger(__name__)
-
-
 
 
 class OrquestadorParcial:
@@ -117,22 +116,7 @@ Descripción:
         t_clasificacion_fin = time.perf_counter()
 
         logger.info("[DEBUG CONTEXT DESPUÉS DE CLASIFICACIÓN]\n%s", context.model_dump_json(indent=2))
-
         return context, t_clasificacion_inicio, t_clasificacion_fin
-
-    def _persist_spec_json(self, resultado: Dict[str, Any], archivos_creados: list) -> None:
-        try:
-            spec = resultado.get("spec")
-            if isinstance(spec, dict) and spec:
-                spec_path = os.path.join("output", self.nombre_proyecto, "SPEC.json")
-                os.makedirs(os.path.dirname(spec_path), exist_ok=True)
-                with open(spec_path, "w", encoding="utf-8") as f:
-                    import json as _json
-
-                    f.write(_json.dumps(spec, ensure_ascii=False, indent=2))
-                archivos_creados.append(spec_path)
-        except Exception as _e:
-            logger.info("[DEBUG] No se pudo persistir SPEC.json: %s", _e)
 
     def _generar_y_materializar(self, context: ProjectContext, modo_generacion: str):
         import time
@@ -154,7 +138,7 @@ Descripción:
             ),
         )
 
-        self._persist_spec_json(resultado, archivos_creados)
+        persist_spec_json(self.nombre_proyecto, resultado, archivos_creados)
 
         t_generacion_fin = time.perf_counter()
         tiempo_generacion_horas = (t_generacion_fin - t_generacion_inicio) / 3600
@@ -172,40 +156,6 @@ Descripción:
 
         return estructura, archivos_creados, tiempo_generacion_horas, resultado
 
-    def _generar_tests(self, resultado: Dict[str, Any], estructura: Dict[str, str], archivos_creados: list[str]) -> bool:
-        generar_tests = os.getenv("GENERAR_TESTS_UNITARIOS", "1").strip() in (
-            "1",
-            "true",
-            "True",
-            "yes",
-            "YES",
-        )
-        if not generar_tests:
-            return generar_tests
-
-        try:
-            spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
-            tests_result = generar_tests_unitarios_minimos(
-                nombre_proyecto=self.nombre_proyecto,
-                spec=spec_dict if isinstance(spec_dict, dict) else None,
-                estructura_generada=estructura,
-                intentos=1,
-            )
-            if tests_result.errores:
-                logger.info("[TESTS] Aviso: generación de tests con warnings: %s", tests_result.errores)
-
-            if tests_result.estructura_tests:
-                archivos_tests = materializar_proyecto(
-                    nombre_proyecto=self.nombre_proyecto,
-                    estructura=tests_result.estructura_tests,
-                    limpiar_directorio=False,
-                )
-                archivos_creados.extend(archivos_tests)
-                estructura.update(tests_result.estructura_tests)
-        except Exception as _e:
-            logger.info("[TESTS] Error generando/materializando tests: %s", _e)
-
-        return generar_tests
 
     def _postprocesar_alineacion(
         self,
@@ -351,7 +301,7 @@ SALIDA
         if runtime_repaired and generar_tests:
             try:
                 spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
-                tests_result = generar_tests_unitarios_minimos(
+                tests_result = generar_tests_unitarios(
                     nombre_proyecto=self.nombre_proyecto,
                     spec=spec_dict if isinstance(spec_dict, dict) else None,
                     estructura_generada=estructura,
@@ -543,7 +493,7 @@ SALIDA
 
                 project_dir = os.path.join("output", self.nombre_proyecto)
 
-                generar_tests = self._generar_tests(resultado, estructura, archivos_creados)
+                generar_tests = generar_tests_unitarios(self.nombre_proyecto, resultado, estructura, archivos_creados)
                 self._postprocesar_alineacion(project_dir, resultado, estructura, archivos_creados)
                 self._runtime_repair_loop(
                     project_dir=project_dir,
