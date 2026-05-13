@@ -21,12 +21,16 @@ from __future__ import annotations
 from typing import Dict, Any, Optional, Tuple
 import os
 import subprocess
+import pathlib
+import importlib.util
+import traceback
 
 from poc_it.generador_artefactos import generar_proyecto_completo
 from poc_it.generador_tests_unitarios import generar_tests_unitarios_minimos
 from poc_it.materializador_archivos import materializar_proyecto
 from poc_it.models import ProjectContext, PlantillaUsuario
 from poc_it.clasificador import clasificar_viabilidad
+from poc_it.postprocesador_alineacion import AlignmentIssue, postprocesar_alineacion_llm
 
 
 def _runtime_verify_fastapi_project(project_dir: str) -> Tuple[bool, str]:
@@ -217,7 +221,7 @@ Descripción:
                 )
 
                 # ==========================================
-                # 3.2) Generación de pruebas unitarias mínimas
+                # 3.1) Generación de pruebas unitarias mínimas
                 # ==========================================
                 # Módulo independiente: basado en SPEC (si existe) y en la estructura generada.
                 # Controlado por flag, para no añadir coste si no se desea.
@@ -247,14 +251,101 @@ Descripción:
                                 limpiar_directorio=False,
                             )
                             archivos_creados.extend(archivos_tests)
+                            # Importante: para siguientes pasos, incluir tests en estructura in-memory
+                            estructura.update(tests_result.estructura_tests)
                     except Exception as _e:
                         print(f"[TESTS] Error generando/materializando tests: {_e}")
 
                 # ==========================================
-                # 3.1) Verificación runtime mínima (evita PoCs que no arrancan)
+                # 3.2) Post-procesado de alineación (LLM-only)
+                # ==========================================
+                # Objetivo: aplicar micro-parches para corregir errores residuales detectados por pytest.
+                #
+                # Importante:
+                # - Se ejecuta DESPUÉS de materializar tests, para que pytest tenga algo que ejecutar.
+                # - El LLM recibe SPEC+FACTS+ISSUES y devuelve un patch mínimo.
+                try:
+                    project_dir = os.path.join("output", self.nombre_proyecto)
+                    max_repairs = int(os.getenv("POSTPROCESADO_MAX_REPAIRS", "2"))
+
+                    for attempt in range(max_repairs + 1):
+                        issues: list[AlignmentIssue] = []
+
+                        # Pytest si existe: convertir fallos en issue.
+                        try:
+                            tests_dir = os.path.join(project_dir, "tests")
+                            if os.path.isdir(tests_dir):
+                                p = subprocess.run(
+                                    ["python", "-m", "pytest", "-q"],
+                                    cwd=project_dir,
+                                    capture_output=True,
+                                    text=True,
+                                )
+                                if p.returncode != 0:
+                                    out = (p.stdout or "") + "\n" + (p.stderr or "")
+                                    issues.append(
+                                        AlignmentIssue(
+                                            code="PYTEST_FAILURE",
+                                            severity="error",
+                                            file="tests",
+                                            message="Errores residuales: pytest falla; alinear tests/handlers/modelos.",
+                                            hint=out[:8000],
+                                        )
+                                    )
+                        except Exception as e:
+                            print(f"[POST] Aviso: pytest no ejecutable: {e}")
+
+                        # Si no hay issues, no hacemos nada
+                        if not issues:
+                            break
+
+                        # Si hay issues pero ya agotamos intentos, salir
+                        if attempt >= max_repairs:
+                            print("[POST] Reparación por pytest agotada; se continúa sin bloquear.")
+                            break
+
+                        print(f"[POST] Pytest falló; ejecutando post-procesado (attempt {attempt+1}/{max_repairs})")
+
+                        spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
+                        pp = postprocesar_alineacion_llm(
+                            estructura=estructura,
+                            spec=spec_dict if isinstance(spec_dict, dict) else None,
+                            issues=issues,
+                            max_files=6,
+                        )
+                        if not pp.patched_files:
+                            print("[POST] El modelo no devolvió patch; se continúa.")
+                            break
+
+                        materializar_proyecto(
+                            nombre_proyecto=self.nombre_proyecto,
+                            estructura=pp.patched_files,
+                            limpiar_directorio=False,
+                        )
+                        estructura.update(pp.patched_files)
+                        archivos_creados.extend(
+                            [
+                                os.path.join(project_dir, p.replace("/", os.sep))
+                                for p in pp.patched_files.keys()
+                            ]
+                        )
+                except Exception as _e:
+                    print(f"[POST] Aviso: post-procesado de alineación falló (se continúa): {_e}")
+
+                # ==========================================
+                # 3.3) Verificación runtime mínima (evita PoCs que no arrancan)
                 # ==========================================
                 # Si falla, intentamos un repair loop dirigido usando el traceback real.
+                #
+                # IMPORTANTE (bugfix):
+                # - generar_proyecto_completo() puede re-ejecutar un "precheck/reparación" de SPEC vs contratos
+                #   y regenerar spec+código (p.ej. al detectar multipart vs json).
+                # - Si hacemos esta verificación DESPUÉS de generar tests, esa regeneración posterior puede
+                #   dejar el output sin tests (porque el segundo pase no los vuelve a materializar).
+                # - Solución: si hay reparación runtime, re-generar tests al final.
                 project_dir = os.path.join("output", self.nombre_proyecto)
+
+                runtime_repaired = False
 
                 max_runtime_repairs = 5
                 for attempt in range(max_runtime_repairs + 1):
@@ -314,15 +405,40 @@ SALIDA
                     # Aplicar solo los archivos devueltos (parche)
                     patch = {f["path"]: f["content"] for f in repaired_files if "path" in f and "content" in f}
                     if patch:
+                        runtime_repaired = True
                         materializar_proyecto(nombre_proyecto=self.nombre_proyecto, estructura=patch)
                         estructura.update(patch)
                         archivos_creados.extend(
                             [os.path.join(project_dir, p.replace("/", os.sep)) for p in patch.keys()]
                         )
 
+                # Si hubo reparación runtime (posible regeneración spec+código), asegurar tests presentes al final.
+                if runtime_repaired and generar_tests:
+                    try:
+                        spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
+                        tests_result = generar_tests_unitarios_minimos(
+                            nombre_proyecto=self.nombre_proyecto,
+                            spec=spec_dict if isinstance(spec_dict, dict) else None,
+                            estructura_generada=estructura,
+                            intentos=1,
+                        )
+                        if tests_result.estructura_tests:
+                            archivos_tests = materializar_proyecto(
+                                nombre_proyecto=self.nombre_proyecto,
+                                estructura=tests_result.estructura_tests,
+                                limpiar_directorio=False,
+                            )
+                            archivos_creados.extend(archivos_tests)
+                            estructura.update(tests_result.estructura_tests)
+                    except Exception as _e:
+                        print(f"[TESTS] Error regenerando tests tras reparación runtime: {_e}")
+
             # ======================================================
             # CÁLCULO DE ESTIMACIONES MEDIANTE MÉTODOS MODULARIZADOS
             # ======================================================
+            # DESACTIVADO TEMPORALMENTE (ahorro de tokens):
+            # Las llamadas a calcular_estimacion_llm consumen tokens.
+            # Para reactivarlo, descomenta el bloque original completo.
 
             modo_upper = modo_generacion.upper()
 
