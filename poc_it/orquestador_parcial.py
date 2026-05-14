@@ -30,9 +30,9 @@ from poc_it.normalizador_contexto import normalizar_plantilla
 from poc_it.orquestacion.generacion_documentacion import generar_documentacion
 from poc_it.orquestacion.persistencia_spec import persist_spec_json
 from poc_it.orquestacion.postprocesado_alineacion import postprocesar_alineacion_por_pytest
-from poc_it.orquestacion.reparacion_runtime import ejecutar_reparacion_runtime
-from poc_it.orquestacion.constantes import OUTPUT_DIRNAME
+from poc_it.orquestacion.constantes import OUTPUT_DIRNAME, README_ERROR_FILENAME, README_FINAL_FILENAME
 from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
+from poc_it.orquestacion.reparacion_runtime import ejecutar_reparacion_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -264,7 +264,7 @@ Descripción:
 
             archivos_creados = materializar_proyecto(
                 nombre_proyecto=self.nombre_proyecto,
-                estructura={"README.md": fallback_readme, "README_ERROR.md": fallback_error},
+                estructura={README_FINAL_FILENAME: fallback_readme, README_ERROR_FILENAME: fallback_error},
                 limpiar_directorio=True,
             )
 
