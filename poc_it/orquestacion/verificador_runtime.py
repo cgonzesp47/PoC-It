@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Tuple
+from typing import Final
+
+PYTHON_EXECUTABLE: Final[str] = "python"
+IMPORT_CHECK_CMD: Final[list[str]] = [PYTHON_EXECUTABLE, "-c", "import app.main; print('IMPORT_OK')"]
 
 
-def runtime_verify_fastapi_project(project_dir: str) -> Tuple[bool, str]:
+def runtime_verify_fastapi_project(project_dir: str) -> tuple[bool, str]:
     """
     Verificación runtime mínima (genérica) para proyectos FastAPI generados.
 
@@ -16,10 +19,8 @@ def runtime_verify_fastapi_project(project_dir: str) -> Tuple[bool, str]:
     - No valida integraciones externas (Drive, DB, etc.). Solo valida "arranque/import-time".
     - Devuelve detalles ricos (stdout/stderr + hints) para repair loop.
     """
-    py = "python"
-
     p1 = subprocess.run(
-        [py, "-c", "import app.main; print('IMPORT_OK')"],
+        IMPORT_CHECK_CMD,
         cwd=project_dir,
         capture_output=True,
         text=True,

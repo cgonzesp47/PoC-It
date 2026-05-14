@@ -20,8 +20,6 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Tuple
 
 from poc_it.clasificador import clasificar_viabilidad
@@ -29,16 +27,11 @@ from poc_it.generador_artefactos import generar_proyecto_completo
 from poc_it.orquestacion.verificador_runtime import runtime_verify_fastapi_project
 from poc_it.orquestacion.reparacion_runtime import ejecutar_reparacion_runtime
 from poc_it.orquestacion.persistencia_spec import persist_spec_json
-from poc_it.generador_informes import (
-    generar_readme_asesor,
-    generar_readme_final,
-    generar_readme_manual,
-)
+from poc_it.orquestacion.generacion_documentacion import generar_documentacion
 from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
 from poc_it.materializador_archivos import materializar_proyecto
-from poc_it.models import ContextoNormalizado, PlantillaUsuario, ProjectContext
+from poc_it.models import ContextoNormalizado, ModoGeneracion, PlantillaUsuario, ProjectContext
 from poc_it.normalizador_contexto import normalizar_plantilla
-from poc_it.opciones import generar_opciones
 from poc_it.orquestacion.postprocesado_alineacion import postprocesar_alineacion_por_pytest
 
 logger = logging.getLogger(__name__)
@@ -127,7 +120,7 @@ Descripción:
         tiempo_generacion_horas = 0.0
         resultado: Dict[str, Any] = {}
 
-        if modo_generacion.upper() == "ASESOR":
+        if modo_generacion.upper() == ModoGeneracion.ASESOR:
             return estructura, archivos_creados, tiempo_generacion_horas, resultado
 
         t_generacion_inicio = time.perf_counter()
@@ -157,139 +150,6 @@ Descripción:
 
         return estructura, archivos_creados, tiempo_generacion_horas, resultado
 
-
-
-
-    def _generar_documentacion(
-        self,
-        context: ProjectContext,
-        modo_generacion: str,
-        estructura: Dict[str, str],
-        resultado: Dict[str, Any],
-        estimacion_generada,
-        estimacion_completa,
-        estimacion_manual,
-        t_clasificacion_inicio: float,
-        t_clasificacion_fin: float,
-        t_generacion_inicio: float,
-        t_generacion_fin: float,
-    ) -> None:
-        generar_docs = True
-        if modo_generacion.upper() != "ASESOR":
-            project_dir = os.path.join("output", self.nombre_proyecto)
-            ok_runtime, detail = runtime_verify_fastapi_project(project_dir)
-            if not ok_runtime:
-                generar_docs = False
-                logger.info("[DOCS] Saltando generación de documentación: el proyecto no es importable aún.")
-                logger.info(detail)
-
-        if not generar_docs:
-            return
-
-        endpoints_detectados = [path for path in estructura.keys() if path.endswith(".py")]
-
-        if context.contexto_normalizado:
-            arquitectura_real = context.contexto_normalizado.objetivo_tecnico
-            limites_reales = ", ".join(context.contexto_normalizado.restricciones_tecnicas)
-            tecnologias_reales = ", ".join(context.contexto_normalizado.integraciones_externas)
-            funcionalidades_reales = ", ".join(context.contexto_normalizado.funcionalidades_clave)
-            usuarios_reales = ", ".join(context.contexto_normalizado.actores_principales)
-        else:
-            arquitectura_real = context.plantilla.problema
-            limites_reales = context.plantilla.limites or ""
-            tecnologias_reales = context.plantilla.tecnologias or ""
-            funcionalidades_reales = context.plantilla.funcionalidades or ""
-            usuarios_reales = context.plantilla.usuarios or ""
-
-        opciones_estrategicas = generar_opciones(
-            arquitectura=arquitectura_real,
-            limites=limites_reales,
-            tecnologias=tecnologias_reales,
-        )
-
-        import time
-
-        t_documentacion_inicio = time.perf_counter()
-
-        spec_dict = None
-        try:
-            spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
-        except Exception:
-            spec_dict = None
-        if not isinstance(spec_dict, dict) or not spec_dict:
-            spec_dict = context.contexto_normalizado.model_dump() if context.contexto_normalizado else None
-
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            future_final = executor.submit(
-                generar_readme_final,
-                self.nombre_proyecto,
-                self.descripcion_global,
-                "Arquitectura generada dinámicamente por LLM",
-                endpoints_detectados,
-                modo_generacion.upper(),
-                self.tecnologias,
-                estimacion_generada,
-                estimacion_completa,
-                spec=spec_dict,
-            )
-
-            future_analisis = executor.submit(
-                generar_readme_asesor,
-                self.nombre_proyecto,
-                context.plantilla.problema,
-                usuarios_reales,
-                funcionalidades_reales,
-                limites_reales,
-                tecnologias_reales,
-                arquitectura_real,
-                opciones_estrategicas,
-                estimacion_manual,
-                spec_dict,
-            )
-
-            future_manual = None
-            if modo_generacion.upper() == "PARCIAL":
-                future_manual = executor.submit(
-                    generar_readme_manual,
-                    self.nombre_proyecto,
-                    "Arquitectura generada dinámicamente por LLM",
-                    self.tecnologias,
-                    endpoints_detectados,
-                    estructura,
-                    spec_dict,
-                )
-
-            readme_final = future_final.result()
-            readme_analisis = future_analisis.result()
-            readme_manual = future_manual.result() if future_manual else None
-
-        archivos_readme_final = materializar_proyecto(
-            nombre_proyecto=self.nombre_proyecto,
-            estructura={"README.md": readme_final},
-            limpiar_directorio=False,
-        )
-
-        archivos_readme_analisis = materializar_proyecto(
-            nombre_proyecto=self.nombre_proyecto,
-            estructura={"README_ANALISIS.md": readme_analisis},
-            limpiar_directorio=False,
-        )
-
-        if readme_manual:
-            archivos_readme_manual = materializar_proyecto(
-                nombre_proyecto=self.nombre_proyecto,
-                estructura={"README_MANUAL.md": readme_manual},
-                limpiar_directorio=False,
-            )
-        else:
-            archivos_readme_manual = []
-
-        t_documentacion_fin = time.perf_counter()
-
-        logger.info("\n[PERFORMANCE]")
-        logger.info("- Clasificación: %.2fs", t_clasificacion_fin - t_clasificacion_inicio)
-        logger.info("- Generación libre: %.2fs", t_generacion_fin - t_generacion_inicio)
-        logger.info("- Documentación: %.2fs\n", t_documentacion_fin - t_documentacion_inicio)
 
     def _build_fallback_docs(self, exc: Exception) -> Tuple[str, str]:
         fallback_readme = (
@@ -325,7 +185,7 @@ Descripción:
 
             t_generacion_inicio = 0.0
             t_generacion_fin = 0.0
-            if modo_generacion.upper() != "ASESOR":
+            if modo_generacion.upper() != ModoGeneracion.ASESOR:
                 import time
 
                 # Mantener comportamiento: el tiempo real se medía solo si se generaba.
@@ -360,15 +220,15 @@ Descripción:
             estimacion_completa = None
             estimacion_manual = None
 
-            if modo_upper == "PARCIAL":
+            if modo_upper == ModoGeneracion.PARCIAL:
                 estimacion_generada = self._estimacion_generada(modo_generacion, tiempo_generacion_horas)
                 estimacion_completa = self._estimacion_completa(tiempo_generacion_horas)
                 estimacion_manual = self._estimacion_manual()
-            elif modo_upper == "COMPLETO":
+            elif modo_upper == ModoGeneracion.COMPLETO:
                 estimacion_generada = self._estimacion_generada(modo_generacion, tiempo_generacion_horas)
                 estimacion_completa = self._estimacion_completa(tiempo_generacion_horas)
                 estimacion_manual = None
-            elif modo_upper == "ASESOR":
+            elif modo_upper == ModoGeneracion.ASESOR:
                 estimacion_manual = self._estimacion_manual()
                 estimacion_generada = None
                 estimacion_completa = None
@@ -381,7 +241,10 @@ Descripción:
                 estimacion_manual = self._estimacion_manual()
 
             # Generación docs
-            self._generar_documentacion(
+            generar_documentacion(
+                nombre_proyecto=self.nombre_proyecto,
+                descripcion_global=self.descripcion_global,
+                tecnologias=self.tecnologias,
                 context=context,
                 modo_generacion=modo_generacion,
                 estructura=estructura,
