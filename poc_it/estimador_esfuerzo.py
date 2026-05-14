@@ -128,11 +128,39 @@ _ESTIMACION_JSON_FALLBACK: dict[str, Any] = {
 }
 
 
+def _extraer_json_objeto(texto: str) -> str:
+    """Extrae el primer objeto JSON de un texto.
+
+    Robustece el parseo ante respuestas del LLM con:
+    - fences ```json ... ```
+    - texto antes/después del JSON
+    """
+    t = texto.strip()
+
+    # Eliminar fences simples
+    if t.startswith("```"):
+        lines = t.splitlines()
+        # quita primera y última línea si parecen fences
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        t = "\n".join(lines).strip()
+
+    start = t.find("{")
+    end = t.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return texto
+    return t[start : end + 1]
+
+
 def _parse_json_or_fallback(raw: Any, fallback: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(raw, str) or not raw.strip():
         return dict(fallback)
+
+    candidato = _extraer_json_objeto(raw)
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(candidato)
     except Exception:
         return dict(fallback)
     return parsed if isinstance(parsed, dict) else dict(fallback)
@@ -367,37 +395,3 @@ def calcular_estimacion_esfuerzo(
         ahorro_vs_junior=round(ahorro_vs_junior, 1),
         ahorro_vs_senior=round(ahorro_vs_senior, 1),
     )
-
-
-# ==========================================================
-# MARKDOWN
-# ==========================================================
-
-def generar_bloque_markdown(estimacion: EstimacionEsfuerzo) -> str:
-    # ------------------------------------------------------
-    # Formateo inteligente del tiempo de PoC-it
-    # ------------------------------------------------------
-    horas = estimacion.horas_scopeguardian
-
-    if horas < 1:
-        total_segundos = int(horas * 3600)
-        minutos = total_segundos // 60
-        segundos = total_segundos % 60
-        tiempo_pocit = f"{minutos} min {segundos} s (medido)"
-    else:
-        tiempo_pocit = f"{horas} horas (medido)"
-
-    return f"""
-## Estimación comparativa de esfuerzo
-
-| Perfil | Tiempo estimado |
-|--------|-----------------|
-| Junior | {estimacion.junior_min} – {estimacion.junior_max} horas |
-| Senior | {estimacion.senior_min} – {estimacion.senior_max} horas |
-| PoC-it | {tiempo_pocit} |
-
-### Ahorro estimado
-
-- Reducción frente a Junior: {estimacion.ahorro_vs_junior}%  
-- Reducción frente a Senior: {estimacion.ahorro_vs_senior}%  
-""".strip()
