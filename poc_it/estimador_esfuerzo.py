@@ -88,6 +88,9 @@ class ParametrosEstimacion:
     # LLM / parsing
     max_tokens_estimacion: int = 450
 
+    # Guardrails / ajustes
+    factor_escenario_simple: float = 0.9
+
     # Fallbacks (si el LLM falla o devuelve valores no válidos)
     fallback_junior_horas: float = 24.0
     fallback_senior_horas: float = 12.0
@@ -273,9 +276,8 @@ def _aplicar_limites_y_margen(
     # Ajuste suave para escenarios simples sin persistencia ni auth compleja.
     # Mantenerlo aquí (y parametrizable) evita “números mágicos” y documenta intención.
     if not requiere_persistencia and not requiere_auth and num_integraciones <= 1:
-        factor_simple = 0.9
-        senior *= factor_simple
-        junior *= factor_simple
+        senior *= PARAMETROS_ESTIMACION.factor_escenario_simple
+        junior *= PARAMETROS_ESTIMACION.factor_escenario_simple
 
     margen = PARAMETROS_ESTIMACION.margen_generable if generable else PARAMETROS_ESTIMACION.margen_no_generable
 
