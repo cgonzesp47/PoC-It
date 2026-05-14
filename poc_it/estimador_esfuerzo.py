@@ -242,6 +242,42 @@ def _modo_a_instruccion(modo: str | None) -> str:
     return f"Modo: {modo_upper}. Estima en base al alcance descrito/estructurado."
 
 
+def _to_json_block(label: str, data: Optional[Mapping[str, Any]]) -> str:
+    if not data:
+        return f"{label}:\n(no disponible)\n"
+    try:
+        payload = json.dumps(data, ensure_ascii=False)
+    except Exception:
+        payload = str(data)
+    return f"{label}:\n{payload}\n"
+
+
+def _build_prompt_estimacion(
+    *,
+    descripcion_proyecto: str,
+    modo: str | None,
+    metricas: Optional[Mapping[str, Any]],
+    spec: Optional[Mapping[str, Any]],
+    contexto_normalizado: Optional[Mapping[str, Any]],
+) -> str:
+    metricas_block = ""
+    if metricas:
+        metricas_block = _to_json_block("MÉTRICAS ESTRUCTURALES (resumen, si están presentes)", metricas)
+
+    return f"""
+{PROMPT_ESTIMACION_ESTRUCTURADA}
+
+INSTRUCCIÓN OPERATIVA:
+{_modo_a_instruccion(modo)}
+
+{_to_json_block("SPEC (FUENTE DE VERDAD, si está presente)", spec)}
+{_to_json_block("CONTEXTO_NORMALIZADO (FUENTE DE VERDAD, si está presente)", contexto_normalizado)}
+{metricas_block}
+DESCRIPCIÓN (solo apoyo si falta detalle en spec/contexto):
+{descripcion_proyecto}
+""".strip()
+
+
 def _estimar_horas_desde_inputs(
     *,
     descripcion_proyecto: str,
@@ -255,39 +291,13 @@ def _estimar_horas_desde_inputs(
     - Si hay spec/contexto_normalizado, se priorizan como fuente de verdad.
     - `metricas` se usa como fallback estructurado si se aporta.
     """
-    def _safe_json(obj: Optional[Mapping[str, Any]]) -> str:
-        if not obj:
-            return ""
-        try:
-            return json.dumps(obj, ensure_ascii=False)
-        except Exception:
-            return str(obj)
-
-    spec_json = _safe_json(spec)
-    contexto_json = _safe_json(contexto_normalizado)
-
-    metricas_block = ""
-    if metricas:
-        metricas_block = f"""
-MÉTRICAS ESTRUCTURALES (si están presentes, úsalas como resumen):
-{_safe_json(metricas)}
-"""
-
-    prompt_estimacion = f"""
-{PROMPT_ESTIMACION_ESTRUCTURADA}
-
-INSTRUCCIÓN OPERATIVA:
-{_modo_a_instruccion(modo)}
-
-SPEC (FUENTE DE VERDAD, si está presente):
-{spec_json or "(no disponible)"}
-
-CONTEXTO_NORMALIZADO (FUENTE DE VERDAD, si está presente):
-{contexto_json or "(no disponible)"}
-{metricas_block}
-DESCRIPCIÓN (solo apoyo si falta detalle en spec/contexto):
-{descripcion_proyecto}
-"""
+    prompt_estimacion = _build_prompt_estimacion(
+        descripcion_proyecto=descripcion_proyecto,
+        modo=modo,
+        metricas=metricas,
+        spec=spec,
+        contexto_normalizado=contexto_normalizado,
+    )
 
     contenido_estimacion = chat_completion_json(
         prompt=prompt_estimacion,
@@ -338,9 +348,12 @@ def _aplicar_limites_y_margen(
     senior = min(senior, limite)
     junior = min(junior, limite * 2)
 
+    # Ajuste suave para escenarios simples sin persistencia ni auth compleja.
+    # Mantenerlo aquí (y parametrizable) evita “números mágicos” y documenta intención.
     if not requiere_persistencia and not requiere_auth and num_integraciones <= 1:
-        senior *= 0.9
-        junior *= 0.9
+        factor_simple = 0.9
+        senior *= factor_simple
+        junior *= factor_simple
 
     margen = PARAMETROS_ESTIMACION.margen_generable if generable else PARAMETROS_ESTIMACION.margen_no_generable
 
