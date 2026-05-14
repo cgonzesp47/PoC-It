@@ -215,9 +215,37 @@ Descripción técnica de la PoC:
     return _normalizar_metricas(raw_metricas)
 
 
+def _modo_a_instruccion(modo: str | None) -> str:
+    """
+    Añade contexto operativo al prompt para reducir ambigüedad sin meter heurísticas duras.
+    """
+    if not modo:
+        return "Modo: (no especificado). Estima en base al alcance descrito/estructurado."
+
+    modo_upper = modo.upper()
+    if modo_upper == "ASESOR":
+        return (
+            "Modo: ASESOR. NO hay código generado. Estima el esfuerzo humano para implementar la PoC "
+            "descrita por el usuario, usando el contexto/spec como fuente de verdad."
+        )
+    if modo_upper == "PARCIAL":
+        return (
+            "Modo: PARCIAL. Puede haber alcance parcial. Estima el esfuerzo humano para implementar el SPEC "
+            "y completar los elementos típicamente necesarios para una PoC funcional (sin suposiciones enterprise)."
+        )
+    if modo_upper == "COMPLETO":
+        return (
+            "Modo: COMPLETO. Se pretende implementar el SPEC completo como PoC funcional. Estima el esfuerzo humano "
+            "para construir lo definido en el SPEC."
+        )
+
+    return f"Modo: {modo_upper}. Estima en base al alcance descrito/estructurado."
+
+
 def _estimar_horas_desde_inputs(
     *,
     descripcion_proyecto: str,
+    modo: str | None,
     metricas: Optional[Mapping[str, Any]] = None,
     spec: Optional[Mapping[str, Any]] = None,
     contexto_normalizado: Optional[Mapping[str, Any]] = None,
@@ -247,6 +275,9 @@ MÉTRICAS ESTRUCTURALES (si están presentes, úsalas como resumen):
 
     prompt_estimacion = f"""
 {PROMPT_ESTIMACION_ESTRUCTURADA}
+
+INSTRUCCIÓN OPERATIVA:
+{_modo_a_instruccion(modo)}
 
 SPEC (FUENTE DE VERDAD, si está presente):
 {spec_json or "(no disponible)"}
@@ -348,6 +379,7 @@ def calcular_estimacion_llm(
 
     junior, senior, complejidad = _estimar_horas_desde_inputs(
         descripcion_proyecto=descripcion_proyecto,
+        modo=modo,
         metricas=metricas,
         spec=spec,
         contexto_normalizado=contexto_normalizado,
