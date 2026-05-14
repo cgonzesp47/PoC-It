@@ -12,15 +12,14 @@ Nuevo flujo:
 """
 
 import asyncio
+import logging
+import os
 import time
 
-from poc_it.analizador_viabilidad import (
-    PlantillaUsuario,
-    analizar_viabilidad,
-)
+from poc_it.analizador_viabilidad import PlantillaUsuario, analizar_viabilidad
 from poc_it.models import ModoGeneracion
-from poc_it.orquestador_parcial import OrquestadorParcial
 from poc_it.opciones import generar_opciones
+from poc_it.orquestador_parcial import OrquestadorParcial
 
 
 TEMPLATE_PROMPT = """
@@ -59,7 +58,25 @@ def collect_user_input() -> PlantillaUsuario:
     )
 
 
+def _configure_logging() -> None:
+    """
+    Configura logging por defecto para CLI.
+
+    Nota:
+    - Se mantiene simple: consola + nivel configurable por env var.
+    - Esto hace visibles los logs del orquestador tras migrar prints->logging.
+    """
+    level_name = os.getenv("POCIT_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
 async def main() -> None:
+    _configure_logging()
     inicio_ejecucion = time.perf_counter()
 
     try:
