@@ -24,15 +24,15 @@ from typing import Any, Dict, Tuple
 
 from poc_it.clasificador import clasificar_viabilidad
 from poc_it.generador_artefactos import generar_proyecto_completo
-from poc_it.orquestacion.verificador_runtime import runtime_verify_fastapi_project
-from poc_it.orquestacion.reparacion_runtime import ejecutar_reparacion_runtime
-from poc_it.orquestacion.persistencia_spec import persist_spec_json
-from poc_it.orquestacion.generacion_documentacion import generar_documentacion
-from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
 from poc_it.materializador_archivos import materializar_proyecto
 from poc_it.models import ContextoNormalizado, ModoGeneracion, PlantillaUsuario, ProjectContext
 from poc_it.normalizador_contexto import normalizar_plantilla
+from poc_it.orquestacion.generacion_documentacion import generar_documentacion
+from poc_it.orquestacion.persistencia_spec import persist_spec_json
 from poc_it.orquestacion.postprocesado_alineacion import postprocesar_alineacion_por_pytest
+from poc_it.orquestacion.reparacion_runtime import ejecutar_reparacion_runtime
+from poc_it.orquestacion.constantes import OUTPUT_DIRNAME
+from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ class OrquestadorParcial:
     # 🔹 MÉTODOS PRIVADOS DE ESTIMACIÓN (MODULARIZADOS)
     # ======================================================
 
-    def _estimacion_generada(self, modo: str, horas: float):
+    def _estimacion_generada(self, modo: str, horas: float) -> Any:
         from poc_it.estimador_esfuerzo import calcular_estimacion_llm
 
         descripcion = f"""
@@ -62,7 +62,7 @@ Descripción:
             tiempo_real_scopeguardian_horas=horas,
         )
 
-    def _estimacion_completa(self, horas: float):
+    def _estimacion_completa(self, horas: float) -> Any:
         from poc_it.estimador_esfuerzo import calcular_estimacion_llm
 
         return calcular_estimacion_llm(
@@ -71,7 +71,7 @@ Descripción:
             tiempo_real_scopeguardian_horas=horas,
         )
 
-    def _estimacion_manual(self):
+    def _estimacion_manual(self) -> Any:
         from poc_it.estimador_esfuerzo import calcular_estimacion_llm
 
         return calcular_estimacion_llm(
@@ -102,7 +102,7 @@ Descripción:
         except Exception:
             context.contexto_normalizado = None
 
-    def _clasificar(self, context: ProjectContext):
+    def _clasificar(self, context: ProjectContext) -> tuple[ProjectContext, float, float]:
         import time
 
         t_clasificacion_inicio = time.perf_counter()
@@ -112,7 +112,9 @@ Descripción:
         logger.info("[DEBUG CONTEXT DESPUÉS DE CLASIFICACIÓN]\n%s", context.model_dump_json(indent=2))
         return context, t_clasificacion_inicio, t_clasificacion_fin
 
-    def _generar_y_materializar(self, context: ProjectContext, modo_generacion: str):
+    def _generar_y_materializar(
+        self, context: ProjectContext, modo_generacion: str
+    ) -> tuple[Dict[str, str], list[str], float, Dict[str, Any]]:
         import time
 
         estructura: Dict[str, str] = {}
@@ -150,7 +152,6 @@ Descripción:
 
         return estructura, archivos_creados, tiempo_generacion_horas, resultado
 
-
     def _build_fallback_docs(self, exc: Exception) -> Tuple[str, str]:
         fallback_readme = (
             f"# {self.nombre_proyecto}\n\n"
@@ -176,7 +177,7 @@ Descripción:
 
             context, t_clasificacion_inicio, t_clasificacion_fin = self._clasificar(context)
 
-            modo_generacion = context.clasificacion or self.modo_generacion
+            modo_generacion = (context.clasificacion or self.modo_generacion).upper()
 
             estructura, archivos_creados, tiempo_generacion_horas, resultado = self._generar_y_materializar(
                 context=context,
@@ -185,7 +186,7 @@ Descripción:
 
             t_generacion_inicio = 0.0
             t_generacion_fin = 0.0
-            if modo_generacion.upper() != ModoGeneracion.ASESOR:
+            if modo_generacion != ModoGeneracion.ASESOR:
                 import time
 
                 # Mantener comportamiento: el tiempo real se medía solo si se generaba.
@@ -193,7 +194,7 @@ Descripción:
                 t_generacion_inicio = time.perf_counter()
                 t_generacion_fin = t_generacion_inicio
 
-                project_dir = os.path.join("output", self.nombre_proyecto)
+                project_dir = os.path.join(OUTPUT_DIRNAME, self.nombre_proyecto)
 
                 generar_tests = generar_tests_unitarios(self.nombre_proyecto, resultado, estructura, archivos_creados)
                 postprocesar_alineacion_por_pytest(
@@ -214,7 +215,7 @@ Descripción:
                     regenerar_tests=generar_tests,
                 )
 
-            modo_upper = modo_generacion.upper()
+            modo_upper = modo_generacion
 
             estimacion_generada = None
             estimacion_completa = None
