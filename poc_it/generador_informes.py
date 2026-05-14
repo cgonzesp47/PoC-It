@@ -15,7 +15,7 @@ from typing import List, Dict, Any, Optional
 import re
 
 from poc_it.llm_client import chat_completion_text
-from poc_it.estimador_esfuerzo import generar_bloque_markdown
+from poc_it.orquestacion.render_estimacion import generar_bloque_estimacion_markdown
 from poc_it.poc_facts_extractor import extract_poc_facts_from_structure
 
 
@@ -155,7 +155,7 @@ No repitas información trivial.
     # ESTIMACIONES RECIBIDAS DESDE ORQUESTADOR (una sola llamada externa)
     # ======================================================
 
-    bloque_generada = generar_bloque_markdown(estimacion_generada)
+    bloque_generada = generar_bloque_estimacion_markdown(estimacion_generada)
 
     nota = """
 > Nota: El ahorro real puede ser superior al porcentaje mostrado.  
@@ -437,6 +437,6 @@ def generar_readme_asesor(
     # 5. Estimación (no se elimina, es crítica en asesor)
     # ------------------------------------------------------
     contenido += "\n## 5. Estimación conceptual de implementación manual\n\n"
-    contenido += generar_bloque_markdown(estimacion_manual)
+    contenido += generar_bloque_estimacion_markdown(estimacion_manual)
 
     return contenido.strip()
