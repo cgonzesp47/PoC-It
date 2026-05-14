@@ -15,9 +15,7 @@ from typing import List, Dict, Any, Optional
 import re
 
 from poc_it.llm_client import chat_completion_text
-from poc_it.estimador_esfuerzo import (
-    generar_bloque_markdown,
-)
+from poc_it.estimador_esfuerzo import generar_bloque_markdown
 from poc_it.poc_facts_extractor import extract_poc_facts_from_structure
 
 
@@ -51,7 +49,6 @@ def generar_readme_final(
     modo: str,
     tecnologias: str,
     estimacion_generada,
-    estimacion_completa,
     spec: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
@@ -159,12 +156,6 @@ No repitas información trivial.
     # ======================================================
 
     bloque_generada = generar_bloque_markdown(estimacion_generada)
-    bloque_completa = generar_bloque_markdown(estimacion_completa)
-
-    # Eliminar fila de PoC-it en estimación B (proyecto completo no automatizable)
-    lineas = bloque_completa.splitlines()
-    lineas_filtradas = [l for l in lineas if "PoC-it" not in l]
-    bloque_completa = "\n".join(lineas_filtradas)
 
     nota = """
 > Nota: El ahorro real puede ser superior al porcentaje mostrado.  
@@ -172,14 +163,9 @@ No repitas información trivial.
 """
 
     seccion_estimacion = (
-        "## Estimación de esfuerzo – A) PoC generada automáticamente\n\n"
+        "## Estimación de esfuerzo – PoC generada automáticamente\n\n"
         "Esta estimación se refiere únicamente al alcance realmente generado por el sistema.\n\n"
         + bloque_generada
-        + "\n\n---\n\n"
-        + "## Estimación de esfuerzo – B) PoC completa solicitada\n\n"
-        "Esta estimación considera la implementación completa tal y como fue descrita por el usuario, "
-        "incluyendo integraciones reales, configuración cloud y validación de permisos.\n\n"
-        + bloque_completa
         + "\n\n"
         + nota.strip()
     )
@@ -388,7 +374,6 @@ def generar_readme_asesor(
     - Estimación incluida (crítica en modo asesor)
     """
 
-    from poc_it.estimador_esfuerzo import generar_bloque_markdown
 
     spec = spec or {}
     spec_json = ""

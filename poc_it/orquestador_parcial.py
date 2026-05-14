@@ -62,15 +62,6 @@ Descripción:
             tiempo_real_scopeguardian_horas=horas,
         )
 
-    def _estimacion_completa(self, horas: float) -> Any:
-        from poc_it.estimador_esfuerzo import calcular_estimacion_llm
-
-        return calcular_estimacion_llm(
-            descripcion_proyecto=self.descripcion_global,
-            modo="COMPLETA_SOLICITADA",
-            tiempo_real_scopeguardian_horas=horas,
-        )
-
     def _estimacion_manual(self) -> Any:
         from poc_it.estimador_esfuerzo import calcular_estimacion_llm
 
@@ -218,27 +209,15 @@ Descripción:
             modo_upper = modo_generacion
 
             estimacion_generada = None
-            estimacion_completa = None
             estimacion_manual = None
 
-            if modo_upper == ModoGeneracion.PARCIAL:
-                estimacion_generada = self._estimacion_generada(modo_generacion, tiempo_generacion_horas)
-                estimacion_completa = self._estimacion_completa(tiempo_generacion_horas)
+            if modo_upper == ModoGeneracion.ASESOR:
+                # En ASESOR no se genera PoC, pero sí queremos estimación para README_ANALISIS.
                 estimacion_manual = self._estimacion_manual()
-            elif modo_upper == ModoGeneracion.COMPLETO:
+            else:
+                # En PARCIAL/COMPLETO se estima el alcance realmente generado.
                 estimacion_generada = self._estimacion_generada(modo_generacion, tiempo_generacion_horas)
-                estimacion_completa = self._estimacion_completa(tiempo_generacion_horas)
-                estimacion_manual = None
-            elif modo_upper == ModoGeneracion.ASESOR:
-                estimacion_manual = self._estimacion_manual()
-                estimacion_generada = None
-                estimacion_completa = None
-
-            if estimacion_generada is None:
-                estimacion_generada = self._estimacion_manual()
-            if estimacion_completa is None:
-                estimacion_completa = self._estimacion_manual()
-            if estimacion_manual is None:
+                # Mantener también una estimación manual para README_ANALISIS (sin recalcular en docs).
                 estimacion_manual = self._estimacion_manual()
 
             # Generación docs
@@ -251,7 +230,6 @@ Descripción:
                 estructura=estructura,
                 resultado=resultado,
                 estimacion_generada=estimacion_generada,
-                estimacion_completa=estimacion_completa,
                 estimacion_manual=estimacion_manual,
                 t_clasificacion_inicio=t_clasificacion_inicio,
                 t_clasificacion_fin=t_clasificacion_fin,

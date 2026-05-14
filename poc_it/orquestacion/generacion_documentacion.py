@@ -5,11 +5,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
-from poc_it.generador_informes import (
-    generar_readme_asesor,
-    generar_readme_final,
-    generar_readme_manual,
-)
+from poc_it.generador_informes import generar_readme_asesor, generar_readme_final, generar_readme_manual
 from poc_it.materializador_archivos import materializar_proyecto
 from poc_it.models import ModoGeneracion, ProjectContext
 from poc_it.opciones import generar_opciones
@@ -35,7 +31,6 @@ def generar_documentacion(
     estructura: Dict[str, str],
     resultado: Dict[str, Any],
     estimacion_generada: Any,
-    estimacion_completa: Any,
     estimacion_manual: Any,
     t_clasificacion_inicio: float,
     t_clasificacion_fin: float,
@@ -112,7 +107,6 @@ def generar_documentacion(
             modo_generacion.upper(),
             tecnologias,
             estimacion_generada,
-            estimacion_completa,
             spec=spec_dict,
         )
 
