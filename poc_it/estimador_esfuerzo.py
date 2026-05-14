@@ -36,24 +36,6 @@ class EstimacionEsfuerzo:
 # PROMPT LLM
 # ==========================================================
 
-PROMPT_EXTRACCION_METRICAS = """
-Actúa como un arquitecto backend.
-
-Analiza la descripción de la PoC y extrae SOLO métricas estructurales objetivas.
-
-Devuelve ÚNICAMENTE JSON válido con esta estructura:
-
-{
-  "num_endpoints": number,
-  "num_integraciones_externas": number,
-  "requiere_autenticacion_compleja": boolean,
-  "requiere_persistencia": boolean,
-  "requiere_despliegue_cloud": boolean,
-  "complejidad_global": "BAJA | MEDIA | ALTA | CRITICA"
-}
-
-No añadas texto fuera del JSON.
-"""
 
 PROMPT_ESTIMACION_ESTRUCTURADA = """
 Actúa como un arquitecto software senior pragmático.
@@ -135,14 +117,6 @@ class ParametrosEstimacion:
 
 PARAMETROS_ESTIMACION = ParametrosEstimacion()
 
-_METRICAS_FALLBACK: dict[str, Any] = {
-    "num_endpoints": 1,
-    "num_integraciones_externas": 1,
-    "requiere_autenticacion_compleja": False,
-    "requiere_persistencia": False,
-    "requiere_despliegue_cloud": False,
-    "complejidad_global": PARAMETROS_ESTIMACION.fallback_complejidad,
-}
 
 _ESTIMACION_JSON_FALLBACK: dict[str, Any] = {
     "junior_horas": PARAMETROS_ESTIMACION.fallback_junior_horas,
@@ -161,58 +135,6 @@ def _parse_json_or_fallback(raw: Any, fallback: Mapping[str, Any]) -> dict[str, 
     return parsed if isinstance(parsed, dict) else dict(fallback)
 
 
-def _safe_int(value: object, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _normalizar_metricas(metricas: Mapping[str, Any]) -> dict[str, Any]:
-    num_endpoints = _safe_int(metricas.get("num_endpoints"))
-    num_integraciones = _safe_int(metricas.get("num_integraciones_externas"))
-
-    requiere_auth = bool(metricas.get("requiere_autenticacion_compleja", False))
-    requiere_persistencia = bool(metricas.get("requiere_persistencia", False))
-    requiere_cloud = bool(metricas.get("requiere_despliegue_cloud", False))
-
-    complejidad_global = metricas.get("complejidad_global")
-    if not isinstance(complejidad_global, str):
-        complejidad_global = "MEDIA"
-
-    return {
-        "num_endpoints": num_endpoints,
-        "num_integraciones_externas": num_integraciones,
-        "requiere_autenticacion_compleja": requiere_auth,
-        "requiere_persistencia": requiere_persistencia,
-        "requiere_despliegue_cloud": requiere_cloud,
-        "complejidad_global": complejidad_global,
-    }
-
-
-def _extraer_metricas(descripcion_proyecto: str) -> dict[str, Any]:
-    """
-    Fallback legacy: extracción de métricas desde texto libre mediante LLM.
-    Se mantiene para compatibilidad cuando no haya inputs estructurados.
-    """
-    prompt_metricas = f"""
-{PROMPT_EXTRACCION_METRICAS}
-
-Descripción técnica de la PoC:
-
-{descripcion_proyecto}
-"""
-
-    contenido_metricas = chat_completion_json(
-        prompt=prompt_metricas,
-        system="Responde únicamente con JSON válido.",
-        temperature=0.0,
-        max_tokens=300,
-        fase="estimacion",
-    )
-
-    raw_metricas = _parse_json_or_fallback(contenido_metricas, _METRICAS_FALLBACK)
-    return _normalizar_metricas(raw_metricas)
 
 
 def _modo_a_instruccion(modo: str | None) -> str:
@@ -383,29 +305,21 @@ def calcular_estimacion_llm(
     spec: Optional[Mapping[str, Any]] = None,
     contexto_normalizado: Optional[Mapping[str, Any]] = None,
 ) -> EstimacionEsfuerzo:
-    # Si tenemos inputs estructurados, evitamos la llamada extra del “paso 1” (extracción de métricas).
-    metricas: Optional[dict[str, Any]]
-    if spec or contexto_normalizado:
-        metricas = None
-    else:
-        metricas = _extraer_metricas(descripcion_proyecto)
-
+    # Invariante del pipeline: en esta fase siempre hay input estructurado.
+    # Se conserva `descripcion_proyecto` solo como apoyo por si faltan detalles finos.
     junior, senior, complejidad = _estimar_horas_desde_inputs(
         descripcion_proyecto=descripcion_proyecto,
         modo=modo,
-        metricas=metricas,
+        metricas=None,
         spec=spec,
         contexto_normalizado=contexto_normalizado,
     )
 
-    # Para aplicar guardrails, si no había métricas las derivamos con fallback (sin LLM).
-    if metricas is None:
-        # fallback conservador: sin datos estructurales finos, asumimos al menos 1 endpoint y 1 integración
-        metricas = _METRICAS_FALLBACK
-
-    num_integraciones = int(metricas["num_integraciones_externas"])
-    requiere_auth = bool(metricas["requiere_autenticacion_compleja"])
-    requiere_persistencia = bool(metricas["requiere_persistencia"])
+    # Guardrails: sin métricas estructurales legacy, aplicamos valores conservadores.
+    # (Se mantiene el comportamiento de clamps/márgenes sin dependencia de extracción previa).
+    num_integraciones = 1
+    requiere_auth = False
+    requiere_persistencia = False
 
     junior_min, junior_max, senior_min, senior_max = _aplicar_limites_y_margen(
         junior=junior,
