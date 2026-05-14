@@ -250,6 +250,45 @@ def _estimar_horas_desde_inputs(
     return junior, senior, complejidad
 
 
+def _sanitizar_horas_estimadas(*, junior: float, senior: float, num_integraciones: int) -> tuple[float, float]:
+    if junior <= 0:
+        junior = max(PARAMETROS_ESTIMACION.min_junior_horas, 2.5 + num_integraciones * 4.0)
+
+    if senior <= 0:
+        senior = max(PARAMETROS_ESTIMACION.min_senior_horas, 1.5 + num_integraciones * 3.0)
+
+    return junior, senior
+
+
+def _aplicar_clamps_por_complejidad(*, junior: float, senior: float, complejidad: str) -> tuple[float, float]:
+    limite = PARAMETROS_ESTIMACION.limites_senior_por_complejidad.get(
+        complejidad, PARAMETROS_ESTIMACION.limites_senior_por_complejidad["MEDIA"]
+    )
+
+    senior = min(senior, limite)
+    junior = min(junior, limite * 2)
+    return junior, senior
+
+
+def _aplicar_ajustes_escenario_simple(
+    *, junior: float, senior: float, requiere_persistencia: bool, requiere_auth: bool, num_integraciones: int
+) -> tuple[float, float]:
+    if not requiere_persistencia and not requiere_auth and num_integraciones <= 1:
+        junior *= PARAMETROS_ESTIMACION.factor_escenario_simple
+        senior *= PARAMETROS_ESTIMACION.factor_escenario_simple
+    return junior, senior
+
+
+def _calcular_rangos(*, junior: float, senior: float, generable: bool) -> tuple[float, float, float, float]:
+    margen = PARAMETROS_ESTIMACION.margen_generable if generable else PARAMETROS_ESTIMACION.margen_no_generable
+    return (
+        junior * (1 - margen),
+        junior * (1 + margen),
+        senior * (1 - margen),
+        senior * (1 + margen),
+    )
+
+
 def _aplicar_limites_y_margen(
     *,
     junior: float,
@@ -260,33 +299,16 @@ def _aplicar_limites_y_margen(
     num_integraciones: int,
     generable: bool,
 ) -> tuple[float, float, float, float]:
-    if junior <= 0:
-        junior = max(PARAMETROS_ESTIMACION.min_junior_horas, 2.5 + num_integraciones * 4.0)
-
-    if senior <= 0:
-        senior = max(PARAMETROS_ESTIMACION.min_senior_horas, 1.5 + num_integraciones * 3.0)
-
-    limite = PARAMETROS_ESTIMACION.limites_senior_por_complejidad.get(
-        complejidad, PARAMETROS_ESTIMACION.limites_senior_por_complejidad["MEDIA"]
+    junior, senior = _sanitizar_horas_estimadas(junior=junior, senior=senior, num_integraciones=num_integraciones)
+    junior, senior = _aplicar_clamps_por_complejidad(junior=junior, senior=senior, complejidad=complejidad)
+    junior, senior = _aplicar_ajustes_escenario_simple(
+        junior=junior,
+        senior=senior,
+        requiere_persistencia=requiere_persistencia,
+        requiere_auth=requiere_auth,
+        num_integraciones=num_integraciones,
     )
-
-    senior = min(senior, limite)
-    junior = min(junior, limite * 2)
-
-    # Ajuste suave para escenarios simples sin persistencia ni auth compleja.
-    # Mantenerlo aquí (y parametrizable) evita “números mágicos” y documenta intención.
-    if not requiere_persistencia and not requiere_auth and num_integraciones <= 1:
-        senior *= PARAMETROS_ESTIMACION.factor_escenario_simple
-        junior *= PARAMETROS_ESTIMACION.factor_escenario_simple
-
-    margen = PARAMETROS_ESTIMACION.margen_generable if generable else PARAMETROS_ESTIMACION.margen_no_generable
-
-    return (
-        junior * (1 - margen),
-        junior * (1 + margen),
-        senior * (1 - margen),
-        senior * (1 + margen),
-    )
+    return _calcular_rangos(junior=junior, senior=senior, generable=generable)
 
 
 def _calcular_ahorro(*, estimado: float, real: float) -> float:
@@ -298,7 +320,7 @@ def _calcular_ahorro(*, estimado: float, real: float) -> float:
     )
 
 
-def calcular_estimacion_llm(
+def calcular_estimacion_esfuerzo(
     descripcion_proyecto: str,
     modo: str | None,
     tiempo_real_scopeguardian_horas: float,
