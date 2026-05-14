@@ -34,6 +34,10 @@ from poc_it.orquestacion.constantes import OUTPUT_DIRNAME, README_ERROR_FILENAME
 from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
 from poc_it.orquestacion.reparacion_runtime import ejecutar_reparacion_runtime
 
+# Cachea el contexto normalizado para poder reutilizarlo en estimaciones (sin recalcular inputs).
+# Nota: se inicializa en _normalizar_contexto.
+ContextoNormalizadoCache = ContextoNormalizado | None
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,7 +50,7 @@ class OrquestadorParcial:
     # 🔹 MÉTODOS PRIVADOS DE ESTIMACIÓN (MODULARIZADOS)
     # ======================================================
 
-    def _estimacion_generada(self, modo: str, horas: float) -> Any:
+    def _estimacion_generada(self, modo: str, horas: float, *, spec: Dict[str, Any] | None = None) -> Any:
         from poc_it.estimador_esfuerzo import calcular_estimacion_llm
 
         descripcion = f"""
@@ -60,9 +64,11 @@ Descripción:
             descripcion_proyecto=descripcion,
             modo=modo,
             tiempo_real_scopeguardian_horas=horas,
+            spec=spec,
+            contexto_normalizado=self._contexto_normalizado.model_dump() if self._contexto_normalizado else None,
         )
 
-    def _estimacion_manual(self) -> Any:
+    def _estimacion_manual(self, *, spec: Dict[str, Any] | None = None) -> Any:
         from poc_it.estimador_esfuerzo import calcular_estimacion_llm
 
         return calcular_estimacion_llm(
@@ -70,6 +76,8 @@ Descripción:
             modo=None,
             tiempo_real_scopeguardian_horas=0.0,
             generable=False,
+            spec=spec,
+            contexto_normalizado=self._contexto_normalizado.model_dump() if self._contexto_normalizado else None,
         )
 
     def __init__(self, plantilla: PlantillaUsuario, modo_generacion: str):
@@ -78,6 +86,7 @@ Descripción:
         self.descripcion_global = plantilla.problema
         self.tecnologias = plantilla.tecnologias
         self.modo_generacion = modo_generacion
+        self._contexto_normalizado: ContextoNormalizadoCache = None
 
     def _build_context(self) -> ProjectContext:
         context = ProjectContext(plantilla=self.plantilla)
@@ -89,9 +98,11 @@ Descripción:
         try:
             contexto_normalizado = ContextoNormalizado(**contexto_dict)
             context.contexto_normalizado = contexto_normalizado
+            self._contexto_normalizado = contexto_normalizado
             context.registrar_modelo("normalizacion_contexto", "chat_completion_json")
         except Exception:
             context.contexto_normalizado = None
+            self._contexto_normalizado = None
 
     def _clasificar(self, context: ProjectContext) -> tuple[ProjectContext, float, float]:
         import time
@@ -213,12 +224,13 @@ Descripción:
 
             if modo_upper == ModoGeneracion.ASESOR:
                 # En ASESOR no se genera PoC, pero sí queremos estimación para README_ANALISIS.
-                estimacion_manual = self._estimacion_manual()
+                estimacion_manual = self._estimacion_manual(spec=resultado.get("spec") if isinstance(resultado, dict) else None)
             else:
+                spec = resultado.get("spec") if isinstance(resultado, dict) else None
                 # En PARCIAL/COMPLETO se estima el alcance realmente generado.
-                estimacion_generada = self._estimacion_generada(modo_generacion, tiempo_generacion_horas)
+                estimacion_generada = self._estimacion_generada(modo_generacion, tiempo_generacion_horas, spec=spec)
                 # Mantener también una estimación manual para README_ANALISIS (sin recalcular en docs).
-                estimacion_manual = self._estimacion_manual()
+                estimacion_manual = self._estimacion_manual(spec=spec)
 
             # Generación docs
             generar_documentacion(

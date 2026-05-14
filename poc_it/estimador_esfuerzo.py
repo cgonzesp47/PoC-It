@@ -10,9 +10,9 @@ Nueva estrategia:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 from poc_it.llm_client import chat_completion_json
 
@@ -58,13 +58,15 @@ No añadas texto fuera del JSON.
 PROMPT_ESTIMACION_ESTRUCTURADA = """
 Actúa como un arquitecto software senior pragmático.
 
-Debes estimar el tiempo TOTAL necesario para implementar una **PoC mínima funcional (MVP)** basada únicamente en las métricas estructurales proporcionadas.
+Debes estimar el tiempo TOTAL necesario para implementar una **PoC mínima funcional (MVP)**.
+
+Fuente de verdad:
+- Si se proporciona un SPEC o un CONTEXTO_NORMALIZADO, debes basarte principalmente en esos datos estructurados.
+- Si faltan datos, utiliza la descripción textual solo como apoyo (sin inventar requisitos).
 
 Principios obligatorios:
 - Asume implementación directa, sin burocracia corporativa.
 - No asumas configuración avanzada de red, VPC, IAM granular ni hardening.
-- Cloud Run básico con despliegue estándar NO debe considerarse arquitectura compleja.
-- ADC con Service Account estándar NO debe considerarse autenticación compleja.
 - No incluyas optimizaciones enterprise ni arquitectura futura.
 
 Referencia orientativa realista (Senior):
@@ -72,8 +74,6 @@ Referencia orientativa realista (Senior):
 - Integración externa simple (SDK oficial): 3–6h
 - Deploy cloud básico: 1–3h
 - CRUD con base de datos simple: 6–10h
-
-Si no hay persistencia ni autenticación compleja, el total Senior raramente debería superar 16–20h.
 
 Devuelve ÚNICAMENTE JSON válido con esta estructura:
 
@@ -92,8 +92,48 @@ No añadas texto fuera del JSON.
 
 
 # ==========================================================
-# FUNCIÓN PRINCIPAL
+# CONFIGURACIÓN (evitar números mágicos)
 # ==========================================================
+
+
+@dataclass(frozen=True)
+class ParametrosEstimacion:
+    """Parámetros de tuning para mantener estabilidad y mantenibilidad.
+
+    Nota: Aunque el LLM estime, estos parámetros actúan como guardrails.
+    """
+
+    # LLM / parsing
+    max_tokens_estimacion: int = 450
+
+    # Fallbacks (si el LLM falla o devuelve valores no válidos)
+    fallback_junior_horas: float = 24.0
+    fallback_senior_horas: float = 12.0
+    fallback_complejidad: str = "MEDIA"
+
+    # Guardrails mínimos
+    min_junior_horas: float = 8.0
+    min_senior_horas: float = 4.0
+
+    # Márgenes de incertidumbre
+    margen_generable: float = 0.15
+    margen_no_generable: float = 0.25
+
+    # Porcentaje máximo de ahorro mostrado
+    max_ahorro_pct: float = 90.0
+
+    # Límites máximos senior por complejidad (para evitar outliers)
+    limites_senior_por_complejidad: Mapping[str, int] = field(
+        default_factory=lambda: {
+            "BAJA": 14,
+            "MEDIA": 32,
+            "ALTA": 70,
+            "CRITICA": 140,
+        }
+    )
+
+
+PARAMETROS_ESTIMACION = ParametrosEstimacion()
 
 _METRICAS_FALLBACK: dict[str, Any] = {
     "num_endpoints": 1,
@@ -101,7 +141,13 @@ _METRICAS_FALLBACK: dict[str, Any] = {
     "requiere_autenticacion_compleja": False,
     "requiere_persistencia": False,
     "requiere_despliegue_cloud": False,
-    "complejidad_global": "MEDIA",
+    "complejidad_global": PARAMETROS_ESTIMACION.fallback_complejidad,
+}
+
+_ESTIMACION_JSON_FALLBACK: dict[str, Any] = {
+    "junior_horas": PARAMETROS_ESTIMACION.fallback_junior_horas,
+    "senior_horas": PARAMETROS_ESTIMACION.fallback_senior_horas,
+    "complejidad": PARAMETROS_ESTIMACION.fallback_complejidad,
 }
 
 
@@ -145,6 +191,10 @@ def _normalizar_metricas(metricas: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _extraer_metricas(descripcion_proyecto: str) -> dict[str, Any]:
+    """
+    Fallback legacy: extracción de métricas desde texto libre mediante LLM.
+    Se mantiene para compatibilidad cuando no haya inputs estructurados.
+    """
     prompt_metricas = f"""
 {PROMPT_EXTRACCION_METRICAS}
 
@@ -165,44 +215,71 @@ Descripción técnica de la PoC:
     return _normalizar_metricas(raw_metricas)
 
 
-def _estimar_horas_desde_metricas(metricas: Mapping[str, Any]) -> tuple[float, float, str]:
+def _estimar_horas_desde_inputs(
+    *,
+    descripcion_proyecto: str,
+    metricas: Optional[Mapping[str, Any]] = None,
+    spec: Optional[Mapping[str, Any]] = None,
+    contexto_normalizado: Optional[Mapping[str, Any]] = None,
+) -> tuple[float, float, str]:
+    """
+    Estima horas con UNA llamada LLM, usando inputs estructurados cuando existan.
+    - Si hay spec/contexto_normalizado, se priorizan como fuente de verdad.
+    - `metricas` se usa como fallback estructurado si se aporta.
+    """
+    def _safe_json(obj: Optional[Mapping[str, Any]]) -> str:
+        if not obj:
+            return ""
+        try:
+            return json.dumps(obj, ensure_ascii=False)
+        except Exception:
+            return str(obj)
+
+    spec_json = _safe_json(spec)
+    contexto_json = _safe_json(contexto_normalizado)
+
+    metricas_block = ""
+    if metricas:
+        metricas_block = f"""
+MÉTRICAS ESTRUCTURALES (si están presentes, úsalas como resumen):
+{_safe_json(metricas)}
+"""
+
     prompt_estimacion = f"""
 {PROMPT_ESTIMACION_ESTRUCTURADA}
 
-Métricas estructurales detectadas:
-- Endpoints: {metricas.get("num_endpoints")}
-- Integraciones externas: {metricas.get("num_integraciones_externas")}
-- Autenticación compleja: {metricas.get("requiere_autenticacion_compleja")}
-- Persistencia: {metricas.get("requiere_persistencia")}
-- Despliegue cloud: {metricas.get("requiere_despliegue_cloud")}
-- Complejidad global: {metricas.get("complejidad_global")}
+SPEC (FUENTE DE VERDAD, si está presente):
+{spec_json or "(no disponible)"}
+
+CONTEXTO_NORMALIZADO (FUENTE DE VERDAD, si está presente):
+{contexto_json or "(no disponible)"}
+{metricas_block}
+DESCRIPCIÓN (solo apoyo si falta detalle en spec/contexto):
+{descripcion_proyecto}
 """
 
     contenido_estimacion = chat_completion_json(
         prompt=prompt_estimacion,
         system="Responde únicamente con JSON válido.",
         temperature=0.0,
-        max_tokens=400,
+        max_tokens=PARAMETROS_ESTIMACION.max_tokens_estimacion,
         fase="estimacion",
     )
 
-    data = _parse_json_or_fallback(
-        contenido_estimacion,
-        {"junior_horas": 24.0, "senior_horas": 12.0, "complejidad": "MEDIA"},
-    )
+    data = _parse_json_or_fallback(contenido_estimacion, _ESTIMACION_JSON_FALLBACK)
 
     try:
         junior = float(data.get("junior_horas", 0))
     except Exception:
-        junior = 24.0
+        junior = PARAMETROS_ESTIMACION.fallback_junior_horas
     try:
         senior = float(data.get("senior_horas", 0))
     except Exception:
-        senior = 12.0
+        senior = PARAMETROS_ESTIMACION.fallback_senior_horas
 
     complejidad = data.get("complejidad", "MEDIA")
     if not isinstance(complejidad, str):
-        complejidad = "MEDIA"
+        complejidad = PARAMETROS_ESTIMACION.fallback_complejidad
 
     return junior, senior, complejidad
 
@@ -218,18 +295,14 @@ def _aplicar_limites_y_margen(
     generable: bool,
 ) -> tuple[float, float, float, float]:
     if junior <= 0:
-        junior = max(8.0, 2.5 + num_integraciones * 4.0)
+        junior = max(PARAMETROS_ESTIMACION.min_junior_horas, 2.5 + num_integraciones * 4.0)
 
     if senior <= 0:
-        senior = max(4.0, 1.5 + num_integraciones * 3.0)
+        senior = max(PARAMETROS_ESTIMACION.min_senior_horas, 1.5 + num_integraciones * 3.0)
 
-    limites_senior = {
-        "BAJA": 14,
-        "MEDIA": 32,
-        "ALTA": 70,
-        "CRITICA": 140,
-    }
-    limite = limites_senior.get(complejidad, 32)
+    limite = PARAMETROS_ESTIMACION.limites_senior_por_complejidad.get(
+        complejidad, PARAMETROS_ESTIMACION.limites_senior_por_complejidad["MEDIA"]
+    )
 
     senior = min(senior, limite)
     junior = min(junior, limite * 2)
@@ -238,7 +311,7 @@ def _aplicar_limites_y_margen(
         senior *= 0.9
         junior *= 0.9
 
-    margen = 0.15 if generable else 0.25
+    margen = PARAMETROS_ESTIMACION.margen_generable if generable else PARAMETROS_ESTIMACION.margen_no_generable
 
     return (
         junior * (1 - margen),
@@ -251,7 +324,10 @@ def _aplicar_limites_y_margen(
 def _calcular_ahorro(*, estimado: float, real: float) -> float:
     if estimado <= 0:
         return 0.0
-    return min(90.0, max(0.0, (estimado - real) / estimado * 100))
+    return min(
+        PARAMETROS_ESTIMACION.max_ahorro_pct,
+        max(0.0, (estimado - real) / estimado * 100),
+    )
 
 
 def calcular_estimacion_llm(
@@ -259,9 +335,28 @@ def calcular_estimacion_llm(
     modo: str | None,
     tiempo_real_scopeguardian_horas: float,
     generable: bool = True,
+    *,
+    spec: Optional[Mapping[str, Any]] = None,
+    contexto_normalizado: Optional[Mapping[str, Any]] = None,
 ) -> EstimacionEsfuerzo:
-    metricas = _extraer_metricas(descripcion_proyecto)
-    junior, senior, complejidad = _estimar_horas_desde_metricas(metricas)
+    # Si tenemos inputs estructurados, evitamos la llamada extra del “paso 1” (extracción de métricas).
+    metricas: Optional[dict[str, Any]]
+    if spec or contexto_normalizado:
+        metricas = None
+    else:
+        metricas = _extraer_metricas(descripcion_proyecto)
+
+    junior, senior, complejidad = _estimar_horas_desde_inputs(
+        descripcion_proyecto=descripcion_proyecto,
+        metricas=metricas,
+        spec=spec,
+        contexto_normalizado=contexto_normalizado,
+    )
+
+    # Para aplicar guardrails, si no había métricas las derivamos con fallback (sin LLM).
+    if metricas is None:
+        # fallback conservador: sin datos estructurales finos, asumimos al menos 1 endpoint y 1 integración
+        metricas = _METRICAS_FALLBACK
 
     num_integraciones = int(metricas["num_integraciones_externas"])
     requiere_auth = bool(metricas["requiere_autenticacion_compleja"])
