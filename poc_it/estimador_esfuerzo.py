@@ -10,8 +10,10 @@ Nueva estrategia:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
+from typing import Any, Mapping, Optional
+
 from poc_it.llm_client import chat_completion_json
 
 
@@ -34,35 +36,19 @@ class EstimacionEsfuerzo:
 # PROMPT LLM
 # ==========================================================
 
-PROMPT_EXTRACCION_METRICAS = """
-Actúa como un arquitecto backend.
-
-Analiza la descripción de la PoC y extrae SOLO métricas estructurales objetivas.
-
-Devuelve ÚNICAMENTE JSON válido con esta estructura:
-
-{
-  "num_endpoints": number,
-  "num_integraciones_externas": number,
-  "requiere_autenticacion_compleja": boolean,
-  "requiere_persistencia": boolean,
-  "requiere_despliegue_cloud": boolean,
-  "complejidad_global": "BAJA | MEDIA | ALTA | CRITICA"
-}
-
-No añadas texto fuera del JSON.
-"""
 
 PROMPT_ESTIMACION_ESTRUCTURADA = """
 Actúa como un arquitecto software senior pragmático.
 
-Debes estimar el tiempo TOTAL necesario para implementar una **PoC mínima funcional (MVP)** basada únicamente en las métricas estructurales proporcionadas.
+Debes estimar el tiempo TOTAL necesario para implementar una **PoC mínima funcional (MVP)**.
+
+Fuente de verdad:
+- Si se proporciona un SPEC o un CONTEXTO_NORMALIZADO, debes basarte principalmente en esos datos estructurados.
+- Si faltan datos, utiliza la descripción textual solo como apoyo (sin inventar requisitos).
 
 Principios obligatorios:
 - Asume implementación directa, sin burocracia corporativa.
 - No asumas configuración avanzada de red, VPC, IAM granular ni hardening.
-- Cloud Run básico con despliegue estándar NO debe considerarse arquitectura compleja.
-- ADC con Service Account estándar NO debe considerarse autenticación compleja.
 - No incluyas optimizaciones enterprise ni arquitectura futura.
 
 Referencia orientativa realista (Senior):
@@ -70,8 +56,6 @@ Referencia orientativa realista (Senior):
 - Integración externa simple (SDK oficial): 3–6h
 - Deploy cloud básico: 1–3h
 - CRUD con base de datos simple: 6–10h
-
-Si no hay persistencia ni autenticación compleja, el total Senior raramente debería superar 16–20h.
 
 Devuelve ÚNICAMENTE JSON válido con esta estructura:
 
@@ -90,164 +74,317 @@ No añadas texto fuera del JSON.
 
 
 # ==========================================================
-# FUNCIÓN PRINCIPAL
+# CONFIGURACIÓN (evitar números mágicos)
 # ==========================================================
 
-def calcular_estimacion_llm(
-    descripcion_proyecto: str,
-    modo: str | None,
-    tiempo_real_scopeguardian_horas: float,
-    generable: bool = True,
-) -> EstimacionEsfuerzo:
 
-    # ======================================================
-    # PASO 1: EXTRACCIÓN DE MÉTRICAS ESTRUCTURALES (LLM)
-    # ======================================================
+@dataclass(frozen=True)
+class ParametrosEstimacion:
+    """Parámetros de tuning para mantener estabilidad y mantenibilidad.
 
-    prompt_metricas = f"""
-{PROMPT_EXTRACCION_METRICAS}
+    Nota: Aunque el LLM estime, estos parámetros actúan como guardrails.
+    """
 
-Descripción técnica de la PoC:
+    # LLM / parsing
+    max_tokens_estimacion: int = 450
 
-{descripcion_proyecto}
-"""
+    # Guardrails / ajustes
+    factor_escenario_simple: float = 0.9
 
-    contenido_metricas = chat_completion_json(
-        prompt=prompt_metricas,
-        system="Responde únicamente con JSON válido.",
-        temperature=0.0,
-        max_tokens=300,
-        fase="estimacion",
+    # Fallbacks (si el LLM falla o devuelve valores no válidos)
+    fallback_junior_horas: float = 24.0
+    fallback_senior_horas: float = 12.0
+    fallback_complejidad: str = "MEDIA"
+
+    # Guardrails mínimos
+    min_junior_horas: float = 8.0
+    min_senior_horas: float = 4.0
+
+    # Márgenes de incertidumbre
+    margen_generable: float = 0.15
+    margen_no_generable: float = 0.25
+
+    # Porcentaje máximo de ahorro mostrado
+    max_ahorro_pct: float = 90.0
+
+    # Límites máximos senior por complejidad (para evitar outliers)
+    limites_senior_por_complejidad: Mapping[str, int] = field(
+        default_factory=lambda: {
+            "BAJA": 14,
+            "MEDIA": 32,
+            "ALTA": 70,
+            "CRITICA": 140,
+        }
     )
 
+
+PARAMETROS_ESTIMACION = ParametrosEstimacion()
+
+
+_ESTIMACION_JSON_FALLBACK: dict[str, Any] = {
+    "junior_horas": PARAMETROS_ESTIMACION.fallback_junior_horas,
+    "senior_horas": PARAMETROS_ESTIMACION.fallback_senior_horas,
+    "complejidad": PARAMETROS_ESTIMACION.fallback_complejidad,
+}
+
+
+def _extraer_json_objeto(texto: str) -> str:
+    """Extrae el primer objeto JSON de un texto.
+
+    Robustece el parseo ante respuestas del LLM con:
+    - fences ```json ... ```
+    - texto antes/después del JSON
+    """
+    t = texto.strip()
+
+    # Eliminar fences simples
+    if t.startswith("```"):
+        lines = t.splitlines()
+        # quita primera y última línea si parecen fences
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        t = "\n".join(lines).strip()
+
+    start = t.find("{")
+    end = t.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return texto
+    return t[start : end + 1]
+
+
+def _parse_json_or_fallback(raw: Any, fallback: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(raw, str) or not raw.strip():
+        return dict(fallback)
+
+    candidato = _extraer_json_objeto(raw)
     try:
-        metricas = json.loads(contenido_metricas)
+        parsed = json.loads(candidato)
     except Exception:
-        metricas = {
-            "num_endpoints": 1,
-            "num_integraciones_externas": 1,
-            "requiere_autenticacion_compleja": False,
-            "requiere_persistencia": False,
-            "requiere_despliegue_cloud": False,
-            "complejidad_global": "MEDIA",
-        }
+        return dict(fallback)
+    return parsed if isinstance(parsed, dict) else dict(fallback)
 
-    # ======================================================
-    # PASO 2: ESTIMACIÓN BASADA EN MÉTRICAS (LLM)
-    # ======================================================
 
-    # NORMALIZACIÓN EXPLÍCITA DE MÉTRICAS (VERSIÓN ELEGANTE)
 
-    def _safe_int(value: object, default: int = 0) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
 
-    num_endpoints = _safe_int(metricas.get("num_endpoints"))
-    num_integraciones = _safe_int(metricas.get("num_integraciones_externas"))
+def _modo_a_instruccion(modo: str | None) -> str:
+    """
+    Añade contexto operativo al prompt para reducir ambigüedad sin meter heurísticas duras.
+    """
+    if not modo:
+        return "Modo: (no especificado). Estima en base al alcance descrito/estructurado."
 
-    requiere_auth = bool(metricas.get("requiere_autenticacion_compleja", False))
-    requiere_persistencia = bool(metricas.get("requiere_persistencia", False))
-    requiere_cloud = bool(metricas.get("requiere_despliegue_cloud", False))
+    modo_upper = modo.upper()
+    if modo_upper == "ASESOR":
+        return (
+            "Modo: ASESOR. NO hay código generado. Estima el esfuerzo humano para implementar la PoC "
+            "descrita por el usuario, usando el contexto/spec como fuente de verdad."
+        )
+    if modo_upper == "PARCIAL":
+        return (
+            "Modo: PARCIAL. Puede haber alcance parcial. Estima el esfuerzo humano para implementar el SPEC "
+            "y completar los elementos típicamente necesarios para una PoC funcional (sin suposiciones enterprise)."
+        )
+    if modo_upper == "COMPLETO":
+        return (
+            "Modo: COMPLETO. Se pretende implementar el SPEC completo como PoC funcional. Estima el esfuerzo humano "
+            "para construir lo definido en el SPEC."
+        )
 
-    complejidad_global = metricas.get("complejidad_global")
-    if not isinstance(complejidad_global, str):
-        complejidad_global = "MEDIA"
+    return f"Modo: {modo_upper}. Estima en base al alcance descrito/estructurado."
 
-    prompt_estimacion = f"""
+
+def _to_json_block(label: str, data: Optional[Mapping[str, Any]]) -> str:
+    if not data:
+        return f"{label}:\n(no disponible)\n"
+    try:
+        payload = json.dumps(data, ensure_ascii=False)
+    except Exception:
+        payload = str(data)
+    return f"{label}:\n{payload}\n"
+
+
+def _build_prompt_estimacion(
+    *,
+    descripcion_proyecto: str,
+    modo: str | None,
+    metricas: Optional[Mapping[str, Any]],
+    spec: Optional[Mapping[str, Any]],
+    contexto_normalizado: Optional[Mapping[str, Any]],
+) -> str:
+    metricas_block = ""
+    if metricas:
+        metricas_block = _to_json_block("MÉTRICAS ESTRUCTURALES (resumen, si están presentes)", metricas)
+
+    return f"""
 {PROMPT_ESTIMACION_ESTRUCTURADA}
 
-Métricas estructurales detectadas:
-- Endpoints: {num_endpoints}
-- Integraciones externas: {num_integraciones}
-- Autenticación compleja: {requiere_auth}
-- Persistencia: {requiere_persistencia}
-- Despliegue cloud: {requiere_cloud}
-- Complejidad global: {complejidad_global}
-"""
+INSTRUCCIÓN OPERATIVA:
+{_modo_a_instruccion(modo)}
+
+{_to_json_block("SPEC (FUENTE DE VERDAD, si está presente)", spec)}
+{_to_json_block("CONTEXTO_NORMALIZADO (FUENTE DE VERDAD, si está presente)", contexto_normalizado)}
+{metricas_block}
+DESCRIPCIÓN (solo apoyo si falta detalle en spec/contexto):
+{descripcion_proyecto}
+""".strip()
+
+
+def _estimar_horas_desde_inputs(
+    *,
+    descripcion_proyecto: str,
+    modo: str | None,
+    metricas: Optional[Mapping[str, Any]] = None,
+    spec: Optional[Mapping[str, Any]] = None,
+    contexto_normalizado: Optional[Mapping[str, Any]] = None,
+) -> tuple[float, float, str]:
+    """
+    Estima horas con UNA llamada LLM, usando inputs estructurados cuando existan.
+    - Si hay spec/contexto_normalizado, se priorizan como fuente de verdad.
+    - `metricas` se usa como fallback estructurado si se aporta.
+    """
+    prompt_estimacion = _build_prompt_estimacion(
+        descripcion_proyecto=descripcion_proyecto,
+        modo=modo,
+        metricas=metricas,
+        spec=spec,
+        contexto_normalizado=contexto_normalizado,
+    )
 
     contenido_estimacion = chat_completion_json(
         prompt=prompt_estimacion,
         system="Responde únicamente con JSON válido.",
         temperature=0.0,
-        max_tokens=400,
+        max_tokens=PARAMETROS_ESTIMACION.max_tokens_estimacion,
         fase="estimacion",
     )
 
+    data = _parse_json_or_fallback(contenido_estimacion, _ESTIMACION_JSON_FALLBACK)
+
     try:
-        data = json.loads(contenido_estimacion)
         junior = float(data.get("junior_horas", 0))
-        senior = float(data.get("senior_horas", 0))
-        complejidad = data.get("complejidad", "MEDIA")
     except Exception:
-        junior = 24.0
-        senior = 12.0
-        complejidad = "MEDIA"
+        junior = PARAMETROS_ESTIMACION.fallback_junior_horas
+    try:
+        senior = float(data.get("senior_horas", 0))
+    except Exception:
+        senior = PARAMETROS_ESTIMACION.fallback_senior_horas
 
-    # ------------------------------------------------------
-    # VALIDACIÓN POST-LLM: evitar estimaciones irreales (0h)
-    # ------------------------------------------------------
+    complejidad = data.get("complejidad", "MEDIA")
+    if not isinstance(complejidad, str):
+        complejidad = PARAMETROS_ESTIMACION.fallback_complejidad
 
+    return junior, senior, complejidad
+
+
+def _sanitizar_horas_estimadas(*, junior: float, senior: float, num_integraciones: int) -> tuple[float, float]:
     if junior <= 0:
-        # fallback razonable pero manteniendo prioridad del LLM
-        junior = max(8.0, num_endpoints * 2.5 + num_integraciones * 4.0)
+        junior = max(PARAMETROS_ESTIMACION.min_junior_horas, 2.5 + num_integraciones * 4.0)
 
     if senior <= 0:
-        senior = max(4.0, num_endpoints * 1.5 + num_integraciones * 3.0)
+        senior = max(PARAMETROS_ESTIMACION.min_senior_horas, 1.5 + num_integraciones * 3.0)
 
-    # ======================================================
-    # NORMALIZACIÓN Y LÍMITES RAZONABLES (AJUSTE FINO)
-    # ======================================================
+    return junior, senior
 
-    limites_senior = {
-        "BAJA": 14,
-        "MEDIA": 32,
-        "ALTA": 70,
-        "CRITICA": 140,
-    }
 
-    limite = limites_senior.get(complejidad, 32)
+def _aplicar_clamps_por_complejidad(*, junior: float, senior: float, complejidad: str) -> tuple[float, float]:
+    limite = PARAMETROS_ESTIMACION.limites_senior_por_complejidad.get(
+        complejidad, PARAMETROS_ESTIMACION.limites_senior_por_complejidad["MEDIA"]
+    )
 
     senior = min(senior, limite)
     junior = min(junior, limite * 2)
+    return junior, senior
 
-    # Ajuste adicional para escenarios simples sin persistencia ni auth compleja
-    if (
-        not requiere_persistencia
-        and not requiere_auth
-        and num_integraciones <= 1
-    ):
-        senior *= 0.9
-        junior *= 0.9
 
-    # Margen mayor si no es generable (más incertidumbre)
-    margen = 0.15 if generable else 0.25
+def _aplicar_ajustes_escenario_simple(
+    *, junior: float, senior: float, requiere_persistencia: bool, requiere_auth: bool, num_integraciones: int
+) -> tuple[float, float]:
+    if not requiere_persistencia and not requiere_auth and num_integraciones <= 1:
+        junior *= PARAMETROS_ESTIMACION.factor_escenario_simple
+        senior *= PARAMETROS_ESTIMACION.factor_escenario_simple
+    return junior, senior
 
-    junior_min = junior * (1 - margen)
-    junior_max = junior * (1 + margen)
-    senior_min = senior * (1 - margen)
-    senior_max = senior * (1 + margen)
 
-    # ======================================================
-    # PROTECCIÓN CONTRA DIVISIÓN POR CERO
-    # ======================================================
+def _calcular_rangos(*, junior: float, senior: float, generable: bool) -> tuple[float, float, float, float]:
+    margen = PARAMETROS_ESTIMACION.margen_generable if generable else PARAMETROS_ESTIMACION.margen_no_generable
+    return (
+        junior * (1 - margen),
+        junior * (1 + margen),
+        senior * (1 - margen),
+        senior * (1 + margen),
+    )
 
-    if junior > 0:
-        ahorro_vs_junior = min(
-            90.0,
-            max(0.0, (junior - tiempo_real_scopeguardian_horas) / junior * 100),
-        )
-    else:
-        ahorro_vs_junior = 0.0
 
-    if senior > 0:
-        ahorro_vs_senior = min(
-            90.0,
-            max(0.0, (senior - tiempo_real_scopeguardian_horas) / senior * 100),
-        )
-    else:
-        ahorro_vs_senior = 0.0
+def _aplicar_limites_y_margen(
+    *,
+    junior: float,
+    senior: float,
+    complejidad: str,
+    requiere_persistencia: bool,
+    requiere_auth: bool,
+    num_integraciones: int,
+    generable: bool,
+) -> tuple[float, float, float, float]:
+    junior, senior = _sanitizar_horas_estimadas(junior=junior, senior=senior, num_integraciones=num_integraciones)
+    junior, senior = _aplicar_clamps_por_complejidad(junior=junior, senior=senior, complejidad=complejidad)
+    junior, senior = _aplicar_ajustes_escenario_simple(
+        junior=junior,
+        senior=senior,
+        requiere_persistencia=requiere_persistencia,
+        requiere_auth=requiere_auth,
+        num_integraciones=num_integraciones,
+    )
+    return _calcular_rangos(junior=junior, senior=senior, generable=generable)
+
+
+def _calcular_ahorro(*, estimado: float, real: float) -> float:
+    if estimado <= 0:
+        return 0.0
+    return min(
+        PARAMETROS_ESTIMACION.max_ahorro_pct,
+        max(0.0, (estimado - real) / estimado * 100),
+    )
+
+
+def calcular_estimacion_esfuerzo(
+    descripcion_proyecto: str,
+    modo: str | None,
+    tiempo_real_scopeguardian_horas: float,
+    generable: bool = True,
+    *,
+    spec: Optional[Mapping[str, Any]] = None,
+    contexto_normalizado: Optional[Mapping[str, Any]] = None,
+) -> EstimacionEsfuerzo:
+    # Invariante del pipeline: en esta fase siempre hay input estructurado.
+    # Se conserva `descripcion_proyecto` solo como apoyo por si faltan detalles finos.
+    junior, senior, complejidad = _estimar_horas_desde_inputs(
+        descripcion_proyecto=descripcion_proyecto,
+        modo=modo,
+        metricas=None,
+        spec=spec,
+        contexto_normalizado=contexto_normalizado,
+    )
+
+    # Guardrails: sin métricas estructurales legacy, aplicamos valores conservadores.
+    # (Se mantiene el comportamiento de clamps/márgenes sin dependencia de extracción previa).
+    num_integraciones = 1
+    requiere_auth = False
+    requiere_persistencia = False
+
+    junior_min, junior_max, senior_min, senior_max = _aplicar_limites_y_margen(
+        junior=junior,
+        senior=senior,
+        complejidad=complejidad,
+        requiere_persistencia=requiere_persistencia,
+        requiere_auth=requiere_auth,
+        num_integraciones=num_integraciones,
+        generable=generable,
+    )
+
+    ahorro_vs_junior = _calcular_ahorro(estimado=junior, real=tiempo_real_scopeguardian_horas)
+    ahorro_vs_senior = _calcular_ahorro(estimado=senior, real=tiempo_real_scopeguardian_horas)
 
     return EstimacionEsfuerzo(
         junior_min=round(junior_min, 1),
@@ -258,37 +395,3 @@ Métricas estructurales detectadas:
         ahorro_vs_junior=round(ahorro_vs_junior, 1),
         ahorro_vs_senior=round(ahorro_vs_senior, 1),
     )
-
-
-# ==========================================================
-# MARKDOWN
-# ==========================================================
-
-def generar_bloque_markdown(estimacion: EstimacionEsfuerzo) -> str:
-    # ------------------------------------------------------
-    # Formateo inteligente del tiempo de PoC-it
-    # ------------------------------------------------------
-    horas = estimacion.horas_scopeguardian
-
-    if horas < 1:
-        total_segundos = int(horas * 3600)
-        minutos = total_segundos // 60
-        segundos = total_segundos % 60
-        tiempo_pocit = f"{minutos} min {segundos} s (medido)"
-    else:
-        tiempo_pocit = f"{horas} horas (medido)"
-
-    return f"""
-## Estimación comparativa de esfuerzo
-
-| Perfil | Tiempo estimado |
-|--------|-----------------|
-| Junior | {estimacion.junior_min} – {estimacion.junior_max} horas |
-| Senior | {estimacion.senior_min} – {estimacion.senior_max} horas |
-| PoC-it | {tiempo_pocit} |
-
-### Ahorro estimado
-
-- Reducción frente a Junior: {estimacion.ahorro_vs_junior}%  
-- Reducción frente a Senior: {estimacion.ahorro_vs_senior}%  
-""".strip()
