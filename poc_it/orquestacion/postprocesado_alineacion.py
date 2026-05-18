@@ -29,6 +29,8 @@ def postprocesar_alineacion_por_pytest(
     try:
         max_repairs = int(os.getenv("POSTPROCESADO_MAX_REPAIRS", "2"))
 
+        last_signature: str = ""
+
         for attempt in range(max_repairs + 1):
             issues: list[AlignmentIssue] = []
 
@@ -43,6 +45,17 @@ def postprocesar_alineacion_por_pytest(
                     )
                     if p.returncode != 0:
                         out = (p.stdout or "") + "\n" + (p.stderr or "")
+                        # Circuit breaker: si pytest falla con el MISMO output de forma repetida,
+                        # no tiene sentido seguir re-parcheando: suele llevar a loops de regeneración
+                        # indirectos y consumo de tokens.
+                        signature = out.strip()[:1200]
+                        if signature and signature == last_signature:
+                            logger.info(
+                                "[POST] Pytest vuelve a fallar con la misma firma; se corta post-procesado para evitar loop."
+                            )
+                            break
+                        last_signature = signature
+
                         issues.append(
                             AlignmentIssue(
                                 code="PYTEST_FAILURE",
