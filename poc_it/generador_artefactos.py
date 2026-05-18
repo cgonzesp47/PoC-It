@@ -818,36 +818,133 @@ def _sanitizar_restrictions(restrictions: List[dict]) -> List[dict]:
     """
     Limpieza defensiva y GENÉRICA de restrictions (enforcement-ready).
 
-    Política acordada:
-    - Mantener `must_not_contain` (prohibiciones): suelen ser universales y poco frágiles.
-    - Eliminar `must_contain_any` cuando la regla aplica a un scope overbroad ("*" o "*.py"),
-      ya que fuerza tokens específicos en TODOS los módulos (falsos positivos masivos).
-    - Mantener `must_contain_any` solo si `applies_to` es específico (archivo/carpeta).
+    Objetivo:
+    - Mantener restricciones útiles (evitar alucinaciones claras).
+    - Reducir falsos positivos que bloquean PoCs realistas.
+
+    Convenciones:
+    - Cada restriction puede incluir opcionalmente:
+      - severity: "BLOCK" | "WARN"
+      - kind: "SECURITY" | "STRUCTURAL" | "CONTRACT" | "QUALITY"
+    - Si no viene severity, la inferimos por TIPO (kind) y por heurísticas de riesgo
+      (sin mirar palabras clave específicas de una PoC concreta).
     """
     if not isinstance(restrictions, list):
         return []
 
+    def _norm_patterns(applies_to_val: Any) -> List[str]:
+        if not isinstance(applies_to_val, list):
+            return []
+        return [str(x).replace("\\", "/").strip() for x in applies_to_val if str(x).strip()]
+
     def _is_overbroad(applies_to_val: Any) -> bool:
-        if not isinstance(applies_to_val, list) or not applies_to_val:
+        """
+        Overbroad = aplica a "todo" o a scopes tan amplios que hacen `must_contain_any` frágil.
+        Ejemplos típicos:
+        - ["*"], ["*.py"]
+        - ["app/*"], ["app/"], ["app/*.py"]
+        - cualquier lista que incluya "*" o "*.py"
+        """
+        norm = _norm_patterns(applies_to_val)
+        if not norm:
             return True
-        norm = [str(x).strip() for x in applies_to_val if str(x).strip()]
-        return norm == ["*"] or norm == ["*.py"] or "*" in norm
+        if "*" in norm or "*.py" in norm:
+            return True
+        if any(p in ("app/*", "app/", "app/*.py") for p in norm):
+            return True
+        return False
+
+    def _infer_kind(rr: dict) -> str:
+        """
+        Clasificación de tipo (agnóstica):
+        - SECURITY: evitar secretos/credenciales embebidas
+        - STRUCTURAL: invariantes del generador (paths/imports/routers), baja tolerancia al incumplimiento
+        - CONTRACT: invariantes del contrato (request/response/endpoints) pero suelen ser verificables por otras vías
+        - QUALITY: estilo/calidad/mantenibilidad (no deben bloquear generación)
+        """
+        kind = str(rr.get("kind") or "").strip().upper()
+        if kind in ("SECURITY", "STRUCTURAL", "CONTRACT", "QUALITY"):
+            return kind
+
+        must_not = [str(x).lower() for x in (rr.get("must_not_contain") or []) if str(x).strip()]
+        must_any = [str(x).lower() for x in (rr.get("must_contain_any") or []) if str(x).strip()]
+
+        # Heurística genérica de secretos (alto riesgo real)
+        high_risk = ("password", "private_key", "api_key", "apikey", "secret", "token=")
+        if any(any(t in p for t in high_risk) for p in (must_not + must_any)):
+            return "SECURITY"
+
+        # must_contain_any suele ser "contractual/guía", no estructural
+        if must_any:
+            return "CONTRACT"
+
+        # default conservador: QUALITY (no bloquear)
+        return "QUALITY"
+
+    def _inferir_severidad(rr: dict) -> str:
+        """
+        Política por tipo:
+        - SECURITY -> BLOCK (evitar credenciales/secretos en código)
+        - STRUCTURAL -> BLOCK (si se usan para invariantes internas del generador)
+        - CONTRACT -> WARN (preferimos no bloquear: hay otras validaciones deterministas)
+        - QUALITY -> WARN
+        """
+        kind = _infer_kind(rr)
+        if kind in ("SECURITY", "STRUCTURAL"):
+            return "BLOCK"
+        return "WARN"
 
     cleaned: List[dict] = []
     for r in restrictions:
         if not isinstance(r, dict):
             continue
 
-        applies_to = r.get("applies_to")
-        must_any = r.get("must_contain_any") or []
+        rr = dict(r)
 
-        # Si es overbroad, anulamos must_contain_any (pero conservamos must_not_contain).
+        # Normalización defensiva
+        applies_to = rr.get("applies_to")
+        must_any = rr.get("must_contain_any") or []
+        must_not = rr.get("must_not_contain") or []
+
+        if not isinstance(must_any, list):
+            must_any = [str(must_any)]
+        if not isinstance(must_not, list):
+            must_not = [str(must_not)]
+        rr["must_contain_any"] = must_any
+        rr["must_not_contain"] = must_not
+
+        rr["kind"] = _infer_kind(rr)
+
+        # Severidad: si no viene, inferir por tipo (kind)
+        severity = str(rr.get("severity") or "").strip().upper()
+        if severity not in ("BLOCK", "WARN"):
+            severity = _inferir_severidad(rr)
+        rr["severity"] = severity
+
+        def _looks_api_specific_must_any(patterns: List[str]) -> bool:
+            """
+            must_contain_any demasiado específico a una API/implementación concreta.
+            Ejemplo: exigir exactamente os.getenv('DATABASE_URL') cuando también sería válido
+            usar Settings, os.environ.get, etc.
+            """
+            joined = " ".join(str(x) for x in patterns)
+            return "os.getenv(" in joined or "os.environ[" in joined or "os.environ.get(" in joined
+
+        # must_contain_any es frágil si aplica a demasiado scope:
+        # - lo anulamos
+        # - y degradamos severidad a WARN
         if must_any and _is_overbroad(applies_to):
-            rr = dict(r)
             rr["must_contain_any"] = []
-            cleaned.append(rr)
-        else:
-            cleaned.append(r)
+            rr["severity"] = "WARN"
+            rr["kind"] = "QUALITY"
+
+        # aunque el scope sea específico, si must_contain_any exige una API concreta, no bloqueamos
+        if must_any and _looks_api_specific_must_any(must_any):
+            rr["severity"] = "WARN"
+            if rr.get("kind") == "STRUCTURAL":
+                rr["kind"] = "CONTRACT"
+
+        cleaned.append(rr)
 
     return cleaned
 
@@ -1033,20 +1130,163 @@ REGLA (GENÉRICA) - EVITAR RESTRICCIONES INÚTILES/FRÁGILES
             return _sanitizar_restrictions(cleaned)
     return []
 
+def _aplicar_patch_en_memoria(
+    files_generados: List[Dict[str, str]],
+    patch_files: List[Dict[str, str]],
+) -> None:
+    """
+    Aplica un patch (lista de {"path","content"}) sobre `files_generados` EN MEMORIA.
+    Regla conservadora: solo sobrescribe si el nuevo contenido no está vacío.
+    """
+    if not isinstance(patch_files, list) or not patch_files:
+        return
+
+    idx = {(f.get("path") or "").replace("\\", "/"): i for i, f in enumerate(files_generados) if isinstance(f, dict)}
+    for f in patch_files:
+        if not isinstance(f, dict):
+            continue
+        p = (f.get("path") or "").replace("\\", "/")
+        c = f.get("content") or ""
+        if not p or not c.strip():
+            continue
+        if p in idx:
+            files_generados[idx[p]]["content"] = c
+        else:
+            files_generados.append({"path": p, "content": c})
+
+
+def _extraer_errores_por_archivo(errores: List[str]) -> Dict[str, List[str]]:
+    """
+    Agrupa errores tipo "<path>: ..." por path.
+    """
+    out: Dict[str, List[str]] = {}
+    for e in errores or []:
+        s = str(e)
+        if ":" not in s:
+            continue
+        p, rest = s.split(":", 1)
+        p = p.strip().replace("\\", "/")
+        if not p:
+            continue
+        out.setdefault(p, []).append(rest.strip())
+    return out
+
+
+def _seleccionar_error_bloqueante(errores: List[str]) -> Optional[Tuple[str, str]]:
+    """
+    Selecciona un único error "prioritario" para reparación atómica.
+    Devuelve (path, mensaje) si puede; si no, None.
+    """
+    by_file = _extraer_errores_por_archivo(errores)
+
+    # Heurística simple y estable:
+    # - priorizar archivos de config/DB (suelen disparar security/env)
+    # - luego endpoints/services
+    preferred_prefixes = ("app/config/", "app/db", "app/settings", "app/endpoints/", "app/services/")
+    for pref in preferred_prefixes:
+        for p, msgs in by_file.items():
+            if p.startswith(pref) or p == "app/db.py":
+                return p, msgs[0]
+
+    for p, msgs in by_file.items():
+        return p, msgs[0]
+    return None
+
+
+def _build_repair_prompt_por_restriccion(
+    *,
+    spec: dict,
+    full_errors: List[str],
+    target_error_path: str,
+    target_error_msg: str,
+    repair_paths: List[str],
+    files_generados: List[Dict[str, str]],
+) -> str:
+    """
+    Prompt de repair "atómico": atacar 1 error/restricción a la vez.
+    """
+    by_path = {(f.get("path") or "").replace("\\", "/"): (f.get("content") or "") for f in files_generados if f.get("path")}
+    target_src = by_path.get(target_error_path, "")
+
+    # limitar tamaño del source para no quemar tokens (pero mantener suficiente contexto)
+    target_lines = target_src.splitlines()
+    if len(target_lines) > 260:
+        target_src = "\n".join(target_lines[:260]) + "\n# ... (truncado)"
+
+    # Acotar a archivos implicados: el target + cualquier otro que guardrails haya marcado
+    # (pero manteniendo el repair atómico en el target como objetivo principal)
+    scoped_paths = [p for p in dict.fromkeys([target_error_path] + (repair_paths or [])).keys() if p]
+
+    # Extraer la restriction relevante del SPEC (best-effort, por id textual en el error)
+    restrictions = spec.get("restrictions", [])
+    rid = None
+    m = re.search(r"viola restriction '([^']+)'", target_error_msg or "")
+    if m:
+        rid = m.group(1).strip()
+
+    restriction_obj = None
+    if rid and isinstance(restrictions, list):
+        for r in restrictions:
+            if isinstance(r, dict) and str(r.get("id") or "").strip() == rid:
+                restriction_obj = r
+                break
+
+    restriction_block = json.dumps(restriction_obj, ensure_ascii=False) if restriction_obj else "(no disponible)"
+
+    return f"""
+TAREA
+Corrige UN ÚNICO incumplimiento bloqueante de guardrails del proyecto, con cambios mínimos y verificables.
+
+ERROR OBJETIVO (PRIORITARIO)
+- Archivo: {target_error_path}
+- Error: {target_error_msg}
+
+RESTRICCIÓN (si está disponible en SPEC.restrictions)
+{restriction_block}
+
+CONTEXTO
+- No re-arquitectures el proyecto.
+- No añadas endpoints ni cambies rutas/métodos del SPEC.
+- No añadas dependencias nuevas salvo que el propio SPEC lo exija.
+- Enfócate en eliminar el patrón prohibido o cumplir el patrón requerido de ESTA restricción.
+- Si la restricción es must_not_contain: el/los patrones NO deben aparecer en el archivo tras el cambio.
+
+CÓDIGO ACTUAL (fragmento) de {target_error_path}:
+```python
+{target_src}
+```
+
+ARCHIVOS QUE PUEDES MODIFICAR (paths exactos; devuelve SOLO de esta lista):
+{json.dumps(scoped_paths, ensure_ascii=False)}
+
+TODOS LOS ERRORES DE GUARDRAILS (para contexto; NO intentes arreglarlos todos a la vez):
+- {chr(10).join(full_errors)}
+
+SALIDA (EXCLUSIVAMENTE JSON válido):
+{{ "files": [{{"path":"...", "content":"..."}}] }}
+
+REGLAS
+- Devuelve SOLO archivos dentro de la lista permitida.
+- El contenido debe ser completo (no parcial).
+- No incluyas texto fuera del JSON.
+""".strip()
+
+
 def _guardrails_por_spec(
     spec: dict,
     files_generados: List[Dict[str, str]],
-) -> Tuple[bool, List[str], List[str]]:
+) -> Tuple[bool, List[str], List[str], List[str]]:
     """
     Guardrails genéricos basados en SPEC (sin conocimiento de dominio):
     - No endpoints extra (routers incluidos y decorators deben corresponder al SPEC)
     - Enforce request.type json vs multipart (UploadFile/File/python-multipart)
     - Health determinista si request.type=none y response.json_example fijo
     - Logging obligatorio: si hay 'except Exception' debe haber logger.exception en el mismo fichero
-    - Enforce restricciones declaradas en SPEC.restrictions
-    Devuelve: (ok, errores, paths_a_reparar)
+    - Enforce restricciones declaradas en SPEC.restrictions (con severidad BLOCK/WARN)
+    Devuelve: (ok, errores_bloqueantes, paths_a_reparar, warnings)
     """
     errores: List[str] = []
+    warnings: List[str] = []
     reparar: Set[str] = set()
 
     # --- índice path->content ---
@@ -1133,12 +1373,17 @@ def _guardrails_por_spec(
                 reparar.add("requirements.txt")
 
     # --- 3) Logging obligatorio: except Exception -> logger.exception ---
+    # Punto medio: WARNING por defecto; BLOCK solo en endpoints/servicios donde la trazabilidad es crítica.
     for p, src in by_path.items():
         if not p.endswith(".py"):
             continue
         if "except Exception" in src and "logger.exception" not in src:
-            errores.append(f"Falta logging obligatorio (logger.exception) en: {p}")
-            reparar.add(p)
+            msg = f"Falta logging obligatorio (logger.exception) en: {p}"
+            if p.startswith(("app/endpoints/", "app/services/")):
+                errores.append(msg)
+                reparar.add(p)
+            else:
+                warnings.append(msg)
 
     # --- 4) Respuesta coherente con json_example (GENÉRICO / PRAGMÁTICO) ---
     # Problema con la regla anterior:
@@ -1226,10 +1471,16 @@ def _guardrails_por_spec(
         for r in restrictions:
             if not isinstance(r, dict):
                 continue
+
             rid = str(r.get("id") or "restriction").strip()
             applies_to = r.get("applies_to")
             if not isinstance(applies_to, list) or not applies_to:
                 applies_to = ["*"]
+
+            severity = str(r.get("severity") or "").strip().upper()
+            if severity not in ("BLOCK", "WARN"):
+                # default conservador
+                severity = "BLOCK"
 
             must_not = r.get("must_not_contain") or []
             must_any = r.get("must_contain_any") or []
@@ -1248,19 +1499,25 @@ def _guardrails_por_spec(
                     if not needle:
                         continue
                     if _needle_matches(src, str(needle)):
-                        errores.append(f"{p}: viola restriction '{rid}': contiene '{needle}'")
-                        reparar.add(p)
+                        msg = f"{p}: viola restriction '{rid}': contiene '{needle}'"
+                        if severity == "BLOCK":
+                            errores.append(msg)
+                            reparar.add(p)
+                        else:
+                            warnings.append(msg)
 
                 # must_contain_any (si se define, al menos uno debe aparecer)
                 if must_any:
                     if not any(_needle_matches(src, str(needle)) for needle in must_any):
-                        errores.append(
-                            f"{p}: viola restriction '{rid}': no contiene ninguno de {must_any}"
-                        )
-                        reparar.add(p)
+                        msg = f"{p}: viola restriction '{rid}': no contiene ninguno de {must_any}"
+                        if severity == "BLOCK":
+                            errores.append(msg)
+                            reparar.add(p)
+                        else:
+                            warnings.append(msg)
 
     ok = len(errores) == 0
-    return ok, errores, sorted(reparar)
+    return ok, errores, sorted(reparar), warnings
 
 
 # ==========================================================
@@ -1385,6 +1642,415 @@ REGLAS
 # ==========================================================
 # GENERACIÓN PRINCIPAL CON REINTENTOS
 # ==========================================================
+
+
+def _merge_files_generados(
+    base: List[Dict[str, str]],
+    patch: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """
+    Merge estable:
+    - Mantiene `base` como fuente principal.
+    - Sobrescribe solo paths presentes en `patch` con contenido no vacío.
+    - Añade paths nuevos del patch si no existían.
+    """
+    idx = {(f.get("path") or "").replace("\\", "/"): i for i, f in enumerate(base) if isinstance(f, dict)}
+    for f in patch or []:
+        if not isinstance(f, dict):
+            continue
+        p = (f.get("path") or "").replace("\\", "/")
+        c = (f.get("content") or "")
+        if not p or not c.strip():
+            continue
+        if p in idx:
+            base[idx[p]]["content"] = c
+        else:
+            base.append({"path": p, "content": c})
+    return base
+
+
+def generar_proyecto_desde_spec(
+    *,
+    spec: dict,
+    descripcion_global: str,
+    contexto_normalizado: dict | None = None,
+    intentos: int = 2,
+    files_iniciales: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    """
+    Genera/regenera código reutilizando un SPEC ya existente (fuente de verdad).
+
+    Caso de uso principal:
+    - Repair loops posteriores (runtime/tests) donde NO queremos "rebobinar" a Fase 1
+      (regenerar/alinear SPEC), sino re-generar archivos guiados por el SPEC ya validado.
+
+    Contrato:
+    - `spec` debe ser dict. Si está vacío o inválido, se delega en `generar_proyecto_completo`
+      para mantener compatibilidad (fallback conservador).
+    """
+    if not isinstance(spec, dict) or not spec:
+        return generar_proyecto_completo(
+            descripcion_global=descripcion_global,
+            contexto_normalizado=contexto_normalizado,
+            intentos=intentos,
+        )
+
+    files_plan = _completar_inits_en_files(spec.get("files", []))
+    spec["files"] = files_plan
+    allowed_paths = set(files_plan)
+
+    # mantener la misma compilación/sanitización de restricciones
+    spec["restrictions"] = _compilar_restricciones(spec, contexto_normalizado, intentos=intentos)
+
+    # (idéntico a Fase 2/3 de generar_proyecto_completo, pero sin Fase 1/1.5)
+    # Si nos pasan `files_iniciales`, actuamos en modo REPAIR incremental:
+    # - no re-generamos todo por lotes
+    # - reusamos el estado y solo intentamos reparar imports/guardrails al final
+    if isinstance(files_iniciales, list) and files_iniciales:
+        files_generados = [
+            {"path": (f.get("path") or "").replace("\\", "/"), "content": (f.get("content") or "")}
+            for f in files_iniciales
+            if isinstance(f, dict) and f.get("path")
+        ]
+
+        # Fase 3 (misma lógica final) sobre el estado existente
+        if not _validar_proyecto(files_generados):
+            return {"files": []}
+
+        ok_imports, e_imports = _validar_imports_internos(files_generados, allowed_paths)
+        if not ok_imports:
+            repair_paths: List[str] = []
+            for err in e_imports:
+                if ":" in err:
+                    p = err.split(":", 1)[0].strip()
+                    if p and p not in repair_paths:
+                        repair_paths.append(p)
+                m = re.search(r"\((app\/[^\)]+\.py)\)", str(err))
+                if m:
+                    target_path = m.group(1).replace("\\", "/").strip()
+                    if target_path and target_path not in repair_paths:
+                        repair_paths.append(target_path)
+
+            if not repair_paths:
+                return {"files": []}
+
+            prompt_fix_imports = f"""
+Hay errores de imports internos (coherencia entre módulos) que impiden ejecutar el proyecto.
+Corrige SOLO estos archivos y ninguno más.
+
+Errores:
+- {chr(10).join(e_imports)}
+
+Archivos a corregir (paths exactos):
+{json.dumps(repair_paths, ensure_ascii=False)}
+
+SPEC (fuente de verdad):
+{json.dumps(spec, ensure_ascii=False)}
+
+SALIDA (JSON):
+{{ "files": [{{"path":"...", "content":"..."}}] }}
+
+REGLAS:
+- Devuelve SOLO los archivos listados.
+- No inventes nuevos paths.
+- Si un archivo hace `from app.x.y import SIMBOLO`, entonces SIMBOLO debe existir realmente en el módulo importado.
+- Si la dependencia importada NO existe en spec.files, elimina ese import y reestructura el código para no necesitarla.
+- Mantén los endpoints exactamente como en el SPEC (mismos paths y métodos).
+- Si hay try/except: incluye logging obligatorio con logger.exception().
+"""
+            raw = chat_completion_json(
+                prompt=prompt_fix_imports,
+                system=None,
+                temperature=0.1,
+                max_tokens=1600,
+                fase="generacion_codigo",
+            )
+            data = _extraer_json_tolerante(raw) or {}
+            cand = data.get("files")
+            if isinstance(cand, list) and cand:
+                _aplicar_patch_en_memoria(files_generados, cand)
+
+                ok_imports2, e_imports2 = _validar_imports_internos(files_generados, allowed_paths)
+                if not ok_imports2:
+                    return {"files": []}
+            else:
+                return {"files": []}
+
+        ok_guard, e_guard, repair_paths, guard_warnings = _guardrails_por_spec(spec, files_generados)
+        if not ok_guard:
+            if not repair_paths:
+                return {"files": []}
+
+            max_guardrail_repairs = max(2, intentos)
+            for _ in range(max_guardrail_repairs):
+                sel = _seleccionar_error_bloqueante(e_guard)
+                if not sel:
+                    break
+                target_path, target_msg = sel
+
+                prompt_fix = _build_repair_prompt_por_restriccion(
+                    spec=spec,
+                    full_errors=e_guard,
+                    target_error_path=target_path,
+                    target_error_msg=target_msg,
+                    repair_paths=repair_paths,
+                    files_generados=files_generados,
+                )
+
+                raw = chat_completion_json(
+                    prompt=prompt_fix,
+                    system=None,
+                    temperature=0.1,
+                    max_tokens=1600,
+                    fase="generacion_codigo",
+                )
+                data = _extraer_json_tolerante(raw) or {}
+                cand = data.get("files")
+                if isinstance(cand, list) and cand:
+                    _aplicar_patch_en_memoria(files_generados, cand)
+
+                    ok_guard, e_guard, repair_paths, _ = _guardrails_por_spec(spec, files_generados)
+                    if ok_guard:
+                        break
+                    continue
+                break
+
+            if not ok_guard:
+                return {"files": []}
+
+        return {"files": files_generados, "spec": spec}
+    lotes = _agrupar_lotes(files_plan, spec=spec)
+    lotes = sorted(
+        lotes,
+        key=lambda lote: 1
+        if any(p in ("app/main.py", "app/__init__.py") or p.startswith("app/config/") for p in lote)
+        else 0,
+    )
+
+    files_generados: List[Dict[str, str]] = []
+
+    for lote in lotes:
+        lote_set = set(lote)
+
+        contracts = spec.get("contracts", [])
+        env = spec.get("env", [])
+        dependencies = spec.get("dependencies", [])
+        restrictions = spec.get("restrictions", [])
+
+        prompt_lote = f"""
+TAREA
+Genera el CONTENIDO de los siguientes archivos de un proyecto FastAPI.
+
+INVARIANTES (COMPILABLE / IMPORTABLE)
+- Paquete raíz: app/
+- Entrypoint: app.main:app
+- Imports internos: absolutos desde app.*
+- No inventes nuevos archivos: solo los solicitados en este lote.
+- La app DEBE ser importable sin configuración externa: `python -c "import app.main"` debe funcionar aunque falten variables de entorno/credenciales.
+  - No validar credenciales ni configuración obligatoria en import-time.
+  - No instanciar clientes/servicios externos en import-time si requieren parámetros (credenciales, IDs, URLs, etc.).
+  - La creación de servicios debe ocurrir dentro de funciones/endpoints o mediante factorías lazy (dependency injection con FastAPI `Depends`).
+  - La validación de configuración debe hacerse en runtime (p.ej. al ejecutar el endpoint que la necesita).
+- Política de errores en endpoints (si este lote contiene endpoints):
+  - Captura excepciones esperables (auth/permisos/config faltante/timeouts) y mapea a `HTTPException` con `detail` estructurado:
+    - `error_code` (string corto), `message`, `hint` (si aplica)
+  - LOGGING OBLIGATORIO (para ver el error específico SIEMPRE):
+    - Define `logger = logging.getLogger(__name__)` en cada módulo de endpoint/servicio donde haya try/except.
+    - En CADA `except Exception as e`: loguea SIEMPRE con stacktrace: `logger.exception(\"<contexto>\")` antes de lanzar `HTTPException`.
+    - No hacer `except Exception` silencioso sin logging.
+  - Evita 500 genéricos por wiring (AttributeError, KeyError, TypeError): valida inputs/config en runtime y devuelve 400/401 según proceda.
+- Pydantic v2: PROHIBIDO `from pydantic import BaseSettings`.
+  - Si hay settings, usar `pydantic-settings` y patrón canónico get_settings() con lru_cache.
+- Router pattern (OBLIGATORIO):
+  - En CADA archivo `app/endpoints/*.py` debes definir EXACTAMENTE: `router = APIRouter()`
+  - Los endpoints deben declararse como `@router.get(...)` / `@router.post(...)`.
+  - `app/main.py` importará `router` desde cada endpoint y hará `app.include_router(router)`, por tanto el símbolo `router` debe existir SIEMPRE.
+  - Prohibido `from app.main import app`
+  - Prohibido `@app.get/post/...`
+- RUTAS (anti /x/x) - OBLIGATORIO:
+  - En `app/main.py` DEBES usar `app.include_router(<router>, prefix=\"\")` (prefix vacío) para todos los routers.
+  - En los archivos `app/endpoints/*.py`, los decorators DEBEN usar el path completo final.
+  - Prohibido usar prefix no vacío en `include_router` (si lo haces, se duplican rutas).
+- No incluyas texto fuera del JSON.
+- No uses bloques ```.
+
+DECISIONES / CONTRATOS DE ESTA PoC (fuente de verdad)
+- ENV esperada:
+{json.dumps(env, ensure_ascii=False)}
+- Dependencias esperadas:
+{json.dumps(dependencies, ensure_ascii=False)}
+- Contratos de comportamiento (por endpoint):
+{json.dumps(contracts, ensure_ascii=False)}
+- Restricciones ejecutables (NO NEGOCIABLES):
+{json.dumps(restrictions, ensure_ascii=False)}
+
+SPEC COMPLETO (referencia):
+{json.dumps(spec, ensure_ascii=False)}
+
+ARCHIVOS A GENERAR EN ESTE LOTE (exactos):
+{json.dumps(lote, ensure_ascii=False)}
+
+SALIDA (JSON):
+{{
+  "files": [
+    {{"path": "ruta", "content": "contenido"}}
+  ]
+}}
+
+Reglas:
+- Devuelve SOLO archivos cuyo path esté en la lista del lote.
+- Incluye el contenido completo del archivo.
+- Si el archivo es requirements.txt: debe reflejar dependencies (mínimas) y nada inventado.
+- Si el archivo es .py debe ser sintácticamente válido.
+"""
+
+        lote_files: Optional[List[Dict[str, str]]] = None
+        ultimo_raw: str = ""
+        errores_lote: List[str] = []
+
+        for intento_lote in range(max(1, intentos)):
+            raw = chat_completion_json(
+                prompt=prompt_lote,
+                system=None,
+                temperature=0.2,
+                max_tokens=2500,
+                fase="generacion_codigo",
+            )
+            ultimo_raw = raw
+            data = _extraer_json_tolerante(raw)
+            if not data:
+                continue
+            cand = data.get("files")
+            if not isinstance(cand, list) or not cand:
+                continue
+
+            cand_norm = []
+            for f in cand:
+                if not isinstance(f, dict):
+                    continue
+                p = (f.get("path") or "").replace("\\", "/")
+                if p in lote_set:
+                    cand_norm.append({"path": p, "content": f.get("content", "")})
+
+            missing = sorted(list(lote_set - {ff.get("path") for ff in cand_norm if ff.get("path")}))
+            empty = sorted([ff.get("path") for ff in cand_norm if not (ff.get("content") or "").strip()])
+            if missing or empty:
+                print(f"[DEBUG] Lote generado incompleto. Missing={missing} Empty={empty}")
+
+            empty = [p for p in empty if not str(p).endswith("/__init__.py")]
+            ok_nonempty = not missing and not empty
+            ok_paths, e_paths = _validar_paths_generados(cand_norm, lote_set)
+            ok_ast = _validar_proyecto(cand_norm)
+
+            if ok_nonempty and ok_paths and ok_ast:
+                lote_files = cand_norm
+                break
+
+            errores_lote = []
+            if not ok_nonempty:
+                for pth in missing:
+                    errores_lote.append(f"Archivo no devuelto por el modelo: {pth}")
+                for pth in empty:
+                    errores_lote.append(f"Archivo sin contenido (content vacío): {pth}")
+            if not ok_paths:
+                errores_lote.extend(e_paths)
+            if not ok_ast:
+                errores_lote.append("Fallo de sintaxis (AST) en algún archivo del lote")
+
+            if intento_lote == max(1, intentos) - 1 and missing:
+                prompt_lote = f"""
+Faltan archivos del lote y NO pueden omitirse.
+
+Devuelve EXCLUSIVAMENTE estos archivos (y ninguno más), con contenido COMPLETO (no vacío):
+{json.dumps(missing, ensure_ascii=False)}
+
+SPEC (referencia):
+{json.dumps(spec, ensure_ascii=False)}
+
+SALIDA (JSON):
+{{
+  "files": [
+    {{"path": "ruta", "content": "contenido"}}
+  ]
+}}
+
+REGLAS
+- No incluyas texto fuera del JSON.
+- Los paths deben ser exactamente los indicados.
+- No devuelvas content vacío.
+"""
+            else:
+                prompt_lote = f"""
+Hay errores en los archivos del lote. Corrige SOLO los archivos de este lote.
+
+Errores:
+- {chr(10).join(errores_lote)}
+
+REGLA CRÍTICA (from-import):
+- Si un archivo hace `from app.x.y import SIMBOLO`, entonces SIMBOLO DEBE existir realmente en `app/x/y.py`.
+- Si el símbolo no existe, tienes dos opciones válidas:
+  1) Crear/añadir ese símbolo en el módulo importado, o
+  2) Cambiar el import/código para NO requerir ese símbolo.
+- No inventes nombres como verify_token / auth_utils si el SPEC no define autenticación.
+
+SPEC:
+{json.dumps(spec, ensure_ascii=False)}
+
+Archivos del lote:
+{json.dumps(lote, ensure_ascii=False)}
+
+Respuesta anterior:
+{ultimo_raw}
+
+Devuelve nuevamente el JSON con los archivos corregidos (solo los del lote).
+"""
+
+        if not lote_files:
+            print("[DEBUG] No se pudo generar un lote válido.")
+            if errores_lote:
+                print("[DEBUG] Errores lote:", errores_lote)
+            return {"files": []}
+
+        existentes = {(f["path"].replace("\\", "/")): f for f in files_generados}
+
+        for f in lote_files:
+            pth = f["path"]
+            new_content = f.get("content") or ""
+            prev = existentes.get(pth)
+            prev_content = (prev.get("content") or "") if isinstance(prev, dict) else ""
+
+            if prev and prev_content.strip() and not new_content.strip():
+                print(
+                    f"[DEBUG] Merge: ignorando sobrescritura VACÍA de '{pth}' "
+                    f"(prev_len={len(prev_content)}, new_len={len(new_content)})"
+                )
+                continue
+
+            existentes[pth] = f
+
+        files_generados = list(existentes.values())
+
+    # -------------------------
+    # FASE 3: VALIDACIÓN FINAL
+    # -------------------------
+    if not _validar_proyecto(files_generados):
+        print("[DEBUG] Fallo AST en validación final.")
+        return {"files": []}
+
+    ok_imports, e_imports = _validar_imports_internos(files_generados, allowed_paths)
+    if not ok_imports:
+        print("[DEBUG] Fallo imports en validación final:", e_imports)
+        return {"files": []}
+
+    ok_guard, e_guard, repair_paths, guard_warnings = _guardrails_por_spec(spec, files_generados)
+    if guard_warnings:
+        print("[DEBUG] Guardrails warnings:", guard_warnings)
+
+    if not ok_guard:
+        print("[DEBUG] Fallo guardrails SPEC:", e_guard)
+        return {"files": []}
+
+    return {"files": files_generados, "spec": spec}
 
 
 def generar_proyecto_completo(
@@ -1922,47 +2588,37 @@ REGLAS:
     except Exception:
         pass
 
-    ok_guard, e_guard, repair_paths = _guardrails_por_spec(spec, files_generados)
+    ok_guard, e_guard, repair_paths, guard_warnings = _guardrails_por_spec(spec, files_generados)
+    if guard_warnings:
+        print("[DEBUG] Guardrails warnings:", guard_warnings)
+
     if not ok_guard:
         print("[DEBUG] Fallo guardrails SPEC:", e_guard)
 
-        # Repair loop: pedir SOLO los ficheros implicados
-        if repair_paths:
-            prompt_fix = f"""
-Hay desviaciones respecto al SPEC (contrato del usuario). Corrige SOLO estos archivos y ninguno más.
+        if not repair_paths:
+            return {"files": []}
 
-Errores:
-- {chr(10).join(e_guard)}
+        # Repair loop por RESTRICCIÓN (atómico):
+        # - Selecciona 1 error bloqueante
+        # - Pide al LLM un patch mínimo y verificable
+        # - Revalida y repite N veces
+        max_guardrail_repairs = max(2, intentos)
 
-Archivos a corregir (paths exactos):
-{json.dumps(repair_paths, ensure_ascii=False)}
+        for _ in range(max_guardrail_repairs):
+            sel = _seleccionar_error_bloqueante(e_guard)
+            if not sel:
+                break
+            target_path, target_msg = sel
 
-SPEC (fuente de verdad):
-{json.dumps(spec, ensure_ascii=False)}
+            prompt_fix = _build_repair_prompt_por_restriccion(
+                spec=spec,
+                full_errors=e_guard,
+                target_error_path=target_path,
+                target_error_msg=target_msg,
+                repair_paths=repair_paths,
+                files_generados=files_generados,
+            )
 
-SALIDA (JSON):
-{{ "files": [{{"path":"...", "content":"..."}}] }}
-
-REGLAS:
-- Devuelve SOLO los archivos listados.
-- Respeta el SPEC: endpoints exactos, request.type, response.json_example, restrictions, y no añadas endpoints extra.
-
-REGLA CRÍTICA request.type (GENÉRICA)
-- Si en el SPEC un endpoint tiene request.type == \"json\":
-  - El endpoint DEBE aceptar JSON (Pydantic model o Body).
-  - PROHIBIDO usar UploadFile, File(...) o Form(...).
-  - PROHIBIDO añadir python-multipart a requirements.txt.
-- Si en el SPEC un endpoint tiene request.type == \"multipart\":
-  - Debe usar UploadFile + File(...) y entonces sí puede requerir python-multipart.
-
-REGLA CRÍTICA restrictions.must_contain_any (GENÉRICA)
-- Si una restriction incluye `must_contain_any`, el código debe satisfacer al menos uno de esos patrones:
-  - Si el patrón empieza por `re:` debe cumplirse como REGEX.
-  - Si no, se evalúa como substring literal.
-- Si es más fácil, ajusta imports/calls para que coincidan con uno de los patrones.
-
-- Si hay try/except: incluye logging obligatorio con logger.exception().
-"""
             raw = chat_completion_json(
                 prompt=prompt_fix,
                 system=None,
@@ -1973,21 +2629,20 @@ REGLA CRÍTICA restrictions.must_contain_any (GENÉRICA)
             data = _extraer_json_tolerante(raw) or {}
             cand = data.get("files")
             if isinstance(cand, list) and cand:
-                # merge parche
-                patch = {(f.get("path") or "").replace("\\", "/"): (f.get("content") or "") for f in cand if isinstance(f, dict)}
-                for i, f in enumerate(files_generados):
-                    p = (f.get("path") or "").replace("\\", "/")
-                    if p in patch and patch[p].strip():
-                        files_generados[i]["content"] = patch[p]
+                _aplicar_patch_en_memoria(files_generados, cand)
 
-                # revalidar guardrails
-                ok_guard2, e_guard2, _ = _guardrails_por_spec(spec, files_generados)
-                if not ok_guard2:
-                    print("[DEBUG] Guardrails siguen fallando tras repair:", e_guard2)
-                    return {"files": []}
-            else:
-                return {"files": []}
-        else:
+                ok_guard, e_guard, repair_paths, guard_warnings = _guardrails_por_spec(spec, files_generados)
+                if guard_warnings:
+                    print("[DEBUG] Guardrails warnings:", guard_warnings)
+                if ok_guard:
+                    break
+                continue
+
+            # si el modelo no devuelve patch usable, no tiene sentido iterar infinito
+            break
+
+        if not ok_guard:
+            print("[DEBUG] Guardrails siguen fallando tras repair:", e_guard)
             return {"files": []}
 
     return {"files": files_generados, "spec": spec}
