@@ -35,6 +35,53 @@ def _asegurar_directorio(ruta: str) -> None:
 # ==========================================================
 
 
+def _normalizar_paths(estructura: Dict[str, str]) -> Dict[str, str]:
+    """
+    Normaliza separadores y elimina paths vacíos.
+    """
+    out: Dict[str, str] = {}
+    for k, v in (estructura or {}).items():
+        if not k:
+            continue
+        kk = str(k).replace("\\", "/").lstrip("/")
+        out[kk] = v if v is not None else ""
+    return out
+
+
+def _autocompletar_init_py(estructura: Dict[str, str]) -> Dict[str, str]:
+    """
+    Garantiza que todo directorio bajo `app/` que contenga algún `.py` tenga su `__init__.py`.
+
+    Motivación:
+    - Evitar loops de regeneración por errores mecánicos del modelo.
+    - Hacer la materialización más robusta sin depender de LLM.
+
+    Nota:
+    - `__init__.py` puede ser vacío legítimamente.
+    """
+    estructura = _normalizar_paths(estructura)
+    py_files = [p for p in estructura.keys() if p.startswith("app/") and p.endswith(".py")]
+
+    required_inits = set()
+    for p in py_files:
+        parts = p.split("/")[:-1]  # directorios
+        # para cada directorio app/x/y, añadir app/x/y/__init__.py y app/x/__init__.py...
+        for i in range(1, len(parts) + 1):
+            d = "/".join(parts[:i])
+            if d:
+                required_inits.add(f"{d}/__init__.py")
+
+    # Asegurar también el root package `app/__init__.py` si hay código en app/
+    if any(p.startswith("app/") for p in py_files):
+        required_inits.add("app/__init__.py")
+
+    for init_path in sorted(required_inits):
+        if init_path not in estructura:
+            estructura[init_path] = ""
+
+    return estructura
+
+
 def materializar_proyecto(
     nombre_proyecto: str,
     estructura: Dict[str, str],
@@ -48,6 +95,7 @@ def materializar_proyecto(
     - Escribe archivos completos
     """
 
+    estructura = _autocompletar_init_py(estructura)
     base_path = os.path.join("output", nombre_proyecto)
 
     # Si el proyecto ya existía (reintentos / regeneraciones), limpiamos para evitar
