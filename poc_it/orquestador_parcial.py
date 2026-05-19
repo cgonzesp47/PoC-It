@@ -51,7 +51,7 @@ class OrquestadorParcial:
     # ======================================================
 
     def _estimacion_generada(self, modo: str, horas: float, *, spec: Dict[str, Any] | None = None) -> Any:
-        from poc_it.estimador_esfuerzo import calcular_estimacion_llm
+        from poc_it.estimador_esfuerzo import calcular_estimacion_esfuerzo
 
         descripcion = f"""
 Proyecto: {self.nombre_proyecto}
@@ -60,7 +60,7 @@ Modo: {modo}
 Descripción:
 {self.descripcion_global}
 """
-        return calcular_estimacion_llm(
+        return calcular_estimacion_esfuerzo(
             descripcion_proyecto=descripcion,
             modo=modo,
             tiempo_real_scopeguardian_horas=horas,
@@ -69,9 +69,9 @@ Descripción:
         )
 
     def _estimacion_manual(self, *, spec: Dict[str, Any] | None = None) -> Any:
-        from poc_it.estimador_esfuerzo import calcular_estimacion_llm
+        from poc_it.estimador_esfuerzo import calcular_estimacion_esfuerzo
 
-        return calcular_estimacion_llm(
+        return calcular_estimacion_esfuerzo(
             descripcion_proyecto=self.descripcion_global,
             modo=None,
             tiempo_real_scopeguardian_horas=0.0,
