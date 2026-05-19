@@ -237,8 +237,11 @@ PROMPT ORIGINAL (referencia de estructura; NO lo repitas en la salida):
 
 
 from poc_it.generador.spec_validation import (
-    alinear_spec_con_contexto as _alinear_spec_con_contexto,
     persistir_spec_debug as _persistir_spec_debug,
+)
+
+from poc_it.generador.spec_alignment import (
+    alinear_spec_con_contexto as _alinear_spec_con_contexto,
 )
 
 
