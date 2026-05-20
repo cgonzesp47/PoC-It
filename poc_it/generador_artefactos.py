@@ -699,162 +699,27 @@ def _merge_files_generados(
     return base
 
 
-def _validar_y_reparar_final(
+def _generar_archivos_por_lotes(
     *,
     spec: dict,
-    files_generados: List[Dict[str, str]],
-    allowed_paths: Set[str],
+    lotes: List[List[str]],
     intentos: int,
-) -> bool:
+) -> List[Dict[str, str]] | None:
     """
-    Aplica la fase final de validación + repairs sobre `files_generados` IN-MEMORY.
+    Genera el contenido por lotes (FASE 2) sin aplicar validación final.
 
-    Mantiene EXACTAMENTE el comportamiento previo (antes duplicado en 2 flows):
-    - AST global
-    - imports internos + repair loop de imports
-    - guardrails + repair atómico por restricción
-
-    Devuelve:
-    - True si el proyecto queda en estado válido
-    - False si no converge o hay fallos no reparables
+    Nota:
+    - Mantiene el comportamiento existente: reintentos por lote, reparación por lote,
+      y merge estable evitando sobreescritura por contenido vacío.
+    - Devuelve `None` si no se pudo generar algún lote de forma válida.
     """
-    # 1) AST global
-    if not _validar_proyecto(files_generados):
-        return False
-
-    # 2) Imports globales vs allowed_paths
-    ok_imports, e_imports = _validar_imports_internos(files_generados, allowed_paths)
-    if not ok_imports:
-        patched_ok, _repair_paths = aplicar_repair_loop_imports(
-            spec=spec,
-            files_generados=files_generados,
-            allowed_paths=allowed_paths,
-            errores_imports=e_imports,
-            chat_completion_json=chat_completion_json,
-            intentos=intentos,
-        )
-        if not patched_ok:
-            return False
-
-        ok_imports2, _e_imports2 = _validar_imports_internos(files_generados, allowed_paths)
-        if not ok_imports2:
-            return False
-
-    # 3) Guardrails por SPEC (contrato usuario): si fallan, intentamos repair dirigido
-    guard = guardrails_por_spec(spec, files_generados)
-    if guard.warnings:
-        print("[DEBUG] Guardrails warnings:", guard.warnings)
-
-    if not guard.ok:
-        if not guard.repair_paths:
-            return False
-
-        max_guardrail_repairs = max(2, intentos)
-        for _ in range(max_guardrail_repairs):
-            sel = seleccionar_error_bloqueante(guard.errors)
-            if not sel:
-                break
-            target_path, target_msg = sel
-
-            prompt_fix = _build_repair_prompt_por_restriccion(
-                spec=spec,
-                full_errors=guard.errors,
-                target_error_path=target_path,
-                target_error_msg=target_msg,
-                repair_paths=guard.repair_paths,
-                files_generados=files_generados,
-            )
-
-            raw = chat_completion_json(
-                prompt=prompt_fix,
-                system=None,
-                temperature=0.1,
-                max_tokens=1600,
-                fase="generacion_codigo",
-            )
-            data = extraer_json_tolerante(raw) or {}
-            cand = data.get("files")
-            if isinstance(cand, list) and cand:
-                _aplicar_patch_en_memoria(files_generados, cand)
-
-                guard = guardrails_por_spec(spec, files_generados)
-                if guard.ok:
-                    break
-                continue
-            break
-
-        if not guard.ok:
-            return False
-
-    return True
-
-
-def generar_proyecto_desde_spec(
-    *,
-    spec: dict,
-    descripcion_global: str,
-    contexto_normalizado: dict | None = None,
-    intentos: int = 2,
-    files_iniciales: Optional[List[Dict[str, str]]] = None,
-) -> Dict[str, Any]:
-    """
-    Genera/regenera código reutilizando un SPEC ya existente (fuente de verdad).
-
-    Caso de uso principal:
-    - Repair loops posteriores (runtime/tests) donde NO queremos "rebobinar" a Fase 1
-      (regenerar/alinear SPEC), sino re-generar archivos guiados por el SPEC ya validado.
-
-    Contrato:
-    - `spec` debe ser dict. Si está vacío o inválido, se delega en `generar_proyecto_completo`
-      para mantener compatibilidad (fallback conservador).
-    """
-    if not isinstance(spec, dict) or not spec:
-        return generar_proyecto_completo(
-            descripcion_global=descripcion_global,
-            contexto_normalizado=contexto_normalizado,
-            intentos=intentos,
-        )
-
-    files_plan = _completar_inits_en_files(spec.get("files", []))
-    spec["files"] = files_plan
-    allowed_paths = set(files_plan)
-
-    # mantener la misma compilación/sanitización de restricciones
-    spec["restrictions"] = compilar_restricciones(spec, contexto_normalizado, intentos=intentos)
-
-    # (idéntico a Fase 2/3 de generar_proyecto_completo, pero sin Fase 1/1.5)
-    # Si nos pasan `files_iniciales`, actuamos en modo REPAIR incremental:
-    # - no re-generamos todo por lotes
-    # - reusamos el estado y solo intentamos reparar imports/guardrails al final
-    if isinstance(files_iniciales, list) and files_iniciales:
-        files_generados = [
-            {"path": (f.get("path") or "").replace("\\", "/"), "content": (f.get("content") or "")}
-            for f in files_iniciales
-            if isinstance(f, dict) and f.get("path")
-        ]
-
-        if not _validar_y_reparar_final(
-            spec=spec,
-            files_generados=files_generados,
-            allowed_paths=allowed_paths,
-            intentos=intentos,
-        ):
-            return {"files": []}
-
-        return {"files": files_generados, "spec": spec}
-    lotes = _agrupar_lotes(files_plan, spec=spec)
-    lotes = sorted(
-        lotes,
-        key=lambda lote: 1
-        if any(p in ("app/main.py", "app/__init__.py") or p.startswith("app/config/") for p in lote)
-        else 0,
-    )
-
     files_generados: List[Dict[str, str]] = []
 
     for lote in lotes:
         lote_set = set(lote)
 
+        # Extrae “contratos” y “env/deps/restrictions” del SPEC para que el modelo implemente
+        # decisiones específicas de ESTA PoC sin hardcodearlas globalmente.
         contracts = spec.get("contracts", [])
         env = spec.get("env", [])
         dependencies = spec.get("dependencies", [])
@@ -875,7 +740,6 @@ INVARIANTES (COMPILABLE / IMPORTABLE)
   - No instanciar clientes/servicios externos en import-time si requieren parámetros (credenciales, IDs, URLs, etc.).
   - La creación de servicios debe ocurrir dentro de funciones/endpoints o mediante factorías lazy (dependency injection con FastAPI `Depends`).
   - La validación de configuración debe hacerse en runtime (p.ej. al ejecutar el endpoint que la necesita).
-
 - Política de errores en endpoints (si este lote contiene endpoints):
   - Captura excepciones esperables (auth/permisos/config faltante/timeouts) y mapea a `HTTPException` con `detail` estructurado:
     - `error_code` (string corto), `message`, `hint` (si aplica)
@@ -1036,7 +900,7 @@ Devuelve nuevamente el JSON con los archivos corregidos (solo los del lote).
             print("[DEBUG] No se pudo generar un lote válido.")
             if errores_lote:
                 print("[DEBUG] Errores lote:", errores_lote)
-            return {"files": []}
+            return None
 
         existentes = {(f["path"].replace("\\", "/")): f for f in files_generados}
 
@@ -1057,27 +921,212 @@ Devuelve nuevamente el JSON con los archivos corregidos (solo los del lote).
 
         files_generados = list(existentes.values())
 
-    # -------------------------
-    # FASE 3: VALIDACIÓN FINAL
-    # -------------------------
-    if not _validar_proyecto(files_generados):
-        print("[DEBUG] Fallo AST en validación final.")
-        return {"files": []}
+    return files_generados
 
+
+def _validar_y_reparar_final(
+    *,
+    spec: dict,
+    files_generados: List[Dict[str, str]],
+    allowed_paths: Set[str],
+    intentos: int,
+) -> bool:
+    """
+    Aplica la fase final de validación + repairs sobre `files_generados` IN-MEMORY.
+
+    Mantiene EXACTAMENTE el comportamiento previo (antes duplicado en 2 flows):
+    - AST global
+    - imports internos + repair loop de imports
+    - guardrails + repair atómico por restricción
+
+    Devuelve:
+    - True si el proyecto queda en estado válido
+    - False si no converge o hay fallos no reparables
+    """
+    # 1) AST global
+    if not _validar_proyecto(files_generados):
+        return False
+
+    # 2) Imports globales vs allowed_paths
     ok_imports, e_imports = _validar_imports_internos(files_generados, allowed_paths)
     if not ok_imports:
-        print("[DEBUG] Fallo imports en validación final:", e_imports)
+        patched_ok, _repair_paths = aplicar_repair_loop_imports(
+            spec=spec,
+            files_generados=files_generados,
+            allowed_paths=allowed_paths,
+            errores_imports=e_imports,
+            chat_completion_json=chat_completion_json,
+            intentos=intentos,
+        )
+        if not patched_ok:
+            return False
+
+        ok_imports2, _e_imports2 = _validar_imports_internos(files_generados, allowed_paths)
+        if not ok_imports2:
+            return False
+
+    # 3) Guardrails por SPEC (contrato usuario): si fallan, intentamos repair dirigido
+    guard = guardrails_por_spec(spec, files_generados)
+    if guard.warnings:
+        print("[DEBUG] Guardrails warnings:", guard.warnings)
+
+    if not guard.ok:
+        if not guard.repair_paths:
+            return False
+
+        max_guardrail_repairs = max(2, intentos)
+        for _ in range(max_guardrail_repairs):
+            sel = seleccionar_error_bloqueante(guard.errors)
+            if not sel:
+                break
+            target_path, target_msg = sel
+
+            prompt_fix = _build_repair_prompt_por_restriccion(
+                spec=spec,
+                full_errors=guard.errors,
+                target_error_path=target_path,
+                target_error_msg=target_msg,
+                repair_paths=guard.repair_paths,
+                files_generados=files_generados,
+            )
+
+            raw = chat_completion_json(
+                prompt=prompt_fix,
+                system=None,
+                temperature=0.1,
+                max_tokens=1600,
+                fase="generacion_codigo",
+            )
+            data = extraer_json_tolerante(raw) or {}
+            cand = data.get("files")
+            if isinstance(cand, list) and cand:
+                _aplicar_patch_en_memoria(files_generados, cand)
+
+                guard = guardrails_por_spec(spec, files_generados)
+                if guard.ok:
+                    break
+                continue
+            break
+
+        if not guard.ok:
+            return False
+
+    return True
+
+
+def _generar_desde_spec_validado(
+    *,
+    spec: dict,
+    contexto_normalizado: dict | None,
+    intentos: int,
+    files_iniciales: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    """
+    Ejecuta Fase 2 (generación por lotes) + Fase 3 (validación final) dado un SPEC ya válido.
+
+    No genera ni alinea el SPEC: eso es responsabilidad del caller.
+    """
+    files_plan = _completar_inits_en_files(spec.get("files", []))
+    spec["files"] = files_plan
+    allowed_paths = set(files_plan)
+
+    # mantener la misma compilación/sanitización de restricciones
+    spec["restrictions"] = compilar_restricciones(spec, contexto_normalizado, intentos=intentos)
+
+    if isinstance(files_iniciales, list) and files_iniciales:
+        files_generados = [
+            {"path": (f.get("path") or "").replace("\\", "/"), "content": (f.get("content") or "")}
+            for f in files_iniciales
+            if isinstance(f, dict) and f.get("path")
+        ]
+
+        if not _validar_y_reparar_final(
+            spec=spec,
+            files_generados=files_generados,
+            allowed_paths=allowed_paths,
+            intentos=intentos,
+        ):
+            return {"files": []}
+
+        return {"files": files_generados, "spec": spec}
+
+    lotes = _agrupar_lotes(files_plan, spec=spec)
+    lotes = sorted(
+        lotes,
+        key=lambda lote: 1
+        if any(p in ("app/main.py", "app/__init__.py") or p.startswith("app/config/") for p in lote)
+        else 0,
+    )
+
+    files_generados = _generar_archivos_por_lotes(spec=spec, lotes=lotes, intentos=intentos)
+    if not files_generados:
         return {"files": []}
 
-    ok_guard, e_guard, repair_paths, guard_warnings = guardrails_por_spec(spec, files_generados)
-    if guard_warnings:
-        print("[DEBUG] Guardrails warnings:", guard_warnings)
+    # DEBUG: confirmar restrictions finales (post-compilación + sanitización)
+    try:
+        rs = spec.get("restrictions", [])
+        if isinstance(rs, list) and rs:
+            resumen = [
+                {
+                    "id": r.get("id"),
+                    "applies_to": r.get("applies_to"),
+                    "must_any_len": len(r.get("must_contain_any") or []),
+                    "must_not_len": len(r.get("must_not_contain") or []),
+                }
+                for r in rs
+                if isinstance(r, dict)
+            ]
+            print(
+                "[DEBUG] Restrictions finales (resumen):",
+                json.dumps(resumen, ensure_ascii=False),
+            )
+    except Exception:
+        pass
 
-    if not ok_guard:
-        print("[DEBUG] Fallo guardrails SPEC:", e_guard)
+    if not _validar_y_reparar_final(
+        spec=spec,
+        files_generados=files_generados,
+        allowed_paths=allowed_paths,
+        intentos=intentos,
+    ):
+        print("[DEBUG] Fase final de validación/repair no convergió.")
         return {"files": []}
 
     return {"files": files_generados, "spec": spec}
+
+
+def generar_proyecto_desde_spec(
+    *,
+    spec: dict,
+    descripcion_global: str,
+    contexto_normalizado: dict | None = None,
+    intentos: int = 2,
+    files_iniciales: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    """
+    Genera/regenera código reutilizando un SPEC ya existente (fuente de verdad).
+
+    Caso de uso principal:
+    - Repair loops posteriores (runtime/tests) donde NO queremos "rebobinar" a Fase 1
+      (regenerar/alinear SPEC), sino re-generar archivos guiados por el SPEC ya validado.
+
+    Contrato:
+    - `spec` debe ser dict. Si está vacío o inválido, se delega en `generar_proyecto_completo`
+      para mantener compatibilidad (fallback conservador).
+    """
+    if not isinstance(spec, dict) or not spec:
+        return generar_proyecto_completo(
+            descripcion_global=descripcion_global,
+            contexto_normalizado=contexto_normalizado,
+            intentos=intentos,
+        )
+
+    return _generar_desde_spec_validado(
+        spec=spec,
+        contexto_normalizado=contexto_normalizado,
+        intentos=intentos,
+        files_iniciales=files_iniciales,
+    )
 
 
 def generar_proyecto_completo(
