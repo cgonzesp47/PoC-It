@@ -53,7 +53,9 @@ Nota sobre dependencias
 Los proyectos generados suelen incluir FastAPI; para tests típicamente se requiere:
 - pytest
 - httpx (dependencia de TestClient; a veces ya viene, pero se recomienda añadirla)
-Este módulo NO modifica requirements; la integración en el orquestador deberá
+Este módulo NO modifica requirements; la integración en el orquestador deberá:
+- separar deps runtime vs dev/tests (requirements.txt vs requirements-dev.txt)
+- añadir pytest/pytest-mock/httpx como dev deps cuando se generen tests
 parchear requirements.txt si existe.
 """
 

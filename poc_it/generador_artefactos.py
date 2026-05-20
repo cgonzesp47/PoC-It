@@ -616,7 +616,8 @@ EL SPEC DEBE INCLUIR
   - `endpoints[].response`: contrato de response (json_example mínimo)
   - `endpoints[].errors`: lista de códigos HTTP esperados (p.ej. [401,403,404])
 - "env": variables de entorno esperadas (nombres exactos y para qué sirven) (si aplica)
-- "dependencies": lista de dependencias PyPI mínimas (si aplica)
+- "dependencies": lista de dependencias PyPI mínimas (runtime) (si aplica)
+- "dev_dependencies": lista de dependencias PyPI para desarrollo/tests (si aplica)
 - "contracts": reglas de comportamiento por endpoint (códigos de error esperados y condición) (si aplica)
 - "restrictions": lista de restricciones ejecutables (enforcement-ready) derivadas de restricciones del usuario
   - Formato por item:
@@ -634,6 +635,7 @@ Devuelve EXCLUSIVAMENTE JSON válido con la estructura:
   "imports_policy": "absolute_from_app",
   "files": ["app/main.py", "..."],
   "dependencies": ["fastapi", "uvicorn", "..."],
+  "dev_dependencies": ["pytest", "pytest-mock", "httpx"],
   "env": [{{"name":"VAR", "description":"..."}}],
   "endpoints": [
     {{
@@ -830,6 +832,7 @@ def generar_proyecto_desde_spec(
         contracts = spec.get("contracts", [])
         env = spec.get("env", [])
         dependencies = spec.get("dependencies", [])
+        dev_dependencies = spec.get("dev_dependencies", [])
         restrictions = spec.get("restrictions", [])
 
         prompt_lote = f"""
@@ -872,8 +875,10 @@ INVARIANTES (COMPILABLE / IMPORTABLE)
 DECISIONES / CONTRATOS DE ESTA PoC (fuente de verdad)
 - ENV esperada:
 {json.dumps(env, ensure_ascii=False)}
-- Dependencias esperadas:
+- Dependencias esperadas (runtime):
 {json.dumps(dependencies, ensure_ascii=False)}
+- Dependencias esperadas (dev/tests):
+{json.dumps(dev_dependencies, ensure_ascii=False)}
 - Contratos de comportamiento (por endpoint):
 {json.dumps(contracts, ensure_ascii=False)}
 - Restricciones ejecutables (NO NEGOCIABLES):
@@ -1258,6 +1263,7 @@ def generar_proyecto_completo(
         contracts = spec.get("contracts", [])
         env = spec.get("env", [])
         dependencies = spec.get("dependencies", [])
+        dev_dependencies = spec.get("dev_dependencies", [])
         restrictions = spec.get("restrictions", [])
 
         prompt_lote = f"""
@@ -1300,8 +1306,10 @@ INVARIANTES (COMPILABLE / IMPORTABLE)
 DECISIONES / CONTRATOS DE ESTA PoC (fuente de verdad)
 - ENV esperada:
 {json.dumps(env, ensure_ascii=False)}
-- Dependencias esperadas:
+- Dependencias esperadas (runtime):
 {json.dumps(dependencies, ensure_ascii=False)}
+- Dependencias esperadas (dev/tests):
+{json.dumps(dev_dependencies, ensure_ascii=False)}
 - Contratos de comportamiento (por endpoint):
 {json.dumps(contracts, ensure_ascii=False)}
 - Restricciones ejecutables (NO NEGOCIABLES):
