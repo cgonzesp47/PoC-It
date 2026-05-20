@@ -41,6 +41,7 @@ from typing import Dict, Any, List, Tuple, Set, Optional, Iterable
 
 from poc_it.llm_client import chat_completion_json
 from poc_it.generador.json_utils import extraer_json_tolerante
+from poc_it.generador.repair_loop import aplicar_repair_loop_imports
 
 
 # ==========================================================
@@ -468,29 +469,7 @@ def _validar_imports_internos(
 
 
 
-def _aplicar_patch_en_memoria(
-    files_generados: List[Dict[str, str]],
-    patch_files: List[Dict[str, str]],
-) -> None:
-    """
-    Aplica un patch (lista de {"path","content"}) sobre `files_generados` EN MEMORIA.
-    Regla conservadora: solo sobrescribe si el nuevo contenido no está vacío.
-    """
-    if not isinstance(patch_files, list) or not patch_files:
-        return
-
-    idx = {(f.get("path") or "").replace("\\", "/"): i for i, f in enumerate(files_generados) if isinstance(f, dict)}
-    for f in patch_files:
-        if not isinstance(f, dict):
-            continue
-        p = (f.get("path") or "").replace("\\", "/")
-        c = f.get("content") or ""
-        if not p or not c.strip():
-            continue
-        if p in idx:
-            files_generados[idx[p]]["content"] = c
-        else:
-            files_generados.append({"path": p, "content": c})
+from poc_it.generador.repair_loop import aplicar_patch_en_memoria as _aplicar_patch_en_memoria
 
 
 
@@ -777,61 +756,19 @@ def generar_proyecto_desde_spec(
 
         ok_imports, e_imports = _validar_imports_internos(files_generados, allowed_paths)
         if not ok_imports:
-            repair_paths: List[str] = []
-            for err in e_imports:
-                if ":" in err:
-                    p = err.split(":", 1)[0].strip()
-                    if p and p not in repair_paths:
-                        repair_paths.append(p)
-                m = re.search(r"\((app\/[^\)]+\.py)\)", str(err))
-                if m:
-                    target_path = m.group(1).replace("\\", "/").strip()
-                    if target_path and target_path not in repair_paths:
-                        repair_paths.append(target_path)
-
-            if not repair_paths:
+            patched_ok, _repair_paths = aplicar_repair_loop_imports(
+                spec=spec,
+                files_generados=files_generados,
+                allowed_paths=allowed_paths,
+                errores_imports=e_imports,
+                chat_completion_json=chat_completion_json,
+                intentos=intentos,
+            )
+            if not patched_ok:
                 return {"files": []}
 
-            prompt_fix_imports = f"""
-Hay errores de imports internos (coherencia entre módulos) que impiden ejecutar el proyecto.
-Corrige SOLO estos archivos y ninguno más.
-
-Errores:
-- {chr(10).join(e_imports)}
-
-Archivos a corregir (paths exactos):
-{json.dumps(repair_paths, ensure_ascii=False)}
-
-SPEC (fuente de verdad):
-{json.dumps(spec, ensure_ascii=False)}
-
-SALIDA (JSON):
-{{ "files": [{{"path":"...", "content":"..."}}] }}
-
-REGLAS:
-- Devuelve SOLO los archivos listados.
-- No inventes nuevos paths.
-- Si un archivo hace `from app.x.y import SIMBOLO`, entonces SIMBOLO debe existir realmente en el módulo importado.
-- Si la dependencia importada NO existe en spec.files, elimina ese import y reestructura el código para no necesitarla.
-- Mantén los endpoints exactamente como en el SPEC (mismos paths y métodos).
-- Si hay try/except: incluye logging obligatorio con logger.exception().
-"""
-            raw = chat_completion_json(
-                prompt=prompt_fix_imports,
-                system=None,
-                temperature=0.1,
-                max_tokens=1600,
-                fase="generacion_codigo",
-            )
-            data = extraer_json_tolerante(raw) or {}
-            cand = data.get("files")
-            if isinstance(cand, list) and cand:
-                _aplicar_patch_en_memoria(files_generados, cand)
-
-                ok_imports2, e_imports2 = _validar_imports_internos(files_generados, allowed_paths)
-                if not ok_imports2:
-                    return {"files": []}
-            else:
+            ok_imports2, _e_imports2 = _validar_imports_internos(files_generados, allowed_paths)
+            if not ok_imports2:
                 return {"files": []}
 
         guard = guardrails_por_spec(spec, files_generados)
@@ -1552,79 +1489,20 @@ Devuelve nuevamente el JSON con los archivos corregidos (solo los del lote).
     if not ok_imports:
         print("[DEBUG] Fallo imports en validación final:", e_imports)
 
-        # Repair loop dirigido para imports:
-        # Pedimos SOLO los ficheros implicados (o los que importan símbolos inexistentes),
-        # y dejamos que el modelo ajuste imports o cree símbolos faltantes según el SPEC.
-        # Estrategia: reparar los propios ficheros que reporta el validador (antes de pasar a guardrails).
-        repair_paths: List[str] = []
-        for err in e_imports:
-            # Formato típico: "<path>: ... "
-            if ":" in err:
-                p = err.split(":", 1)[0].strip()
-                if p and p not in repair_paths:
-                    repair_paths.append(p)
-
-            # Caso especial: from-import inválido por símbolo inexistente.
-            # Incluimos también el módulo TARGET (el que está entre paréntesis) para reparar ambos a la vez.
-            m = re.search(r"\((app\/[^\)]+\.py)\)", str(err))
-            if m:
-                target_path = m.group(1).replace("\\", "/").strip()
-                if target_path and target_path not in repair_paths:
-                    repair_paths.append(target_path)
-
-        if not repair_paths:
+        patched_ok, _repair_paths = aplicar_repair_loop_imports(
+            spec=spec,
+            files_generados=files_generados,
+            allowed_paths=allowed_paths,
+            errores_imports=e_imports,
+            chat_completion_json=chat_completion_json,
+            intentos=intentos,
+        )
+        if not patched_ok:
             return {"files": []}
 
-        prompt_fix_imports = f"""
-Hay errores de imports internos (coherencia entre módulos) que impiden ejecutar el proyecto.
-Corrige SOLO estos archivos y ninguno más.
-
-Errores:
-- {chr(10).join(e_imports)}
-
-Archivos a corregir (paths exactos):
-{json.dumps(repair_paths, ensure_ascii=False)}
-
-SPEC (fuente de verdad):
-{json.dumps(spec, ensure_ascii=False)}
-
-SALIDA (JSON):
-{{ "files": [{{"path":"...", "content":"..."}}] }}
-
-REGLAS:
-- Devuelve SOLO los archivos listados.
-- No inventes nuevos paths.
-- Si un archivo hace `from app.x.y import SIMBOLO`, entonces SIMBOLO debe existir realmente en el módulo importado.
-- Si la dependencia importada NO existe en spec.files, elimina ese import y reestructura el código para no necesitarla.
-- Mantén los endpoints exactamente como en el SPEC (mismos paths y métodos).
-- Si hay try/except: incluye logging obligatorio con logger.exception().
-"""
-        raw = chat_completion_json(
-            prompt=prompt_fix_imports,
-            system=None,
-            temperature=0.1,
-            max_tokens=1600,
-            fase="generacion_codigo",
-        )
-        data = extraer_json_tolerante(raw) or {}
-        cand = data.get("files")
-        if isinstance(cand, list) and cand:
-            patch = {
-                (f.get("path") or "").replace("\\", "/"): (f.get("content") or "")
-                for f in cand
-                if isinstance(f, dict)
-            }
-            for i, f in enumerate(files_generados):
-                p = (f.get("path") or "").replace("\\", "/")
-                if p in patch and patch[p].strip():
-                    files_generados[i]["content"] = patch[p]
-
-            # revalidar imports tras repair
-            ok_imports2, e_imports2 = _validar_imports_internos(files_generados, allowed_paths)
-            if not ok_imports2:
-                print("[DEBUG] Imports siguen fallando tras repair:", e_imports2)
-                return {"files": []}
-        else:
+        ok_imports2, e_imports2 = _validar_imports_internos(files_generados, allowed_paths)
+        if not ok_imports2:
+            print("[DEBUG] Imports siguen fallando tras repair:", e_imports2)
             return {"files": []}
 
     # 3) Guardrails por SPEC (contrato usuario): si fallan, intentamos repair dirigido
