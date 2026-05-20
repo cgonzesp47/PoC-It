@@ -39,9 +39,30 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Set, Optional, Iterable
 
-from poc_it.llm_client import chat_completion_json
+from poc_it.generador.guardrails import (
+    guardrails_por_spec,
+    seleccionar_error_bloqueante,
+)
 from poc_it.generador.json_utils import extraer_json_tolerante
-from poc_it.generador.repair_loop import aplicar_repair_loop_imports
+from poc_it.generador.repair_loop import (
+    aplicar_patch_en_memoria as _aplicar_patch_en_memoria,
+    aplicar_repair_loop_imports,
+)
+from poc_it.generador.restrictions import compilar_restricciones
+from poc_it.generador.spec_alignment import (
+    alinear_spec_con_contexto as _alinear_spec_con_contexto,
+)
+from poc_it.generador.spec_validation import (
+    completar_inits_en_files as _completar_inits_en_files,
+    normalizar_paths as _normalizar_paths,
+    persistir_spec_debug as _persistir_spec_debug,
+    validar_spec as _validar_spec,
+)
+from poc_it.generador.utils_imports import (
+    extraer_from_imports,
+    extraer_imports,
+)
+from poc_it.llm_client import chat_completion_json
 
 
 # ==========================================================
@@ -198,31 +219,6 @@ PROMPT ORIGINAL (referencia de estructura; NO lo repitas en la salida):
 """.strip()
 
 
-from poc_it.generador.spec_validation import (
-    persistir_spec_debug as _persistir_spec_debug,
-)
-
-from poc_it.generador.spec_alignment import (
-    alinear_spec_con_contexto as _alinear_spec_con_contexto,
-)
-
-from poc_it.generador.restrictions import compilar_restricciones
-
-from poc_it.generador.guardrails import (
-    guardrails_por_spec,
-    seleccionar_error_bloqueante,
-)
-
-
-from poc_it.generador.spec_validation import (
-    normalizar_paths as _normalizar_paths,
-    completar_inits_en_files as _completar_inits_en_files,
-)
-
-
-from poc_it.generador.spec_validation import (
-    validar_spec as _validar_spec,
-)
 
 
 def _agrupar_lotes(files: List[str], spec: dict | None = None) -> List[List[str]]:
@@ -335,16 +331,6 @@ def _validar_paths_generados(files_generados: List[Dict[str, str]], allowed_path
         if p not in allowed_paths:
             errores.append(f"El modelo devolvió un path no permitido: {p}")
     return (len(errores) == 0), errores
-
-
-from poc_it.generador.utils_imports import (
-    extraer_imports,
-    extraer_from_imports,
-)
-
-
-
-
 
 
 def _validar_imports_internos(
@@ -466,12 +452,6 @@ def _validar_imports_internos(
 # ==========================================================
 # SPEC NORMALIZATION / SANITIZATION
 # ==========================================================
-
-
-
-from poc_it.generador.repair_loop import aplicar_patch_en_memoria as _aplicar_patch_en_memoria
-
-
 
 
 
@@ -605,6 +585,10 @@ INVARIANTES (ESTRUCTURALES)
 - Comando local: uvicorn app.main:app --reload
 - Imports internos: absolutos desde app.*
 - La app DEBE ser importable sin configuración externa (no validar credenciales/config en import-time).
+- Si el proyecto usa persistencia con SQLAlchemy (PostgreSQL/SQLite/etc.) y define modelos, debe incluir bootstrap simple del esquema (modo PoC):
+  - En el startup/lifespan de FastAPI, crear tablas automáticamente con `Base.metadata.create_all()`.
+  - En async SQLAlchemy: `async with engine.begin() as conn: await conn.run_sync(Base.metadata.create_all)`.
+  - NO uses Alembic a menos que el usuario lo pida explícitamente.
 
 EL SPEC DEBE INCLUIR
 - "files": lista EXACTA de rutas a generar (relativas)
@@ -663,6 +647,9 @@ REGLAS
 - No inventes archivos Python fuera de app/.
 - Incluye requirements.txt y README.md en files.
 - Si declaras endpoints, usa `bundle_files` para listar los módulos internos que el endpoint necesita (services/utils/etc.) y que deben generarse en el MISMO lote que el endpoint para evitar imports/símbolos faltantes.
+- Si en `env` declaras `DATABASE_URL` y hay endpoints de escritura (POST/PUT/PATCH/DELETE):
+  - Debes incluir modelos SQLAlchemy (tablas) y un startup/lifespan que haga `create_all` para que el primer POST no falle.
+  - Documenta en README que en modo PoC se crean tablas automáticamente al arrancar.
 - NO inventes endpoints: los endpoints implementados deben ser exactamente los listados en `endpoints`.
 - Si el usuario ha especificado explícitamente endpoints en la descripción (p.ej. “exponer endpoint ... /ruta ...”), el SPEC DEBE incluirlos en `endpoints` y en `files`.
   - Prohibido degradar silenciosamente a “stub” u omitir endpoints solicitados.
@@ -693,7 +680,11 @@ def _merge_files_generados(
     - Sobrescribe solo paths presentes en `patch` con contenido no vacío.
     - Añade paths nuevos del patch si no existían.
     """
-    idx = {(f.get("path") or "").replace("\\", "/"): i for i, f in enumerate(base) if isinstance(f, dict)}
+    idx = {
+        (f.get("path") or "").replace("\\", "/"): i
+        for i, f in enumerate(base)
+        if isinstance(f, dict)
+    }
     for f in patch or []:
         if not isinstance(f, dict):
             continue
@@ -706,6 +697,96 @@ def _merge_files_generados(
         else:
             base.append({"path": p, "content": c})
     return base
+
+
+def _validar_y_reparar_final(
+    *,
+    spec: dict,
+    files_generados: List[Dict[str, str]],
+    allowed_paths: Set[str],
+    intentos: int,
+) -> bool:
+    """
+    Aplica la fase final de validación + repairs sobre `files_generados` IN-MEMORY.
+
+    Mantiene EXACTAMENTE el comportamiento previo (antes duplicado en 2 flows):
+    - AST global
+    - imports internos + repair loop de imports
+    - guardrails + repair atómico por restricción
+
+    Devuelve:
+    - True si el proyecto queda en estado válido
+    - False si no converge o hay fallos no reparables
+    """
+    # 1) AST global
+    if not _validar_proyecto(files_generados):
+        return False
+
+    # 2) Imports globales vs allowed_paths
+    ok_imports, e_imports = _validar_imports_internos(files_generados, allowed_paths)
+    if not ok_imports:
+        patched_ok, _repair_paths = aplicar_repair_loop_imports(
+            spec=spec,
+            files_generados=files_generados,
+            allowed_paths=allowed_paths,
+            errores_imports=e_imports,
+            chat_completion_json=chat_completion_json,
+            intentos=intentos,
+        )
+        if not patched_ok:
+            return False
+
+        ok_imports2, _e_imports2 = _validar_imports_internos(files_generados, allowed_paths)
+        if not ok_imports2:
+            return False
+
+    # 3) Guardrails por SPEC (contrato usuario): si fallan, intentamos repair dirigido
+    guard = guardrails_por_spec(spec, files_generados)
+    if guard.warnings:
+        print("[DEBUG] Guardrails warnings:", guard.warnings)
+
+    if not guard.ok:
+        if not guard.repair_paths:
+            return False
+
+        max_guardrail_repairs = max(2, intentos)
+        for _ in range(max_guardrail_repairs):
+            sel = seleccionar_error_bloqueante(guard.errors)
+            if not sel:
+                break
+            target_path, target_msg = sel
+
+            prompt_fix = _build_repair_prompt_por_restriccion(
+                spec=spec,
+                full_errors=guard.errors,
+                target_error_path=target_path,
+                target_error_msg=target_msg,
+                repair_paths=guard.repair_paths,
+                files_generados=files_generados,
+            )
+
+            raw = chat_completion_json(
+                prompt=prompt_fix,
+                system=None,
+                temperature=0.1,
+                max_tokens=1600,
+                fase="generacion_codigo",
+            )
+            data = extraer_json_tolerante(raw) or {}
+            cand = data.get("files")
+            if isinstance(cand, list) and cand:
+                _aplicar_patch_en_memoria(files_generados, cand)
+
+                guard = guardrails_por_spec(spec, files_generados)
+                if guard.ok:
+                    break
+                continue
+            break
+
+        if not guard.ok:
+            return False
+
+    return True
 
 
 def generar_proyecto_desde_spec(
@@ -752,68 +833,13 @@ def generar_proyecto_desde_spec(
             if isinstance(f, dict) and f.get("path")
         ]
 
-        # Fase 3 (misma lógica final) sobre el estado existente
-        if not _validar_proyecto(files_generados):
+        if not _validar_y_reparar_final(
+            spec=spec,
+            files_generados=files_generados,
+            allowed_paths=allowed_paths,
+            intentos=intentos,
+        ):
             return {"files": []}
-
-        ok_imports, e_imports = _validar_imports_internos(files_generados, allowed_paths)
-        if not ok_imports:
-            patched_ok, _repair_paths = aplicar_repair_loop_imports(
-                spec=spec,
-                files_generados=files_generados,
-                allowed_paths=allowed_paths,
-                errores_imports=e_imports,
-                chat_completion_json=chat_completion_json,
-                intentos=intentos,
-            )
-            if not patched_ok:
-                return {"files": []}
-
-            ok_imports2, _e_imports2 = _validar_imports_internos(files_generados, allowed_paths)
-            if not ok_imports2:
-                return {"files": []}
-
-        guard = guardrails_por_spec(spec, files_generados)
-        if not guard.ok:
-            if not guard.repair_paths:
-                return {"files": []}
-
-            max_guardrail_repairs = max(2, intentos)
-            for _ in range(max_guardrail_repairs):
-                sel = seleccionar_error_bloqueante(guard.errors)
-                if not sel:
-                    break
-                target_path, target_msg = sel
-
-                prompt_fix = _build_repair_prompt_por_restriccion(
-                    spec=spec,
-                    full_errors=guard.errors,
-                    target_error_path=target_path,
-                    target_error_msg=target_msg,
-                    repair_paths=guard.repair_paths,
-                    files_generados=files_generados,
-                )
-
-                raw = chat_completion_json(
-                    prompt=prompt_fix,
-                    system=None,
-                    temperature=0.1,
-                    max_tokens=1600,
-                    fase="generacion_codigo",
-                )
-                data = extraer_json_tolerante(raw) or {}
-                cand = data.get("files")
-                if isinstance(cand, list) and cand:
-                    _aplicar_patch_en_memoria(files_generados, cand)
-
-                    guard = guardrails_por_spec(spec, files_generados)
-                    if guard.ok:
-                        break
-                    continue
-                break
-
-            if not guard.ok:
-                return {"files": []}
 
         return {"files": files_generados, "spec": spec}
     lotes = _agrupar_lotes(files_plan, spec=spec)
@@ -849,6 +875,7 @@ INVARIANTES (COMPILABLE / IMPORTABLE)
   - No instanciar clientes/servicios externos en import-time si requieren parámetros (credenciales, IDs, URLs, etc.).
   - La creación de servicios debe ocurrir dentro de funciones/endpoints o mediante factorías lazy (dependency injection con FastAPI `Depends`).
   - La validación de configuración debe hacerse en runtime (p.ej. al ejecutar el endpoint que la necesita).
+
 - Política de errores en endpoints (si este lote contiene endpoints):
   - Captura excepciones esperables (auth/permisos/config faltante/timeouts) y mapea a `HTTPException` con `detail` estructurado:
     - `error_code` (string corto), `message`, `hint` (si aplica)
@@ -1487,33 +1514,6 @@ Devuelve nuevamente el JSON con los archivos corregidos (solo los del lote).
     # -------------------------
     # FASE 3: VALIDACIÓN FINAL
     # -------------------------
-    # 1) AST global
-    if not _validar_proyecto(files_generados):
-        print("[DEBUG] Fallo AST en validación final.")
-        return {"files": []}
-
-    # 2) Imports globales vs allowed_paths
-    ok_imports, e_imports = _validar_imports_internos(files_generados, allowed_paths)
-    if not ok_imports:
-        print("[DEBUG] Fallo imports en validación final:", e_imports)
-
-        patched_ok, _repair_paths = aplicar_repair_loop_imports(
-            spec=spec,
-            files_generados=files_generados,
-            allowed_paths=allowed_paths,
-            errores_imports=e_imports,
-            chat_completion_json=chat_completion_json,
-            intentos=intentos,
-        )
-        if not patched_ok:
-            return {"files": []}
-
-        ok_imports2, e_imports2 = _validar_imports_internos(files_generados, allowed_paths)
-        if not ok_imports2:
-            print("[DEBUG] Imports siguen fallando tras repair:", e_imports2)
-            return {"files": []}
-
-    # 3) Guardrails por SPEC (contrato usuario): si fallan, intentamos repair dirigido
     # DEBUG: confirmar restrictions finales (post-compilación + sanitización)
     try:
         rs = spec.get("restrictions", [])
@@ -1528,65 +1528,20 @@ Devuelve nuevamente el JSON con los archivos corregidos (solo los del lote).
                 for r in rs
                 if isinstance(r, dict)
             ]
-            print("[DEBUG] Restrictions finales (resumen):", json.dumps(resumen, ensure_ascii=False))
+            print(
+                "[DEBUG] Restrictions finales (resumen):",
+                json.dumps(resumen, ensure_ascii=False),
+            )
     except Exception:
         pass
 
-    guard = guardrails_por_spec(spec, files_generados)
-    if guard.warnings:
-        print("[DEBUG] Guardrails warnings:", guard.warnings)
-
-    if not guard.ok:
-        print("[DEBUG] Fallo guardrails SPEC:", guard.errors)
-
-        if not guard.repair_paths:
-            return {"files": []}
-
-        # Repair loop por RESTRICCIÓN (atómico):
-        # - Selecciona 1 error bloqueante
-        # - Pide al LLM un patch mínimo y verificable
-        # - Revalida y repite N veces
-        max_guardrail_repairs = max(2, intentos)
-
-        for _ in range(max_guardrail_repairs):
-            sel = seleccionar_error_bloqueante(guard.errors)
-            if not sel:
-                break
-            target_path, target_msg = sel
-
-            prompt_fix = _build_repair_prompt_por_restriccion(
-                spec=spec,
-                full_errors=guard.errors,
-                target_error_path=target_path,
-                target_error_msg=target_msg,
-                repair_paths=guard.repair_paths,
-                files_generados=files_generados,
-            )
-
-            raw = chat_completion_json(
-                prompt=prompt_fix,
-                system=None,
-                temperature=0.1,
-                max_tokens=1600,
-                fase="generacion_codigo",
-            )
-            data = extraer_json_tolerante(raw) or {}
-            cand = data.get("files")
-            if isinstance(cand, list) and cand:
-                _aplicar_patch_en_memoria(files_generados, cand)
-
-                guard = guardrails_por_spec(spec, files_generados)
-                if guard.warnings:
-                    print("[DEBUG] Guardrails warnings:", guard.warnings)
-                if guard.ok:
-                    break
-                continue
-
-            # si el modelo no devuelve patch usable, no tiene sentido iterar infinito
-            break
-
-        if not guard.ok:
-            print("[DEBUG] Guardrails siguen fallando tras repair:", guard.errors)
-            return {"files": []}
+    if not _validar_y_reparar_final(
+        spec=spec,
+        files_generados=files_generados,
+        allowed_paths=allowed_paths,
+        intentos=intentos,
+    ):
+        print("[DEBUG] Fase final de validación/repair no convergió.")
+        return {"files": []}
 
     return {"files": files_generados, "spec": spec}
