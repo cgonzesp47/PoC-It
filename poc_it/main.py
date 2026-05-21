@@ -134,9 +134,9 @@ async def main() -> None:
             from poc_it.generador_informes import generar_readme_asesor
             from poc_it.materializador_archivos import materializar_proyecto
 
-            from poc_it.estimador_esfuerzo import calcular_estimacion_llm
+            from poc_it.estimador_esfuerzo import calcular_estimacion_esfuerzo
 
-            estimacion_manual = calcular_estimacion_llm(
+            estimacion_manual = calcular_estimacion_esfuerzo(
                 descripcion_proyecto=user_data.problema,
                 modo=None,
                 tiempo_real_scopeguardian_horas=0.0,
