@@ -62,6 +62,14 @@ from poc_it.generador.prompts_lotes import (
     build_prompt_lote_fix_errors as _build_prompt_lote_fix_errors,
     build_prompt_lote_missing as _build_prompt_lote_missing,
 )
+from poc_it.generador.prompts_spec import (
+    build_prompt_spec as _build_prompt_spec,
+    reparar_spec_desde_spec as _reparar_spec_desde_spec,
+    reparar_spec_prompt as _reparar_spec_prompt,
+)
+from poc_it.generador.prompts_guardrails import (
+    build_repair_prompt_por_restriccion as _build_repair_prompt_por_restriccion,
+)
 from poc_it.generador.validators import (
     validar_imports_internos as _validar_imports_internos,
     validar_paths_generados as _validar_paths_generados,
@@ -71,125 +79,8 @@ from poc_it.llm_client import chat_completion_json
 
 
 # ==========================================================
-# VALIDACIÓN SINTÁCTICA
+# AGRUPACIÓN DE LOTES
 # ==========================================================
-
-
-def _reparar_spec_prompt(
-    prompt_spec_base: str,
-    raw_resp: str,
-    errores: List[str] | None = None,
-) -> str:
-    """
-    Construye un prompt de reparación de SPEC, usando como entrada la respuesta cruda previa.
-
-    Objetivo: evitar reintentos completos "desde cero" cuando el modelo devolvió JSON truncado
-    o inválido. Pedimos reconstruir el mismo SPEC, completo y parseable.
-    """
-    errores = errores or []
-
-    return f"""
-La respuesta anterior pretendía ser un SPEC en JSON pero NO es parseable o está truncada.
-
-Errores detectados:
-- {chr(10).join(errores) if errores else "(no disponibles)"}
-
-RESPUESTA CRUDA ANTERIOR (entrada a reparar):
-{raw_resp}
-
-TAREA
-Devuelve de nuevo el SPEC COMPLETO como JSON válido.
-
-IMPORTANTE (ANTI-TRUNCADO)
-- La respuesta anterior puede estar TRUNCADA. Reconstruye el JSON COMPLETO.
-- Asegura que se cierran TODOS los corchetes y llaves.
-- Asegura que no quedan strings sin cerrar.
-- Si el JSON es largo, prioriza completar la estructura y campos antes que añadir texto descriptivo.
-
-REGLAS NO NEGOCIABLES
-- Devuelve EXCLUSIVAMENTE JSON válido.
-- Prohibido usar fences Markdown (``` o ```json).
-- Prohibido incluir texto fuera del JSON.
-- Mantén la MISMA estructura lógica requerida por el prompt original.
-- Si faltan campos, inclúyelos aunque sea con valores vacíos razonables:
-  - strings vacíos "", listas vacías [], objetos vacíos {{}}.
-- No inventes nuevos endpoints o archivos no coherentes con la respuesta cruda.
-
-PROMPT ORIGINAL (referencia; NO lo repitas en la salida):
-{prompt_spec_base}
-""".strip()
-
-
-def _reparar_spec_desde_spec(
-    prompt_spec_base: str,
-    spec_actual: dict | None,
-    errores: List[str] | None = None,
-    contexto_normalizado: dict | None = None,
-) -> str:
-    """
-    Construye un prompt de reparación de SPEC aplicando cambios sobre el SPEC ACTUAL (patch-style).
-
-    Fuente de verdad:
-    - CONTEXTO_NORMALIZADO (incluye contratos_api) es el contrato del usuario.
-    - El SPEC debe alinearse con ese contrato; no al revés.
-
-    Objetivo:
-    - Evitar reconstrucciones “desde cero” que reintroducen patrones por defecto (p.ej. multipart upload).
-    - Forzar cambios mínimos y convergentes sobre el spec_actual.
-    """
-    errores = errores or []
-
-    ctx_block = ""
-    if isinstance(contexto_normalizado, dict) and contexto_normalizado:
-        ctx_block = f"""
-
-CONTEXTO_NORMALIZADO (FUENTE DE VERDAD; el SPEC DEBE cumplirlo):
-{json.dumps(contexto_normalizado, ensure_ascii=False)}
-"""
-
-    spec_block = ""
-    if isinstance(spec_actual, dict) and spec_actual:
-        spec_block = f"""
-
-SPEC_ACTUAL (a corregir; aplica cambios MINIMOS aquí):
-{json.dumps(spec_actual, ensure_ascii=False)}
-"""
-
-    return f"""
-TAREA
-Corrige el SPEC_ACTUAL para que cumpla el CONTEXTO_NORMALIZADO (contratos) y los errores MUST indicados.
-NO reconstruyas desde cero: modifica el SPEC_ACTUAL lo mínimo imprescindible.
-
-Errores MUST detectados:
-- {chr(10).join(errores) if errores else "(no disponibles)"}
-{ctx_block}
-{spec_block}
-
-REGLAS NO NEGOCIABLES
-- Devuelve EXCLUSIVAMENTE JSON válido (el SPEC completo).
-- Prohibido Markdown, fences o texto fuera del JSON.
-- No inventes endpoints/archivos no coherentes con el CONTEXTO_NORMALIZADO.
-- Mantén invariantes estructurales:
-  - entrypoint: app.main:app
-  - run_command: uvicorn app.main:app --reload
-  - imports_policy: absolute_from_app
-
-REGLAS ESPECÍFICAS DE CONTRATOS (CRÍTICO)
-- Debes comparar CONTEXTO_NORMALIZADO.contratos_api (FUENTE DE VERDAD) con SPEC.endpoints.
-- Para cada contrato_api (method + path):
-  - Debe existir un endpoint equivalente en SPEC.endpoints.
-  - Sus campos contractuales deben ser consistentes (al menos request.type y response.json_example si existen).
-- Si hay discrepancias entre contrato_api y SPEC.endpoints:
-  - Debes tomar como referencia SIEMPRE el contrato_api.
-  - Modifica el SPEC_ACTUAL con cambios mínimos para que SPEC.endpoints coincida con contratos_api.
-- Si el SPEC tiene endpoints extra que NO están en contratos_api y el contexto parece enumerar explícitamente los endpoints esperados:
-  - Elimina esos endpoints extra del SPEC (cambios mínimos).
-- Ajusta SPEC.dependencies/env/contracts para que no contradigan los contratos.
-- NO reconstruyas el SPEC desde cero.
-
-PROMPT ORIGINAL (referencia de estructura; NO lo repitas en la salida):
-{prompt_spec_base}
-""".strip()
 
 
 def _agrupar_lotes(files: List[str], spec: dict | None = None) -> List[List[str]]:
@@ -290,218 +181,6 @@ def _agrupar_lotes(files: List[str], spec: dict | None = None) -> List[List[str]
         lotes.append(resto)
 
     return lotes
-
-
-# ==========================================================
-# SPEC NORMALIZATION / SANITIZATION
-# ==========================================================
-
-
-def _build_repair_prompt_por_restriccion(
-    *,
-    spec: dict,
-    full_errors: List[str],
-    target_error_path: str,
-    target_error_msg: str,
-    repair_paths: List[str],
-    files_generados: List[Dict[str, str]],
-) -> str:
-    """
-    Prompt de repair "atómico": atacar 1 error/restricción a la vez.
-    """
-    by_path = {(f.get("path") or "").replace("\\", "/"): (f.get("content") or "") for f in files_generados if f.get("path")}
-    target_src = by_path.get(target_error_path, "")
-
-    # limitar tamaño del source para no quemar tokens (pero mantener suficiente contexto)
-    target_lines = target_src.splitlines()
-    if len(target_lines) > 260:
-        target_src = "\n".join(target_lines[:260]) + "\n# ... (truncado)"
-
-    # Acotar a archivos implicados: el target + cualquier otro que guardrails haya marcado
-    # (pero manteniendo el repair atómico en el target como objetivo principal)
-    scoped_paths = [p for p in dict.fromkeys([target_error_path] + (repair_paths or [])).keys() if p]
-
-    # Extraer la restriction relevante del SPEC (best-effort, por id textual en el error)
-    restrictions = spec.get("restrictions", [])
-    rid = None
-    m = re.search(r"viola restriction '([^']+)'", target_error_msg or "")
-    if m:
-        rid = m.group(1).strip()
-
-    restriction_obj = None
-    if rid and isinstance(restrictions, list):
-        for r in restrictions:
-            if isinstance(r, dict) and str(r.get("id") or "").strip() == rid:
-                restriction_obj = r
-                break
-
-    restriction_block = json.dumps(restriction_obj, ensure_ascii=False) if restriction_obj else "(no disponible)"
-
-    return f"""
-TAREA
-Corrige UN ÚNICO incumplimiento bloqueante de guardrails del proyecto, con cambios mínimos y verificables.
-
-ERROR OBJETIVO (PRIORITARIO)
-- Archivo: {target_error_path}
-- Error: {target_error_msg}
-
-RESTRICCIÓN (si está disponible en SPEC.restrictions)
-{restriction_block}
-
-CONTEXTO
-- No re-arquitectures el proyecto.
-- No añadas endpoints ni cambies rutas/métodos del SPEC.
-- No añadas dependencias nuevas salvo que el propio SPEC lo exija.
-- Enfócate en eliminar el patrón prohibido o cumplir el patrón requerido de ESTA restricción.
-- Si la restricción es must_not_contain: el/los patrones NO deben aparecer en el archivo tras el cambio.
-
-CÓDIGO ACTUAL (fragmento) de {target_error_path}:
-```python
-{target_src}
-```
-
-ARCHIVOS QUE PUEDES MODIFICAR (paths exactos; devuelve SOLO de esta lista):
-{json.dumps(scoped_paths, ensure_ascii=False)}
-
-TODOS LOS ERRORES DE GUARDRAILS (para contexto; NO intentes arreglarlos todos a la vez):
-- {chr(10).join(full_errors)}
-
-SALIDA (EXCLUSIVAMENTE JSON válido):
-{{ "files": [{{"path":"...", "content":"..."}}] }}
-
-REGLAS
-- Devuelve SOLO archivos dentro de la lista permitida.
-- El contenido debe ser completo (no parcial).
-- No incluyas texto fuera del JSON.
-""".strip()
-
-
-# ==========================================================
-# PROMPT LIBRE DE GENERACIÓN COMPLETA
-# ==========================================================
-
-
-def _construir_prompt_spec(
-    descripcion_global: str,
-    contexto_normalizado: dict | None = None,
-) -> str:
-    """
-    Prompt SPEC intencionalmente corto.
-    - El SPEC define el QUÉ (estructura/contratos), no el CÓMO (implementación).
-    - Las reglas de implementación se aplican por lotes durante la generación de archivos.
-    """
-    if contexto_normalizado:
-        objetivo = contexto_normalizado.get("objetivo_tecnico", "")
-        funcionalidades = contexto_normalizado.get("funcionalidades_clave", [])
-        integraciones = contexto_normalizado.get("integraciones_externas", [])
-        restricciones = contexto_normalizado.get("restricciones_tecnicas", [])
-
-        descripcion_structurada = f"""
-OBJETIVO:
-{objetivo}
-
-FUNCIONALIDADES:
-{chr(10).join(f"- {f}" for f in funcionalidades) if funcionalidades else "- No especificadas"}
-
-INTEGRACIONES:
-{chr(10).join(f"- {i}" for i in integraciones) if integraciones else "- No especificadas"}
-
-RESTRICCIONES:
-{chr(10).join(f"- {r}" for r in restricciones) if restricciones else "- No especificadas"}
-"""
-    else:
-        descripcion_structurada = f"DESCRIPCIÓN:\n{descripcion_global}\n"
-
-    return f"""
-TAREA
-Genera un SPEC (plan) en JSON para una PoC FastAPI.
-
-{descripcion_structurada}
-
-INVARIANTES (ESTRUCTURALES)
-- Paquete raíz: app/
-- Entrypoint: app.main:app
-- Comando local: uvicorn app.main:app --reload
-- Imports internos: absolutos desde app.*
-- La app DEBE ser importable sin configuración externa (no validar credenciales/config en import-time).
-- Si el proyecto usa persistencia con SQLAlchemy (PostgreSQL/SQLite/etc.) y define modelos, debe incluir bootstrap simple del esquema (modo PoC):
-  - En el startup/lifespan de FastAPI, crear tablas automáticamente con `Base.metadata.create_all()`.
-  - En async SQLAlchemy: `async with engine.begin() as conn: await conn.run_sync(Base.metadata.create_all)`.
-  - NO uses Alembic a menos que el usuario lo pida explícitamente.
-
-EL SPEC DEBE INCLUIR
-- "files": lista EXACTA de rutas a generar (relativas)
-- "endpoints": lista de endpoints con method/path/file/func
-  - IMPORTANTE: `endpoints[].path` es el path FINAL que debe exponer FastAPI.
-  - `endpoints[].request`: contrato de request (tipo + esquema)
-    - type: "json" | "multipart" | "query" | "none"
-    - schema: objeto JSON Schema-like (solo si type="json")
-  - `endpoints[].response`: contrato de response (json_example mínimo)
-  - `endpoints[].errors`: lista de códigos HTTP esperados (p.ej. [401,403,404])
-- "env": variables de entorno esperadas (nombres exactos y para qué sirven) (si aplica)
-- "dependencies": lista de dependencias PyPI mínimas (runtime) (si aplica)
-- "dev_dependencies": lista de dependencias PyPI para desarrollo/tests (si aplica)
-- "contracts": reglas de comportamiento por endpoint (códigos de error esperados y condición) (si aplica)
-- "restrictions": lista de restricciones ejecutables (enforcement-ready) derivadas de restricciones del usuario
-  - Formato por item:
-    - id: string corto
-    - applies_to: lista de globs (p.ej. ["*.py", "requirements.txt"]) (opcional; default "*")
-    - must_not_contain: lista de substrings prohibidas (opcional)
-    - must_contain_any: lista de substrings requeridas (opcional; al menos una debe aparecer)
-
-SALIDA
-Devuelve EXCLUSIVAMENTE JSON válido con la estructura:
-
-{{
-  "entrypoint": "app.main:app",
-  "run_command": "uvicorn app.main:app --reload",
-  "imports_policy": "absolute_from_app",
-  "files": ["app/main.py", "..."],
-  "dependencies": ["fastapi", "uvicorn", "..."],
-  "dev_dependencies": ["pytest", "pytest-mock", "httpx"],
-  "env": [{{"name":"VAR", "description":"..."}}],
-  "endpoints": [
-    {{
-      "method":"GET",
-      "path":"/x",
-      "file":"app/endpoints/x.py",
-      "func":"x",
-      "request": {{"type":"none"}},
-      "response": {{"json_example": {{"status":"ok"}}}},
-      "errors": [401,403,404],
-      "bundle_files":[
-        "app/services/x_service.py",
-        "app/utils/x_utils.py"
-      ]
-    }}
-  ],
-  "contracts": [{{"endpoint":"/x","rules":["..."]}}],
-  "notes": "breve opcional"
-}}
-
-REGLAS
-- Devuelve EXCLUSIVAMENTE JSON válido.
-- Prohibido usar fences Markdown (``` o ```json).
-- No incluyas texto fuera del JSON.
-- No inventes archivos Python fuera de app/.
-- Incluye requirements.txt y README.md en files.
-- Si declaras endpoints, usa `bundle_files` para listar los módulos internos que el endpoint necesita (services/utils/etc.) y que deben generarse en el MISMO lote que el endpoint para evitar imports/símbolos faltantes.
-- Si en `env` declaras `DATABASE_URL` y hay endpoints de escritura (POST/PUT/PATCH/DELETE):
-  - Debes incluir modelos SQLAlchemy (tablas) y un startup/lifespan que haga `create_all` para que el primer POST no falle.
-  - Documenta en README que en modo PoC se crean tablas automáticamente al arrancar.
-- NO inventes endpoints: los endpoints implementados deben ser exactamente los listados en `endpoints`.
-- Si el usuario ha especificado explícitamente endpoints en la descripción (p.ej. “exponer endpoint ... /ruta ...”), el SPEC DEBE incluirlos en `endpoints` y en `files`.
-  - Prohibido degradar silenciosamente a “stub” u omitir endpoints solicitados.
-  - Si no puedes describir el endpoint con suficiente detalle, incluye igualmente el endpoint con `request.type` adecuado y añade en `notes` qué asunción has hecho.
-- Consistencia de rutas (obligatorio, para evitar /x/x):
-  - Estrategia única A (recomendada): `include_router(..., prefix=\"\")` y decorators con el path completo (p.ej. `@router.get(\"/health\")`).
-  - Prohibido añadir prefixes no vacíos en `include_router` si el decorator ya incluye el path completo.
-- Consistencia request:
-  - Si `endpoints[].request.type == \"json\"`: el endpoint debe usar `Body`/Pydantic model y `application/json`. Prohibido `UploadFile`/`File`.
-  - Si `endpoints[].request.type == \"multipart\"`: entonces sí usar `UploadFile`/`File`.
-- /health determinista:
-  - Si un endpoint declara response.json_example fijo y request.type == \"none\", no debe tener try/except genérico ni dependencias externas; devolver directamente el JSON de ejemplo.
-"""
 
 
 # ==========================================================
@@ -861,8 +540,8 @@ def generar_proyecto_completo(
     # -------------------------
     # FASE 1: SPEC
     # -------------------------
-    prompt_spec = _construir_prompt_spec(
-        descripcion_global,
+    prompt_spec = _build_prompt_spec(
+        descripcion_global=descripcion_global,
         contexto_normalizado=contexto_normalizado,
     )
 
