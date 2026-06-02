@@ -252,13 +252,17 @@ def _estimar_horas_desde_inputs(
         contexto_normalizado=contexto_normalizado,
     )
 
-    contenido_estimacion = chat_completion_json(
-        prompt=prompt_estimacion,
-        system="Responde únicamente con JSON válido.",
-        temperature=0.0,
-        max_tokens=PARAMETROS_ESTIMACION.max_tokens_estimacion,
-        fase="estimacion",
-    )
+    try:
+        contenido_estimacion = chat_completion_json(
+            prompt=prompt_estimacion,
+            system="Responde únicamente con JSON válido.",
+            temperature=0.0,
+            max_tokens=PARAMETROS_ESTIMACION.max_tokens_estimacion,
+            fase="estimacion",
+        )
+    except Exception:
+        # La estimación es best-effort: no debe romper el pipeline si el alias/proveedor falla.
+        contenido_estimacion = ""
 
     data = _parse_json_or_fallback(contenido_estimacion, _ESTIMACION_JSON_FALLBACK)
 
