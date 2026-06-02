@@ -1714,6 +1714,29 @@ def repair_tests_until_pytest_passes(
         current_tests.update(patch)
         patched_total.update(patch)
 
+        # 🔒 Reinyectar configuración base de pytest.ini tras cada patch (anti-LLM override)
+        try:
+            base_pytest_ini = """[pytest]
+addopts = -q
+testpaths = tests
+python_files = test_smoke_import.py test_openapi.py test_endpoints_hermetic.py
+asyncio_mode = auto
+markers =
+    hermetic
+    openapi
+    smoke
+"""
+            materializar_proyecto(
+                nombre_proyecto=nombre_proyecto,
+                estructura={"pytest.ini": base_pytest_ini},
+                limpiar_directorio=False,
+            )
+            estructura["pytest.ini"] = base_pytest_ini
+            current_tests["pytest.ini"] = base_pytest_ini
+            patched_total["pytest.ini"] = base_pytest_ini
+        except Exception:
+            logger.exception("[PYTEST-REPAIR] No se pudo reinyectar pytest.ini base.")
+
         # Budget / no_improve: solo cuenta si aplicamos patch.
         # Reset contador de "no patch" en C1 cuando sí aplicamos algo.
         if subphase == "C1":

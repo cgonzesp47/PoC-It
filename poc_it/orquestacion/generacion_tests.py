@@ -289,6 +289,11 @@ def _hermetic_suite_from_llm(nombre_proyecto: str, resultado: Dict[str, Any], es
         "addopts = -q\n"
         "testpaths = tests\n"
         "python_files = test_smoke_import.py test_openapi.py test_endpoints_hermetic.py\n"
+        "asyncio_mode = auto\n"
+        "markers =\n"
+        "    hermetic\n"
+        "    openapi\n"
+        "    smoke\n"
     )
     tests_result.estructura_tests["pytest.ini"] = pytest_ini
 

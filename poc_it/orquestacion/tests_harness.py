@@ -290,10 +290,13 @@ def render_conftest_py(runtime_contracts: dict) -> str:
 
     if plan.tests_style == "sync":
         lines.append("@pytest.fixture")
-        lines.append("def client(monkeypatch):")
-        lines.append("    _ensure_env(monkeypatch)")
+        lines.append("def app():")
         lines.append("    app_main = importlib.import_module('app.main')")
-        lines.append("    app = getattr(app_main, 'app')")
+        lines.append("    return getattr(app_main, 'app')")
+        lines.append("")
+        lines.append("@pytest.fixture")
+        lines.append("def client(app, monkeypatch):")
+        lines.append("    _ensure_env(monkeypatch)")
         lines.append("")
         lines.append("    # Dependency overrides (keys must be callables)")
         for dep in db_deps:
@@ -321,10 +324,13 @@ def render_conftest_py(runtime_contracts: dict) -> str:
         lines.append("")
     else:
         lines.append("@pytest.fixture")
-        lines.append("async def client(monkeypatch):")
-        lines.append("    _ensure_env(monkeypatch)")
+        lines.append("def app():")
         lines.append("    app_main = importlib.import_module('app.main')")
-        lines.append("    app = getattr(app_main, 'app')")
+        lines.append("    return getattr(app_main, 'app')")
+        lines.append("")
+        lines.append("@pytest.fixture")
+        lines.append("async def client(app, monkeypatch):")
+        lines.append("    _ensure_env(monkeypatch)")
         lines.append("")
         lines.append("    # Dependency overrides (keys must be callables)")
         for dep in db_deps:
