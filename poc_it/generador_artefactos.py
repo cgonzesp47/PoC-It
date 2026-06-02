@@ -436,7 +436,9 @@ def _generar_desde_spec_validado(
             allowed_paths=allowed_paths,
             intentos=intentos,
         ):
-            return {"files": []}
+            # Importante: si el SPEC es válido pero la fase final no converge, devolvemos el SPEC
+            # para permitir reintentos aguas arriba (orquestador) reutilizando la “fuente de verdad”.
+            return {"files": [], "spec": spec}
 
         return {"files": files_generados, "spec": spec}
 
@@ -480,7 +482,9 @@ def _generar_desde_spec_validado(
         intentos=intentos,
     ):
         print("[DEBUG] Fase final de validación/repair no convergió.")
-        return {"files": []}
+        # Importante: si el SPEC es válido pero la fase final no converge, devolvemos el SPEC
+        # para permitir reintentos aguas arriba (orquestador) reutilizando la “fuente de verdad”.
+        return {"files": [], "spec": spec}
 
     return {"files": files_generados, "spec": spec}
 

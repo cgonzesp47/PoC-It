@@ -140,10 +140,13 @@ def _build_files_context(estructura: Dict[str, str], files: List[str], max_chars
 
 def postprocesar_alineacion_llm(
     *,
-    estructura: Dict[str, str],
-    spec: Optional[dict] = None,
-    issues: List[AlignmentIssue],
+    estructura: dict[str, str],
+    spec: dict | None,
+    issues: list[AlignmentIssue],
+    runtime_contracts: dict | None = None,
     max_files: int = 6,
+    repair_goal: str = "tests",
+    strategy_hint: str = "GENERAL",
 ) -> PostprocessResult:
     """
     Ejecuta post-procesado SOLO via LLM.
@@ -160,13 +163,71 @@ def postprocesar_alineacion_llm(
     """
     facts = extract_poc_facts_from_structure(estructura).to_dict()
 
-    files_to_patch = _pick_files_to_patch(issues, max_files=max_files)
+    rg = (repair_goal or "auto").strip().lower()
+
+    # En modo TEST_REPAIR forzamos allowlist estricta para evitar que el LLM “escape” a app/**
+    # cuando el traceback menciona ficheros de app (p.ej. Settings/DATABASE_URL missing).
+    # Esto es clave para convergencia: si estamos reparando tests, solo se puede tocar tests/**.
+    if rg == "tests":
+        files_to_patch = []
+        for p in estructura.keys():
+            pp = (p or "").replace("\\", "/")
+            if pp.startswith("tests/") or pp == "conftest.py":
+                files_to_patch.append(pp)
+        # Fallback conservador: si no hay tests, al menos tocar el propio issue.file
+        if not files_to_patch:
+            files_to_patch = _pick_files_to_patch(issues, max_files=max_files)
+        else:
+            files_to_patch = files_to_patch[: max(1, max_files)]
+    else:
+        files_to_patch = _pick_files_to_patch(issues, max_files=max_files)
+
     files_ctx = _build_files_context(estructura, files_to_patch)
+
+    goal_rules = ""
+    if rg == "code":
+        goal_rules = """
+OBJETIVO DE REPARACIÓN: CODE_REPAIR
+- Prioriza arreglar el código de app/ para eliminar excepciones (NameError/AttributeError/imports).
+- NO cambies tests salvo que el error esté en tests y sea estrictamente necesario.
+- NO inventes integraciones externas: si falta DB/credenciales, maneja el caso de forma controlada (errores claros) y mantén import-time estable.
+"""
+    elif rg == "tests":
+        goal_rules = """
+OBJETIVO DE REPARACIÓN: TEST_REPAIR
+- Prioriza arreglar SOLO tests (tests/**, conftest.py) para que sean coherentes con el código existente.
+- NO modifiques app/** salvo que sea imprescindible para permitir import-time (y solo cambios triviales de wiring: imports/logger).
+- Los tests deben ser herméticos: sin red, sin DB real. Usa dependency overrides/mocks coherentes con las firmas reales (AsyncSession vs dict).
+- NO cambies la semántica de la app: adapta asserts/payloads/status codes a lo que el código realmente implementa y a la SPEC.
+"""
+    else:
+        goal_rules = """
+OBJETIVO DE REPARACIÓN: AUTO
+- Si el traceback apunta a app/** con excepciones, arregla código.
+- Si lo que falla son asserts/status codes/contract mismatch, arregla tests.
+"""
 
     prompt = f"""
 TAREA
 Eres un post-procesador de alineación de un proyecto FastAPI generado por IA.
 Debes corregir SOLO los errores reportados, con el CAMBIO MÍNIMO posible.
+
+ESTRATEGIA (HINT; APLICAR SI ES COMPATIBLE CON LOS ISSUES)
+- strategy_hint = {strategy_hint}
+- BOOTSTRAP_HERMETIC:
+  - Haz los tests herméticos: sin DB/red/credenciales reales.
+  - Prefiere introducir/ajustar tests/conftest.py (dependency_overrides, monkeypatch.setenv).
+- STATEFUL_DOUBLES:
+  - Si los tests realizan POST->GET/PUT/DELETE, usa stubs stateful (misma instancia en fixture).
+  - Evita doubles incompatibles con Depends (p.ej. dict como db/session).
+- CONTRACT_ALIGNMENT:
+  - Alinea asserts/status codes/body shape con lo que realmente devuelve el código.
+  - Relaja asserts demasiado estrictos en modo PARCIAL.
+- CLEANUP_FINAL:
+  - Minimiza cambios; evita reescrituras grandes.
+  - Si hay estancamiento, prefiere degradar tests a smoke/openapi en vez de inventar wiring.
+
+{goal_rules}
 
 FUENTES DE VERDAD
 1) SPEC (intención del usuario): úsalo para NO romper requisitos.
@@ -174,6 +235,14 @@ FUENTES DE VERDAD
 
 SPEC (JSON; puede ser null)
 {json.dumps(spec, ensure_ascii=False)}
+
+RUNTIME_CONTRACTS (JSON; puede ser null)
+- Si es no-null, úsalo como fuente de verdad para:
+  - métodos/paths reales existentes (evitar 404/405 falsos)
+  - required/optional fields reales por endpoint (evitar expectativas 422 incorrectas)
+  - not_found_http_status y returns_none_on_not_found (ej: PUT {{}} puede ser 404 si resource no existe)
+  - dependency_overrides permitidos (allowed_dependency_overrides) y estilo de tests (sync/async)
+{json.dumps(runtime_contracts, ensure_ascii=False) if runtime_contracts is not None else "null"}
 
 FACTS (JSON)
 {json.dumps(facts, ensure_ascii=False)}
@@ -228,7 +297,7 @@ Devuelve SOLO JSON con el formato:
         temperature=0.1,
         max_tokens=2500,
         provider_hint="code-gen",
-        fase="postprocesado_alineacion",
+        fase="generacion_codigo",
     )
 
     data = json.loads(llm_raw)

@@ -113,6 +113,18 @@ def alinear_spec_con_contexto(
                             f"MUST: mismatch response.json_example en {ck[0]} {ck[1]} (SPEC debe seguir contratos_api)"
                         )
 
+        # NOTA: los contratos_api vienen del texto del usuario y pueden usar convenciones distintas
+        # (p.ej. idioma: /productos vs /products). En modo PARCIAL queremos ser tolerantes:
+        # - Es MUST que SPEC contenga al menos todos los endpoints declarados por contratos_api (fuente de verdad).
+        # - Pero NO es MUST que SPEC no tenga endpoints extra si el generador los añadió por heurística/arquitectura,
+        #   siempre que no contradigan restricciones.
+        #
+        # La detección de "extras" se rebaja a WARNING para evitar abortar la generación por diferencias de naming.
+        # NOTA: contratos_api viene del texto del usuario y puede usar convenciones distintas
+        # (p.ej. idioma: /productos vs /products). En modo PARCIAL queremos ser tolerantes:
+        # - Es MUST que SPEC contenga al menos todos los endpoints declarados por contratos_api (fuente de verdad).
+        # - Pero NO es MUST que SPEC no tenga endpoints extra, siempre que no contradigan restricciones.
+        # Por tanto, "extras" se rebaja a WARNING para evitar abortar la generación por diferencias de naming.
         contract_keys = {
             _k(c.get("method"), c.get("path"))
             for c in contratos_api
@@ -123,7 +135,7 @@ def alinear_spec_con_contexto(
         )
         if extras:
             errors_contract.append(
-                "MUST: spec contiene endpoints no listados en contratos_api: " + ", ".join(extras)
+                "WARN: spec contiene endpoints no listados en contratos_api: " + ", ".join(extras)
             )
 
         if errors_contract:

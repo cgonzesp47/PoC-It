@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+
 import os
 import re
 from typing import Any, Dict, Optional
@@ -8,8 +9,13 @@ from typing import Any, Dict, Optional
 from poc_it.generador_artefactos import generar_proyecto_desde_spec
 from poc_it.materializador_archivos import materializar_proyecto
 from poc_it.models import ProjectContext
+from poc_it.orquestacion.llm_safe_repair import SafeRepairConfig, run_llm_safe_repair
 from poc_it.orquestacion.verificador_runtime import runtime_verify_fastapi_project
 from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
+from poc_it.orquestacion.pytest_llm_repair import repair_tests_until_pytest_passes
+from poc_it.orquestacion.tests_coverage_llm_repair import repair_tests_coverage_until_ok
+from poc_it.orquestacion.wiring_verifier import verify_wiring_against_runtime_contracts
+from poc_it.orquestacion.runtime_probe import run_runtime_probe
 
 logger = logging.getLogger(__name__)
 
@@ -60,33 +66,252 @@ def ejecutar_reparacion_runtime(
     estructura: Dict[str, str],
     archivos_creados: list[str],
     regenerar_tests: bool,
-    max_runtime_repairs: int = 5,
+    max_runtime_repairs: int = 3,
 ) -> None:
-    """Repair loop para asegurar que el proyecto es importable (import-time) sin configuración externa.
+    """Repair loop best-effort para asegurar que el proyecto es importable (import-time) sin configuración externa.
 
-    Mantiene el comportamiento del orquestador:
-    - Verifica importabilidad con `runtime_verify_fastapi_project(project_dir)`.
-    - Si falla, genera un patch con el LLM y materializa.
-    - Si agota intentos, lanza ValueError con detalle para cortar el flujo.
+    Objetivo pragmático:
+    - Verificar importabilidad con `runtime_verify_fastapi_project(project_dir, spec)`.
+    - Si falla, intentar reparar con el LLM y materializar un patch.
+    - Si agota intentos, NO corta el flujo: persiste un artefacto de error dentro del proyecto
+      y continúa (se debe devolver el código generado aunque no sea importable).
+
+    Nota:
     - Si se ha reparado y `regenerar_tests` es True, re-genera tests mínimos.
     """
     runtime_repaired = False
+    code_ok = False
     last_missing_module: Optional[str] = None
     llm_attempted_for_missing: bool = False
+
+    logger.info(
+        "[PIPELINE][A] Code correctness loop (max=%s): import-time + wiring(OpenAPI) + request-time probe",
+        max_runtime_repairs,
+    )
 
     for attempt in range(max_runtime_repairs + 1):
         ok_runtime, detail = runtime_verify_fastapi_project(project_dir, resultado.get("spec"))
         if ok_runtime:
+            # Verificación adicional determinista: wiring mínimo vía OpenAPI
+            w = verify_wiring_against_runtime_contracts(project_dir=project_dir, estructura=estructura)
+            if not w.ok:
+                ok_runtime = False
+                detail = "RUNTIME_WIRING_VERIFY_FAILED\n" + (w.detail or "")
+
+        if ok_runtime:
+            # Verificación request-time (best-effort en PARCIAL):
+            # - Siempre ejecutamos el probe para enriquecer runtime_contracts con facts (query/body),
+            #   lo que alinea generación/repair de tests.
+            # - En modo PARCIAL NO bloqueamos el pipeline si un endpoint devuelve 500, porque puede
+            #   depender de integraciones externas o de shapes no reproducibles (form/file) en este probe.
+            # Sincronización crítica: si runtime_contracts fue materializado a disco pero `estructura`
+            # aún no lo contiene (o está vacío), el probe seleccionaría 0 endpoints y stub_signatures quedaría vacío.
+            try:
+                rc_key = " .poc_it/runtime_contracts.json".strip()
+                rc_in_mem = estructura.get(rc_key) or ""
+                if not (isinstance(rc_in_mem, str) and rc_in_mem.strip()):
+                    rc_path = os.path.join(project_dir, ".poc_it", "runtime_contracts.json")
+                    if os.path.exists(rc_path):
+                        with open(rc_path, "r", encoding="utf-8") as f:
+                            estructura[rc_key] = f.read()
+            except Exception:
+                pass
+            probe = run_runtime_probe(project_dir=project_dir, estructura=estructura, max_endpoints=3)
+
+            # Si el probe ha generado/actualizado artefactos, materializarlos en el proyecto.
+            # IMPORTANTE: runtime_probe puede enriquecer `.poc_it/runtime_contracts.json` en `estructura`
+            # (query/body/response hints). Si no lo persistimos a disco aquí, la fase C podría leer
+            # un runtime_contracts "viejo" y fallar en reparar 422 (json vs params).
+            try:
+                patch_probe = {}
+                if " .poc_it/runtime_contracts.json".strip() in (estructura or {}):
+                    patch_probe[".poc_it/runtime_contracts.json"] = estructura[".poc_it/runtime_contracts.json"]
+
+                if ".poc_it/stub_signatures.json" in (estructura or {}):
+                    patch_probe[".poc_it/stub_signatures.json"] = estructura[".poc_it/stub_signatures.json"]
+
+                if patch_probe:
+                    materializar_proyecto(
+                        nombre_proyecto=nombre_proyecto,
+                        estructura=patch_probe,
+                        limpiar_directorio=False,
+                    )
+                    for rel in patch_probe.keys():
+                        archivos_creados.append(os.path.join(project_dir, rel.replace("/", os.sep)))
+            except Exception:
+                pass
+
+            if not probe.ok:
+                gen_mode = ""
+                try:
+                    rc_raw = estructura.get(" .poc_it/runtime_contracts.json".strip()) or ""
+                    import json as _json
+                    rc_obj = _json.loads(rc_raw) if isinstance(rc_raw, str) and rc_raw.strip() else {}
+                    gen_mode = str((rc_obj or {}).get("generation_mode") or "").upper()
+                except Exception:
+                    gen_mode = ""
+
+                if gen_mode and gen_mode != "PARCIAL":
+                    ok_runtime = False
+                    detail = "RUNTIME_REQUEST_PROBE_FAILED\n" + (probe.detail or "")
+                else:
+                    logger.info(
+                        "[PIPELINE][A] Runtime request-probe falló pero se ignora en PARCIAL (best-effort). Detalle: %s",
+                        (probe.detail or "")[:400],
+                    )
+
+        # ------------------------------------------------------------
+        # SUBSECCIÓN (aislable): LLM Safe Repair (diagnose -> patch -> gates -> rollback)
+        #
+        # Objetivo de esta subsección:
+        # - Dejar el código en estado "correcto" ANTES de generar tests.
+        # - Cubre:
+        #   A) import-time (runtime_verify)
+        #   B) wiring (OpenAPI/runtime_contracts)
+        #   C) request-time en endpoints (p.ej. NameError logger, exceptions no controladas)
+        #
+        # Feature flags:
+        #   POC_IT_SAFE_LLM_REPAIR=1
+        #   POC_IT_SAFE_LLM_REPAIR_MAX=2
+        #   POC_IT_SAFE_LLM_REPAIR_REQUIRE_PROBE_OK=1   (si se activa, exige probe.ok incluso en PARCIAL)
+        #
+        # Nota: NO usa fixers deterministas. Solo LLM + gates + rollback.
+        # ------------------------------------------------------------
+        safe_enabled = str(os.getenv("POC_IT_SAFE_LLM_REPAIR", "")).strip() in ("1", "true", "True", "yes", "YES")
+        safe_max = int(os.getenv("POC_IT_SAFE_LLM_REPAIR_MAX", "2") or "2")
+        require_probe_ok = str(os.getenv("POC_IT_SAFE_LLM_REPAIR_REQUIRE_PROBE_OK", "")).strip() in (
+            "1",
+            "true",
+            "True",
+            "yes",
+            "YES",
+        )
+
+        safe = SafeRepairConfig(
+            enabled=safe_enabled,
+            max_attempts=max(1, safe_max),
+        )
+
+        # Gate C: request-time probe, controlable por flag para no romper PARCIAL si el usuario no quiere.
+        # Si se activa el safe repair, siempre ejecutamos el probe (ya lo ejecutamos arriba) pero:
+        # - Si require_probe_ok=True, entonces un probe no-ok se considera fallo y activa repair.
+        if ok_runtime and safe.enabled and require_probe_ok and (probe is not None) and (not probe.ok):
+            ok_runtime = False
+            detail = "RUNTIME_REQUEST_PROBE_FAILED\n" + (probe.detail or "")
+
+        if safe.enabled and not ok_runtime:
+            snapshot = dict(estructura)  # rollback in-memory
+            guardrails_warnings = None
+            try:
+                guardrails_warnings = (resultado.get("guardrails") or {}).get("warnings")  # best-effort
+            except Exception:
+                guardrails_warnings = None
+
+            sr = run_llm_safe_repair(
+                config=safe,
+                project_dir=project_dir,
+                spec=resultado.get("spec") if isinstance(resultado.get("spec"), dict) else None,
+                estructura=estructura,
+                runtime_detail=detail,
+                guardrails_warnings=guardrails_warnings if isinstance(guardrails_warnings, list) else None,
+            )
+
+            if sr.ok and sr.patch:
+                patch = sr.patch
+                runtime_repaired = True
+                materializar_proyecto(nombre_proyecto=nombre_proyecto, estructura=patch)
+                estructura.update(patch)
+                archivos_creados.extend([os.path.join(project_dir, p.replace("/", os.sep)) for p in patch.keys()])
+
+                # Gate 1: import-time verify again
+                ok2, detail2 = runtime_verify_fastapi_project(project_dir, resultado.get("spec"))
+                if not ok2:
+                    logger.info("[SAFE_LLM_REPAIR] Patch rechazado por runtime_verify. Rollback.")
+                    estructura.clear()
+                    estructura.update(snapshot)
+                    try:
+                        materializar_proyecto(
+                            nombre_proyecto=nombre_proyecto,
+                            estructura=snapshot,
+                            limpiar_directorio=False,
+                        )
+                    except Exception:
+                        pass
+                    detail = detail2
+                    ok_runtime = False
+                else:
+                    # Gate 2: wiring verify
+                    w2 = verify_wiring_against_runtime_contracts(project_dir=project_dir, estructura=estructura)
+                    if not w2.ok:
+                        logger.info("[SAFE_LLM_REPAIR] Patch rechazado por wiring_verify. Rollback.")
+                        estructura.clear()
+                        estructura.update(snapshot)
+                        try:
+                            materializar_proyecto(
+                                nombre_proyecto=nombre_proyecto,
+                                estructura=snapshot,
+                                limpiar_directorio=False,
+                            )
+                        except Exception:
+                            pass
+                        detail = "RUNTIME_WIRING_VERIFY_FAILED\n" + (w2.detail or "")
+                        ok_runtime = False
+                    else:
+                        # Gate 3: request-time probe (best-effort salvo flag require_probe_ok)
+                        probe2 = run_runtime_probe(project_dir=project_dir, estructura=estructura, max_endpoints=3)
+                        if require_probe_ok and not probe2.ok:
+                            logger.info("[SAFE_LLM_REPAIR] Patch rechazado por request-probe. Rollback.")
+                            estructura.clear()
+                            estructura.update(snapshot)
+                            try:
+                                materializar_proyecto(
+                                    nombre_proyecto=nombre_proyecto,
+                                    estructura=snapshot,
+                                    limpiar_directorio=False,
+                                )
+                            except Exception:
+                                pass
+                            detail = "RUNTIME_REQUEST_PROBE_FAILED\n" + (probe2.detail or "")
+                            ok_runtime = False
+                        else:
+                            logger.info("[SAFE_LLM_REPAIR] Patch aceptado. Files=%s", list(patch.keys()))
+                            ok_runtime = True
+                            # accepted: reintentar loop principal con código ya “más correcto”
+                            continue
+            else:
+                logger.info(
+                    "[SAFE_LLM_REPAIR] No se pudo producir patch seguro. Logs=%s",
+                    [(l.stage, l.ok) for l in sr.logs],
+                )
+        # ------------------------------------------------------------
+        # Fin subsección LLM Safe Repair
+        # ------------------------------------------------------------
+
+        if ok_runtime:
+            code_ok = True
             break
 
         if attempt >= max_runtime_repairs:
-            raise ValueError(
-                "El proyecto generado no supera verificación runtime.\n"
+            msg = (
+                "El proyecto generado no supera verificación runtime (import-time).\n"
                 + detail
                 + "\n\n"
                 + "Sugerencia: evita validar configuración/credenciales en import-time; "
                 + "haz lazy init y valida en runtime (en el endpoint que lo necesite)."
             )
+            logger.error("[RUNTIME_REPAIR] %s", msg)
+
+            # Persistimos un artefacto de error dentro del proyecto para que el usuario lo vea
+            # incluso si la ejecución continúa y se devuelven los archivos generados.
+            patch = {"RUNTIME_VERIFY_ERROR.txt": msg + "\n"}
+            try:
+                materializar_proyecto(nombre_proyecto=nombre_proyecto, estructura=patch)
+                estructura.update(patch)
+                archivos_creados.extend([os.path.join(project_dir, "RUNTIME_VERIFY_ERROR.txt")])
+            except Exception as exc:
+                logger.info("[RUNTIME_REPAIR] No se pudo materializar RUNTIME_VERIFY_ERROR.txt: %s", exc)
+
+            return
 
         missing_mod = _extraer_modulo_faltante(detail)
 
@@ -145,6 +370,22 @@ REGLAS DE REPARACIÓN (MÍNIMAS, CANÓNICAS)
 - Evita instanciar servicios/configuración en import-time. Haz lazy init dentro de endpoints/funciones.
 - Mantén el patrón FastAPI con routers.
 - Regla general: si importas `from X import Y`, entonces Y DEBE existir en X (no inventar símbolos).
+
+REGLAS PRAGMÁTICAS DE COMPATIBILIDAD (CÓDIGO COMPILABLE)
+- Pydantic v2 OBLIGATORIO:
+  - PROHIBIDO `orm_mode = True` y PROHIBIDO `from_orm(...)`.
+  - Para ORM/atributos:
+    - `from pydantic import BaseModel, ConfigDict`
+    - `model_config = ConfigDict(from_attributes=True)`
+    - `Schema.model_validate(obj)` (no `from_orm`)
+  - Para settings:
+    - `from pydantic_settings import BaseSettings` (no `from pydantic import BaseSettings`)
+- Cache/async:
+  - Está PROHIBIDO aplicar `@lru_cache` sobre `async def` (produce errores tipo “cannot reuse already awaited coroutine”).
+  - Si necesitas cachear un recurso async (engine/cliente), usa variable global inicializada lazy (None -> create),
+    o una función sync cacheada que devuelva un objeto ya construido sin await.
+- La reparación debe mantener la intención original del usuario (SPEC) y priorizar compilabilidad.
+
 - Si existe `app/config/settings.py`, el patrón de settings debe ser consistente:
   - Debe existir `class Settings(BaseSettings)`.
   - Debe existir `def get_settings() -> Settings` (cacheada con lru_cache) y ser el ÚNICO punto de creación.
@@ -189,8 +430,207 @@ SALIDA
             estructura.update(patch)
             archivos_creados.extend([os.path.join(project_dir, p.replace("/", os.sep)) for p in patch.keys()])
 
-    if runtime_repaired and regenerar_tests:
+    # Fase B: generación de tests (LLM) sobre código ya validado (import + wiring).
+    # Nota: aquí NO se repara código. Solo se generan tests.
+    if regenerar_tests and code_ok:
+        logger.info("[PIPELINE][B] Generación de tests herméticos (LLM)")
         try:
-            generar_tests_unitarios(nombre_proyecto, resultado, estructura, archivos_creados)
+            # FIX: Propagar modo de generación real (sin hardcodear).
+            #
+            # Fuente de verdad:
+            # - `resultado["clasificacion"]` (string) cuando viene del clasificador.
+            # - `spec["modo"]` / `spec["mode"]` si existe.
+            # - `resultado["modo"]` / `resultado["mode"]` como fallback.
+            #
+            # Si no se propaga, generacion_tests.py puede inferir mal _is_parcial() (p.ej. modo_generacion=None)
+            # y disparar validaciones legacy / fallbacks incorrectos.
+            modo = None
+            try:
+                modo = str((resultado or {}).get("clasificacion") or "").strip() or None
+            except Exception:
+                modo = None
+            if not modo:
+                try:
+                    spec = (resultado or {}).get("spec") if isinstance(resultado, dict) else None
+                    if isinstance(spec, dict):
+                        modo = str(spec.get("modo") or spec.get("mode") or "").strip() or None
+                except Exception:
+                    modo = None
+            if not modo:
+                try:
+                    modo = str((resultado or {}).get("modo") or (resultado or {}).get("mode") or "").strip() or None
+                except Exception:
+                    modo = None
+
+            generar_tests_unitarios(
+                nombre_proyecto,
+                resultado,
+                estructura,
+                archivos_creados,
+                modo_generacion=modo,
+            )
         except Exception as exc:
-            logger.info("[TESTS] Error regenerando tests tras reparación runtime: %s", exc)
+            logger.info("[TESTS] Error generando tests: %s", exc)
+
+        # Fase C0: coverage loop (solo tests) para asegurar tests por endpoint hermético antes de pytest
+        # DESACTIVADO TEMPORALMENTE: incrementa complejidad y no corrige los fallos más frecuentes observados
+        # (harness roto: fixtures called directly / client fixture missing / async-sync mismatch).
+        #
+        # logger.info("[PIPELINE][C0] Coverage loop (solo tests/ + pytest.ini)")
+        # try:
+        #     max_cov = int(os.getenv("TESTS_COVERAGE_REPAIR_MAX", "2"))
+        #     cov = repair_tests_coverage_until_ok(
+        #         nombre_proyecto=nombre_proyecto,
+        #         estructura=estructura,
+        #         max_repairs=max_cov,
+        #     )
+        #     if not cov.ok:
+        #         logger.info("[TESTS] Coverage repair loop agotado: %s", cov.detail)
+        # except Exception as exc:
+        #     logger.info("[TESTS] Aviso: coverage repair loop no ejecutable: %s", exc)
+
+        # Fase C: loop de pytest SOLO sobre tests (prohibido tocar app/**).
+        logger.info("[PIPELINE][C] Pytest loop (solo tests/ + pytest.ini)")
+        try:
+            import json as _json
+            import os as _os
+
+            rc = None
+            rf = None
+            try:
+                rc_raw = estructura.get(" .poc_it/runtime_contracts.json".strip()) or ""
+                rc = _json.loads(rc_raw) if isinstance(rc_raw, str) and rc_raw.strip() else None
+            except Exception:
+                rc = None
+
+            try:
+                rf_raw = estructura.get(" .poc_it/runtime_facts.json".strip()) or ""
+                rf = _json.loads(rf_raw) if isinstance(rf_raw, str) and rf_raw.strip() else None
+            except Exception:
+                rf = None
+
+            max_repairs = int(_os.getenv("TESTS_PYTEST_REPAIR_MAX", "3"))
+            rep = repair_tests_until_pytest_passes(
+                nombre_proyecto=nombre_proyecto,
+                project_dir=project_dir,
+                estructura=estructura,
+                max_repairs=max_repairs,
+                runtime_contracts=rc,
+                runtime_facts=rf,
+            )
+            if not rep.ok:
+                logger.info("[TESTS] Pytest repair loop agotado; pytest sigue fallando.")
+
+                # ------------------------------------------------------------
+                # Escalado pragmático (LLM-driven): si pytest no converge,
+                # intentar 1 safe-repair adicional sobre CÓDIGO usando pytest output
+                # como runtime_detail, con rollback + gates.
+                #
+                # No usa fixers deterministas. Solo LLM + allowlist + gates.
+                #
+                # Feature flag:
+                #   POC_IT_SAFE_LLM_REPAIR_FROM_PYTEST=1
+                # ------------------------------------------------------------
+                safe_from_pytest = str(os.getenv("POC_IT_SAFE_LLM_REPAIR_FROM_PYTEST", "")).strip() in (
+                    "1",
+                    "true",
+                    "True",
+                    "yes",
+                    "YES",
+                )
+                if safe_enabled and safe_from_pytest and (rep.last_output or "").strip():
+                    snapshot = dict(estructura)
+
+                    # Best-effort: ampliar allowlist con endpoints conocidos (runtime_contracts)
+                    # para que el safe repair no dependa solo del traceback de pytest (a veces solo muestra tests/*).
+                    extra_allow = []
+                    try:
+                        if isinstance(rc, dict):
+                            for ep in (rc.get("endpoints") or []):
+                                if isinstance(ep, dict):
+                                    mp = str(ep.get("module_path") or "").strip()
+                                    if mp:
+                                        extra_allow.append(mp.replace("\\", "/"))
+                    except Exception:
+                        extra_allow = []
+
+                    guardrails_warnings = None
+                    try:
+                        guardrails_warnings = (resultado.get("guardrails") or {}).get("warnings")
+                    except Exception:
+                        guardrails_warnings = None
+
+                    sr = run_llm_safe_repair(
+                        config=safe,
+                        project_dir=project_dir,
+                        spec=resultado.get("spec") if isinstance(resultado.get("spec"), dict) else None,
+                        estructura=estructura,
+                        runtime_detail=rep.last_output,
+                        guardrails_warnings=guardrails_warnings if isinstance(guardrails_warnings, list) else None,
+                        extra_allow_paths=extra_allow if extra_allow else None,
+                    )
+
+                    if sr.ok and sr.patch:
+                        patch = sr.patch
+                        materializar_proyecto(nombre_proyecto=nombre_proyecto, estructura=patch)
+                        estructura.update(patch)
+                        archivos_creados.extend([os.path.join(project_dir, p.replace("/", os.sep)) for p in patch.keys()])
+
+                        # Gates (mismos que subsección Safe Repair de A)
+                        ok2, _detail2 = runtime_verify_fastapi_project(project_dir, resultado.get("spec"))
+                        if not ok2:
+                            logger.info("[SAFE_FROM_PYTEST] Patch rechazado por runtime_verify. Rollback.")
+                            estructura.clear()
+                            estructura.update(snapshot)
+                            try:
+                                materializar_proyecto(
+                                    nombre_proyecto=nombre_proyecto,
+                                    estructura=snapshot,
+                                    limpiar_directorio=False,
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            w2 = verify_wiring_against_runtime_contracts(project_dir=project_dir, estructura=estructura)
+                            if not w2.ok:
+                                logger.info("[SAFE_FROM_PYTEST] Patch rechazado por wiring_verify. Rollback.")
+                                estructura.clear()
+                                estructura.update(snapshot)
+                                try:
+                                    materializar_proyecto(
+                                        nombre_proyecto=nombre_proyecto,
+                                        estructura=snapshot,
+                                        limpiar_directorio=False,
+                                    )
+                                except Exception:
+                                    pass
+                            else:
+                                # request-time probe best-effort (PARCIAL); enriquece artefactos pero no bloquea.
+                                try:
+                                    _ = run_runtime_probe(project_dir=project_dir, estructura=estructura, max_endpoints=3)
+                                except Exception:
+                                    pass
+
+                                # Reintentar pytest loop una única vez extra
+                                rep2 = repair_tests_until_pytest_passes(
+                                    nombre_proyecto=nombre_proyecto,
+                                    project_dir=project_dir,
+                                    estructura=estructura,
+                                    max_repairs=max_repairs,
+                                    runtime_contracts=rc,
+                                    runtime_facts=rf,
+                                )
+                                if rep2.ok:
+                                    logger.info(
+                                        "[SAFE_FROM_PYTEST] Pytest pasó tras reparación de código guiada por pytest."
+                                    )
+                                else:
+                                    logger.info(
+                                        "[SAFE_FROM_PYTEST] Pytest sigue fallando tras reparación de código guiada por pytest."
+                                    )
+                    else:
+                        logger.info("[SAFE_FROM_PYTEST] No se pudo producir patch seguro guiado por pytest.")
+        except Exception as exc:
+            logger.info("[TESTS] Aviso: pytest repair loop no ejecutable: %s", exc)
+    elif regenerar_tests and not code_ok:
+        logger.info("[PIPELINE] Skip tests: el código no es importable/wireable tras reparaciones (code_ok=False).")

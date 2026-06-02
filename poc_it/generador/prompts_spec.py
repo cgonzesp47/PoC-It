@@ -53,9 +53,12 @@ INVARIANTES (ESTRUCTURALES)
 - Imports internos: absolutos desde app.*
 - La app DEBE ser importable sin configuración externa (no validar credenciales/config en import-time).
 - Si el proyecto usa persistencia con SQLAlchemy (PostgreSQL/SQLite/etc.) y define modelos, debe incluir bootstrap simple del esquema (modo PoC):
-  - En el startup/lifespan de FastAPI, crear tablas automáticamente con `Base.metadata.create_all()`.
-  - En async SQLAlchemy: `async with engine.begin() as conn: await conn.run_sync(Base.metadata.create_all)`.
-  - NO uses Alembic a menos que el usuario lo pida explícitamente.
+  - Heurística: si existen modelos (Base + declarative models) y no hay migraciones, crea las tablas al arrancar (startup/lifespan) con `Base.metadata.create_all()`.
+  - En async SQLAlchemy, usa el patrón: `async with engine.begin() as conn: await conn.run_sync(Base.metadata.create_all)`.
+  - Heurística de errores: no enmascares errores de infraestructura (DB caída, credenciales, timeouts) como `400 invalid_payload`.
+    - Errores de DB/conectividad => 500/503 (y log con traceback).
+    - 400/409 solo para errores de negocio/validación propia (FastAPI/Pydantic ya maneja 422).
+  - Esto es para PoCs/local; en proyectos reales, lo normal es migraciones (Alembic), pero NO lo uses salvo que el usuario lo pida.
 
 EL SPEC DEBE INCLUIR
 - "files": lista EXACTA de rutas a generar (relativas)

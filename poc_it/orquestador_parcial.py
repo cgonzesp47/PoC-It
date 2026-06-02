@@ -23,7 +23,7 @@ import os
 from typing import Any, Dict, Tuple
 
 from poc_it.clasificador import clasificar_viabilidad
-from poc_it.generador_artefactos import generar_proyecto_completo
+from poc_it.generador_artefactos import generar_proyecto_completo, generar_proyecto_desde_spec
 from poc_it.materializador_archivos import materializar_proyecto
 from poc_it.models import ContextoNormalizado, ModoGeneracion, PlantillaUsuario, ProjectContext
 from poc_it.normalizador_contexto import normalizar_plantilla
@@ -33,6 +33,18 @@ from poc_it.orquestacion.postprocesado_alineacion import postprocesar_alineacion
 from poc_it.orquestacion.constantes import OUTPUT_DIRNAME, README_ERROR_FILENAME, README_FINAL_FILENAME
 from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
 from poc_it.orquestacion.reparacion_runtime import ejecutar_reparacion_runtime
+from poc_it.poc_facts_extractor import extract_poc_facts_from_structure
+from poc_it.runtime_contracts import (
+    EndpointRuntimeContract,
+    ObservedCall,
+    RuntimeContracts,
+    persist_runtime_contracts,
+)
+from poc_it.runtime_facts import (
+    EndpointRuntimeFacts,
+    RuntimeFacts,
+    persist_runtime_facts,
+)
 
 # Cachea el contexto normalizado para poder reutilizarlo en estimaciones (sin recalcular inputs).
 # Nota: se inicializa en _normalizar_contexto.
@@ -129,21 +141,39 @@ Descripción:
 
         t_generacion_inicio = time.perf_counter()
 
+        contexto_norm = context.contexto_normalizado.model_dump() if context.contexto_normalizado else None
+
         resultado = generar_proyecto_completo(
             descripcion_global=self.descripcion_global,
-            contexto_normalizado=(
-                context.contexto_normalizado.model_dump() if context.contexto_normalizado else None
-            ),
+            contexto_normalizado=contexto_norm,
         )
 
+        # Persistimos spec/diagnóstico del primer intento (si existe) antes de decidir el retry.
         persist_spec_json(self.nombre_proyecto, resultado, archivos_creados)
+
+        files = resultado.get("files", [])
+        spec = resultado.get("spec") if isinstance(resultado, dict) else None
+
+        # Retry: si tenemos SPEC válido pero la generación de código no converge (files vacío),
+        # reintentamos una vez reutilizando el SPEC como fuente de verdad.
+        if (not files) and isinstance(spec, dict) and spec:
+            logger.warning(
+                "[CODEGEN] Generación no convergió pero hay SPEC disponible. Reintentando una vez desde SPEC..."
+            )
+            resultado = generar_proyecto_desde_spec(
+                spec=spec,
+                descripcion_global=self.descripcion_global,
+                contexto_normalizado=contexto_norm,
+                intentos=1,
+            )
+            persist_spec_json(self.nombre_proyecto, resultado, archivos_creados)
+            files = resultado.get("files", [])
 
         t_generacion_fin = time.perf_counter()
         tiempo_generacion_horas = (t_generacion_fin - t_generacion_inicio) / 3600
 
-        files = resultado.get("files", [])
         if not files:
-            raise ValueError("El modelo no generó archivos válidos.")
+            raise ValueError("El modelo no generó archivos válidos (2 intentos: completo + desde SPEC).")
 
         estructura = {f["path"]: f["content"] for f in files if "path" in f and "content" in f}
 
@@ -186,6 +216,18 @@ Descripción:
                 modo_generacion=modo_generacion,
             )
 
+            # Fuente de verdad para el resto del pipeline:
+            # `resultado` (dict) es lo que se propaga a reparacion_runtime/generacion_tests.
+            # Si no persistimos el modo aquí, `generacion_tests._is_parcial()` puede ver modo=None
+            # (spec no siempre incluye modo) y disparar warnings legacy/fallback mínimo.
+            if isinstance(resultado, dict):
+                resultado["clasificacion"] = modo_generacion
+                resultado["modo"] = modo_generacion
+                spec0 = resultado.get("spec")
+                if isinstance(spec0, dict):
+                    spec0.setdefault("modo", modo_generacion)
+                    resultado["spec"] = spec0
+
             t_generacion_inicio = 0.0
             t_generacion_fin = 0.0
             if modo_generacion != ModoGeneracion.ASESOR:
@@ -198,14 +240,148 @@ Descripción:
 
                 project_dir = os.path.join(OUTPUT_DIRNAME, self.nombre_proyecto)
 
-                generar_tests = generar_tests_unitarios(self.nombre_proyecto, resultado, estructura, archivos_creados)
-                postprocesar_alineacion_por_pytest(
-                    nombre_proyecto=self.nombre_proyecto,
-                    project_dir=project_dir,
-                    resultado=resultado,
-                    estructura=estructura,
-                    archivos_creados=archivos_creados,
-                )
+                # Persistir artefacto intermedio con facts deterministas del CÓDIGO real
+                # para alinear la generación de tests con el wiring/DI realmente materializado.
+                try:
+                    facts = extract_poc_facts_from_structure(estructura).to_dict()
+                    endpoints: list[EndpointRuntimeFacts] = []
+                    contracts_eps: list[EndpointRuntimeContract] = []
+                    for ep in facts.get("endpoints", []) or []:
+                        calls: list[ObservedCall] = []
+                        for c in ep.get("observed_calls", []) or []:
+                            calls.append(
+                                ObservedCall(
+                                    receiver_param=str(c.get("receiver_param")),
+                                    method_name=str(c.get("method_name")),
+                                    arg_names=list(c.get("arg_names") or []),
+                                    awaited=bool(c.get("awaited")),
+                                )
+                            )
+
+                        # normalizar módulos a posix para estabilidad cross-platform
+                        module_path = str(ep.get("module_path") or "").replace("\\", "/")
+
+                        # Inferencias pragmáticas para stubs (modo PARCIAL):
+                        # - CRUD-like: si hay varias operaciones sobre el mismo receiver (svc.*), se recomienda stub stateful compartido
+                        # - not-found: si el endpoint declara response_model con required_fields, el stub no debe devolver modelos vacíos
+                        observed = ep.get("observed_calls", []) or []
+                        receiver_names = [str(c.get("receiver_param")) for c in observed if isinstance(c, dict)]
+                        receiver_is_service = any(r in ("svc", "service") or r.endswith("Service") for r in receiver_names)
+                        statefulness_recommended = "per_client_fixture" if receiver_is_service and len(observed) >= 1 else "stateless"
+
+                        returns_none_on_not_found = None
+                        not_found_http_status = None
+                        # Heurística: si hay response_model_required_fields, un "not found" NO puede ser {} / modelo vacío
+                        if (ep.get("response_model_required_fields") or []) and any(
+                            c.get("method_name", "").lower().startswith(("get_", "update_", "delete_")) for c in observed if isinstance(c, dict)
+                        ):
+                            returns_none_on_not_found = True
+                            not_found_http_status = 404
+
+                        ep_fact = EndpointRuntimeFacts(
+                            path=str(ep.get("path")),
+                            method=str(ep.get("method")),
+                            module_path=module_path,
+                            func_name=str(ep.get("func_name")),
+                            status_code=ep.get("status_code"),
+                            depends=list(ep.get("depends") or []),
+                            depends_imports=list(ep.get("depends_imports") or []),
+                            injected_params=list(ep.get("injected_params") or []),
+                            uses_injected=bool(ep.get("uses_injected")),
+                            observed_calls=calls,
+                            request_body_param=ep.get("request_body_param"),
+                            request_model=ep.get("request_model"),
+                            request_required_fields=list(ep.get("request_required_fields") or []),
+                            request_optional_fields=list(ep.get("request_optional_fields") or []),
+                            response_model=ep.get("response_model"),
+                            response_model_required_fields=list(ep.get("response_model_required_fields") or []),
+                            response_model_optional_fields=list(ep.get("response_model_optional_fields") or []),
+                            statefulness_recommended=statefulness_recommended,
+                            returns_none_on_not_found=returns_none_on_not_found,
+                            not_found_http_status=not_found_http_status,
+                        )
+                        endpoints.append(ep_fact)
+
+                        contracts_eps.append(
+                            EndpointRuntimeContract(
+                                path=ep_fact.path,
+                                method=ep_fact.method,
+                                module_path=ep_fact.module_path,
+                                func_name=ep_fact.func_name,
+                                status_code=ep_fact.status_code,
+                                depends=ep_fact.depends,
+                                depends_imports=ep_fact.depends_imports,
+                                injected_params=ep_fact.injected_params,
+                                uses_injected=ep_fact.uses_injected,
+                                observed_calls=calls,
+                                request_body_param=ep_fact.request_body_param,
+                                request_model=ep_fact.request_model,
+                                request_required_fields=ep_fact.request_required_fields,
+                                request_optional_fields=ep_fact.request_optional_fields,
+                                path_params=list(ep.get("path_params") or []),
+                                query_params_required=list(ep.get("query_params_required") or []),
+                                query_params_optional=list(ep.get("query_params_optional") or []),
+                                header_params_required=list(ep.get("header_params_required") or []),
+                                header_params_optional=list(ep.get("header_params_optional") or []),
+                                cookie_params_required=list(ep.get("cookie_params_required") or []),
+                                cookie_params_optional=list(ep.get("cookie_params_optional") or []),
+                                form_params_required=list(ep.get("form_params_required") or []),
+                                form_params_optional=list(ep.get("form_params_optional") or []),
+                                file_params_required=list(ep.get("file_params_required") or []),
+                                file_params_optional=list(ep.get("file_params_optional") or []),
+                                response_model=ep_fact.response_model,
+                                response_model_required_fields=ep_fact.response_model_required_fields,
+                                response_model_optional_fields=ep_fact.response_model_optional_fields,
+                                statefulness_recommended=ep_fact.statefulness_recommended,
+                                returns_none_on_not_found=ep_fact.returns_none_on_not_found,
+                                not_found_http_status=ep_fact.not_found_http_status,
+                            )
+                        )
+                    # Inferir estilo de tests (sync vs async) desde el CÓDIGO real.
+                    #
+                    # Regla pragmática:
+                    # - Por defecto "sync" (TestClient). FastAPI soporta perfectamente endpoints async bajo TestClient.
+                    # - Solo usar "async" si el propio suite debe ser async por razones estructurales (muy raras):
+                    #   p.ej. si el proyecto expone explícitamente tests async o si detectamos dependencias a pytest-anyio/asyncio en config.
+                    #
+                    # Nota: Este flag existe para evitar que el LLM mezcle fixtures async + TestClient (error frecuente).
+                    tests_style = "sync"
+                    runtime_facts = RuntimeFacts(
+                        endpoints=endpoints,
+                        env_vars_explicit=list(facts.get("env_vars_explicit") or []),
+                        imports=list(facts.get("imports") or []),
+                        tests_style=tests_style,
+                    )
+                    estructura = persist_runtime_facts(project_structure=estructura, runtime_facts=runtime_facts)
+
+                    runtime_contracts = RuntimeContracts(
+                        endpoints=contracts_eps,
+                        env_vars_explicit=list(facts.get("env_vars_explicit") or []),
+                        imports=list(facts.get("imports") or []),
+                        tests_style=tests_style,
+                        hermetic=True,
+                        generation_mode=modo_generacion,
+                        allowed_dependency_overrides=None,
+                    )
+                    estructura = persist_runtime_contracts(project_structure=estructura, runtime_contracts=runtime_contracts)
+
+                    archivos_creados = materializar_proyecto(
+                        nombre_proyecto=self.nombre_proyecto,
+                        estructura={
+                            ".poc_it/runtime_facts.json": estructura[".poc_it/runtime_facts.json"],
+                            ".poc_it/runtime_contracts.json": estructura[".poc_it/runtime_contracts.json"],
+                        },
+                        limpiar_directorio=False,
+                    )
+                except Exception:
+                    logger.exception("No se pudo persistir runtime_facts; se continúa sin artefacto intermedio.")
+
+                # NUEVO FLUJO (separación estricta de responsabilidades)
+                # Fase A: code correctness loop (solo código, import-time + wiring mínimo)
+                # Fase B: generación de tests (LLM) 100% herméticos, guiados por runtime_contracts
+                # Fase C: pytest loop SOLO tests (app/** prohibido)
+                #
+                # Importante: desactivamos el postprocesado-alineación por pytest, porque mezcla corrección de código con tests.
                 ejecutar_reparacion_runtime(
                     nombre_proyecto=self.nombre_proyecto,
                     descripcion_global=self.descripcion_global,
@@ -214,7 +390,7 @@ Descripción:
                     resultado=resultado,
                     estructura=estructura,
                     archivos_creados=archivos_creados,
-                    regenerar_tests=generar_tests,
+                    regenerar_tests=True,
                 )
 
             modo_upper = modo_generacion
