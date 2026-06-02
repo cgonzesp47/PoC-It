@@ -8,6 +8,15 @@ from typing import Final
 PYTHON_EXECUTABLE: Final[str] = "python"
 IMPORT_MAIN_CMD: Final[list[str]] = [PYTHON_EXECUTABLE, "-c", "import app.main; print('IMPORT_MAIN_OK')"]
 
+# Smoke básico: importa app.main y ejecuta un request mínimo a /openapi.json.
+# Esto captura bugs típicos de wiring que NO aparecen en import-time (p.ej. usar métodos de instancia como estáticos,
+# Depends mal cableados, etc.).
+SMOKE_OPENAPI_CMD: Final[list[str]] = [
+    PYTHON_EXECUTABLE,
+    "-c",
+    "from fastapi.testclient import TestClient; import app.main; c=TestClient(app.main.app); r=c.get('/openapi.json'); print('SMOKE_OPENAPI_OK', r.status_code); assert r.status_code < 500",
+]
+
 _MISSING_MODULE_RE: Final[re.Pattern[str]] = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
 _REQUIREMENTS_PKG_RE: Final[re.Pattern[str]] = re.compile(r"^([a-zA-Z0-9_.-]+)")
 
@@ -164,5 +173,16 @@ def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -
                 "- Evita comentar routers/imports en main para 'pasar' el check: los endpoints declarados deben ser importables.\n"
             )
             return False, f"[runtime_verify] endpoints modules import failed:\nModules={endpoint_modules}\n{out_eps}\n{hint}"
+
+    # Smoke runtime adicional: /openapi.json con TestClient.
+    ok_smoke, out_smoke = _run_cmd(SMOKE_OPENAPI_CMD, cwd=project_dir)
+    if not ok_smoke:
+        hint = (
+            "HINTS:\n"
+            "- Si el error es TypeError missing positional arguments: probablemente estás llamando un método de instancia como clase.\n"
+            "- Si el error es AttributeError en sesión/cliente: Depends está inyectando el tipo incorrecto.\n"
+            "- Si el error es ValidationError: el modelo request/response no coincide con el handler.\n"
+        )
+        return False, f"[runtime_verify] smoke openapi request failed:\n{out_smoke}\n{hint}"
 
     return True, "IMPORT_OK"
