@@ -67,7 +67,7 @@ OPENAI_API_KEY = None
 OPENAI_MODEL = None
 
 CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
-CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "llama-3.3-70b")
+CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"

@@ -55,7 +55,7 @@ model_list:
 
   # Code generation
   # Primary: Mistral (codestral-latest)
-  # Fallback: Cerebras (llama-3.3-70b) - handled by proxy routing below
+  # Fallback: Cerebras (gpt-oss-120b) - handled by proxy routing below
   - model_name: code-gen
     hidden: false
     litellm_params:
@@ -70,7 +70,7 @@ model_list:
       # NOTE: Cerebras model IDs are strict; use the exact ID exposed by your account.
       # From the models shown in your UI, the most code-capable is likely the Qwen 3 235B Instruct family.
       # Try this canonical ID (common in Cerebras catalogs); adjust if your account uses a different slug.
-      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      model: cerebras/gpt-oss-120b
       api_key: os.environ/CEREBRAS_API_KEY
 
   # Documentation (text)
@@ -90,7 +90,7 @@ model_list:
   - model_name: docs-cerebras
     hidden: false
     litellm_params:
-      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      model: cerebras/gpt-oss-120b
       api_key: os.environ/CEREBRAS_API_KEY
 
   - model_name: docs-groq
@@ -109,7 +109,7 @@ model_list:
   - model_name: estimate-cerebras
     hidden: false
     litellm_params:
-      model: cerebras/qwen-3-235b-a22b-instruct-2507
+      model: cerebras/gpt-oss-120b
       api_key: os.environ/CEREBRAS_API_KEY
 
   - model_name: estimate-groq
