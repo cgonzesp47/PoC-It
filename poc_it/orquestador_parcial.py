@@ -354,12 +354,20 @@ Descripción:
                     )
                     estructura = persist_runtime_facts(project_structure=estructura, runtime_facts=runtime_facts)
 
+                    # Nota: `hermetic` controla cómo se interpreta y repara pytest:
+                    # - hermetic=True  -> se asume que NO hay integraciones reales accesibles; preferimos fixers/tests/overrides.
+                    # - hermetic=False -> se asume que el runtime es "real" y permitimos que pytest revele problemas de wiring/código real.
+                    #
+                    # Política del proyecto:
+                    # - PARCIAL => hermetic=True (tests aislados, sin I/O real).
+                    # - COMPLETA => hermetic=False (no hay integraciones externas; tests y código deberían ejecutarse "de verdad").
+                    hermetic_flag = str(modo_generacion).upper() == "PARCIAL"
                     runtime_contracts = RuntimeContracts(
                         endpoints=contracts_eps,
                         env_vars_explicit=list(facts.get("env_vars_explicit") or []),
                         imports=list(facts.get("imports") or []),
                         tests_style=tests_style,
-                        hermetic=True,
+                        hermetic=hermetic_flag,
                         generation_mode=modo_generacion,
                         allowed_dependency_overrides=None,
                     )
@@ -378,10 +386,14 @@ Descripción:
 
                 # NUEVO FLUJO (separación estricta de responsabilidades)
                 # Fase A: code correctness loop (solo código, import-time + wiring mínimo)
-                # Fase B: generación de tests (LLM) 100% herméticos, guiados por runtime_contracts
-                # Fase C: pytest loop SOLO tests (app/** prohibido)
+                # Fase B: generación de tests (LLM)
+                # Fase C: pytest loop para alinear tests y, si aplica, código
                 #
-                # Importante: desactivamos el postprocesado-alineación por pytest, porque mezcla corrección de código con tests.
+                # Política:
+                # - PARCIAL: mantenemos el flujo hermético A/B/C via ejecutar_reparacion_runtime().
+                # - COMPLETA: además habilitamos el postprocesado por pytest (A/C pragmáticos):
+                #   * corrige código si hay fallos reales (wiring, imports, etc.)
+                #   * corrige asserts/tests cuando el fallo es de expectativas
                 ejecutar_reparacion_runtime(
                     nombre_proyecto=self.nombre_proyecto,
                     descripcion_global=self.descripcion_global,
@@ -392,6 +404,14 @@ Descripción:
                     archivos_creados=archivos_creados,
                     regenerar_tests=True,
                 )
+                if str(modo_generacion).upper() == "COMPLETO":
+                    postprocesar_alineacion_por_pytest(
+                        nombre_proyecto=self.nombre_proyecto,
+                        project_dir=project_dir,
+                        resultado=resultado,
+                        estructura=estructura,
+                        archivos_creados=archivos_creados,
+                    )
 
             modo_upper = modo_generacion
 
