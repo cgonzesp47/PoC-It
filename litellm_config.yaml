@@ -74,12 +74,18 @@ model_list:
       api_key: os.environ/CEREBRAS_API_KEY
 
   # Documentation (text)
-  # Reparto de carga: OpenRouter y Gemini antes que Groq.
+  # Reparto de carga: OpenRouter y Mistral antes que Gemini/Groq.
   - model_name: docs
     hidden: false
     litellm_params:
       model: openrouter/openai/gpt-oss-120b:free
       api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: docs-mistral
+    hidden: false
+    litellm_params:
+      model: mistral/codestral-latest
+      api_key: os.environ/MISTRAL_API_KEY
 
   - model_name: docs-gemini
     hidden: false
@@ -180,6 +186,7 @@ router_settings:
         - cls-json-openrouter
 
     - docs:
+        - docs-mistral
         - docs-gemini
         - docs-cerebras
         - docs-groq
