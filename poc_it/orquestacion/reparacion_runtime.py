@@ -518,6 +518,20 @@ SALIDA
                 runtime_contracts=rc,
                 runtime_facts=rf,
             )
+
+            # Propagar resultado estructurado de pytest a `resultado` (fuente de verdad para publicación)
+            try:
+                if isinstance(resultado, dict):
+                    resultado["pytest_repair"] = {
+                        "ok": bool(rep.ok),
+                        "attempts": int(rep.attempts),
+                        "degraded": bool(getattr(rep, "degraded", False)),
+                        "degrade_type": getattr(rep, "degrade_type", None),
+                        "artifacts": dict(getattr(rep, "artifacts", {}) or {}),
+                    }
+            except Exception:
+                pass
+
             if not rep.ok:
                 logger.info("[TESTS] Pytest repair loop agotado; pytest sigue fallando.")
 

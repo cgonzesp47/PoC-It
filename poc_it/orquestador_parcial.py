@@ -33,6 +33,7 @@ from poc_it.orquestacion.postprocesado_alineacion import postprocesar_alineacion
 from poc_it.orquestacion.constantes import OUTPUT_DIRNAME, README_ERROR_FILENAME, README_FINAL_FILENAME
 from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
 from poc_it.orquestacion.reparacion_runtime import ejecutar_reparacion_runtime
+from poc_it.orquestacion.run_result import RunResult
 from poc_it.poc_facts_extractor import extract_poc_facts_from_structure
 from poc_it.runtime_contracts import (
     EndpointRuntimeContract,
@@ -404,6 +405,57 @@ Descripción:
                     archivos_creados=archivos_creados,
                     regenerar_tests=True,
                 )
+
+                # Estado final: determinista y estructurado
+                #
+                # Fuente de verdad:
+                # - `.poc_it/pytest_junit.xml` y `.poc_it/pytest_last_output.txt` (generados por pytest_llm_repair)
+                # - `pytest_llm_repair.PytestRepairResult` ahora expone `degraded/degrade_type` y `ok`
+                #
+                # Política acordada:
+                # - Si degrada a contract-lite, se re-ejecuta pytest con suite mínima.
+                # - Si esa suite mínima no pasa => NO publicar.
+                run_result = RunResult.error(mode=str(modo_generacion).upper(), reason="pytest_failed")
+                try:
+                    from poc_it.orquestacion.pytest_llm_repair import _read_pytest_junit_xml, _extract_counts_from_junit_xml
+
+                    xml = _read_pytest_junit_xml(project_dir)
+                    counts = _extract_counts_from_junit_xml(xml)
+                    pytest_ok = bool(counts and (counts[0] + counts[1] == 0))
+                except Exception:
+                    pytest_ok = False
+
+                # degraded se toma del runtime_contracts (si existe) pero, como el loop lo escribe a disco,
+                # aquí lo inferimos leyendo `runtime_contracts.json` NO es necesario; preferimos el indicador en resultado si lo tenemos.
+                # En este punto, `ejecutar_reparacion_runtime` ya pudo setear `resultado["pytest_repair"]` (nuevo contrato).
+                degraded = False
+                degrade_type = None
+                try:
+                    pr = None
+                    if isinstance(resultado, dict):
+                        pr = resultado.get("pytest_repair")
+                    if isinstance(pr, dict):
+                        degraded = bool(pr.get("degraded"))
+                        degrade_type = pr.get("degrade_type")
+                except Exception:
+                    degraded = False
+                    degrade_type = None
+
+                if pytest_ok:
+                    run_result = RunResult.ok(
+                        mode=str(modo_generacion).upper(),
+                        degraded=degraded,
+                        degrade_type=str(degrade_type) if degrade_type else None,
+                    )
+
+                if isinstance(resultado, dict):
+                    resultado["pytest_ok"] = bool(run_result.pytest_ok)
+                    resultado["estado_final"] = run_result.status
+                    resultado["publishable"] = bool(run_result.publishable)
+                    resultado["run_reasons"] = list(run_result.reasons)
+                    resultado["degraded"] = bool(run_result.degraded) if run_result.degraded is not None else None
+                    resultado["degrade_type"] = run_result.degrade_type
+
                 if str(modo_generacion).upper() == "COMPLETO":
                     postprocesar_alineacion_por_pytest(
                         nombre_proyecto=self.nombre_proyecto,
@@ -460,4 +512,18 @@ Descripción:
                 "error": str(exc),
             }
 
-        return {"nombre_proyecto": self.nombre_proyecto, "archivos_creados": archivos_creados}
+        # Devolvemos flags que main.py usa para decidir publicación.
+        out = {"nombre_proyecto": self.nombre_proyecto, "archivos_creados": archivos_creados}
+
+        try:
+            if isinstance(resultado, dict):
+                if "estado_final" in resultado:
+                    out["estado_final"] = resultado.get("estado_final")
+                if "pytest_ok" in resultado:
+                    out["pytest_ok"] = resultado.get("pytest_ok")
+                if "publishable" in resultado:
+                    out["publishable"] = resultado.get("publishable")
+        except Exception:
+            pass
+
+        return out

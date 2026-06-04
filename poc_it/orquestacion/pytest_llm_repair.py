@@ -23,7 +23,7 @@ import re
 import subprocess
 import inspect
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from poc_it.generador.json_utils import extraer_json_tolerante
@@ -183,8 +183,15 @@ class PytestRepairResult:
     last_output: str
     patched_files: Dict[str, str]
 
+    # Señales estructuradas (fuente de verdad para estado/publish)
+    degraded: bool = False
+    degrade_type: Optional[str] = None
 
-def _run_pytest(project_dir: str) -> Tuple[bool, str]:
+    # Artefactos (paths relativos dentro del proyecto) útiles para diagnóstico
+    artifacts: Dict[str, str] = field(default_factory=dict)
+
+
+def _run_pytest(project_dir: str) -> Tuple[bool, str, str]:
     """
     Ejecuta pytest y genera un reporte estructurado mediante JUnit XML (built-in).
 
@@ -212,7 +219,7 @@ def _run_pytest(project_dir: str) -> Tuple[bool, str]:
     out = (p.stdout or "") + "\n" + (p.stderr or "")
 
     if p.returncode == 0:
-        return True, out
+        return True, out, junit_path
 
     # Fallback: si junitxml rompe en sessionfinish, reintentar sin junitxml.
     out_low = (out or "").lower()
@@ -224,9 +231,9 @@ def _run_pytest(project_dir: str) -> Tuple[bool, str]:
             text=True,
         )
         out2 = (p2.stdout or "") + "\n" + (p2.stderr or "")
-        return p2.returncode == 0, out2
+        return p2.returncode == 0, out2, ""
 
-    return False, out
+    return False, out, junit_path
 
 
 def _read_pytest_junit_xml(project_dir: str) -> Optional[str]:
@@ -1183,6 +1190,32 @@ def _gate_patch_tests_endpoints_exist_in_openapi(
     return True, "ok"
 
 
+_DEFAULT_ARTIFACTS = {
+    "pytest_last_output": ".poc_it/pytest_last_output.txt",
+    "pytest_junit": ".poc_it/pytest_junit.xml",
+}
+
+
+def _mk_result(
+    *,
+    ok: bool,
+    attempts: int,
+    last_output: str,
+    patched_files: Dict[str, str],
+    degraded: bool = False,
+    degrade_type: Optional[str] = None,
+) -> PytestRepairResult:
+    return PytestRepairResult(
+        ok=ok,
+        attempts=attempts,
+        last_output=last_output,
+        patched_files=patched_files,
+        degraded=degraded,
+        degrade_type=degrade_type,
+        artifacts=dict(_DEFAULT_ARTIFACTS),
+    )
+
+
 def repair_tests_until_pytest_passes(
     *,
     nombre_proyecto: str,
@@ -1235,7 +1268,7 @@ def repair_tests_until_pytest_passes(
 
     attempt = 0
     while attempt <= max_allowed:
-        ok, out = _run_pytest(project_dir)
+        ok, out, _junit_path = _run_pytest(project_dir)
         last_out = out
         cls = classify_pytest_failure(out)
 
@@ -1376,7 +1409,7 @@ def repair_tests_until_pytest_passes(
         )
 
         if ok:
-            return PytestRepairResult(ok=True, attempts=attempt, last_output=out, patched_files=patched_total)
+            return _mk_result(ok=True, attempts=attempt, last_output=out, patched_files=patched_total)
 
         # --- Fixers deterministas (C0) ----------------------------------------------------
         # Estrategia híbrida:
@@ -1751,10 +1784,30 @@ markers =
         if no_improve_streak >= NO_IMPROVE_LIMIT:
             logger.info("[PYTEST-REPAIR] Sin mejora en %s iteraciones CON patch aplicado; degradando a contract-lite.", no_improve_streak)
             _degrade_to_contract_lite(nombre_proyecto=nombre_proyecto, estructura=estructura)
-            ok2, out2 = _run_pytest(project_dir)
+            ok2, out2, _ = _run_pytest(project_dir)
+
+            # Política acordada:
+            # - Degradamos a contract-lite y re-ejecutamos pytest (suite mínima smoke+openapi).
+            # - SOLO si pasa => OK_DEGRADED (publicable).
+            # - Si NO pasa => ERROR (no publicable).
             if ok2:
-                return PytestRepairResult(ok=True, attempts=attempt, last_output=out2, patched_files=patched_total)
-            return PytestRepairResult(ok=False, attempts=attempt, last_output=out2, patched_files=patched_total)
+                return _mk_result(
+                    ok=True,
+                    attempts=attempt,
+                    last_output=out2,
+                    patched_files=patched_total,
+                    degraded=True,
+                    degrade_type="contract-lite",
+                )
+
+            return _mk_result(
+                ok=False,
+                attempts=attempt,
+                last_output=out2,
+                patched_files=patched_total,
+                degraded=True,
+                degrade_type="contract-lite",
+            )
 
         # compuerta: tests deben compilar
         if not _compile_tests(project_dir):
@@ -1764,4 +1817,4 @@ markers =
 
         attempt += 1
 
-    return PytestRepairResult(ok=False, attempts=attempt, last_output=last_out, patched_files=patched_total)
+    return _mk_result(ok=False, attempts=attempt, last_output=last_out, patched_files=patched_total)

@@ -96,15 +96,15 @@ async def main() -> None:
             print("\n==============================\n")
 
         # ==============================================
-        # GENERACIÓN LIBRE (COMPLETO o PARCIAL)
+        # GENERACIÓN / MATERIALIZACIÓN
         # ==============================================
+
+        nombre_proyecto_generado = None
 
         if resultado.modo in {ModoGeneracion.COMPLETO, ModoGeneracion.PARCIAL}:
 
             print("=== GENERACIÓN LIBRE ACTIVADA ===\n")
 
-            # Pasamos SOLO el problema como descripción principal.
-            # El resto del contexto ya viaja estructurado en PlantillaUsuario.
             orquestador = OrquestadorParcial(
                 plantilla=user_data,
                 modo_generacion=str(resultado.modo).split(".")[-1],
@@ -112,15 +112,33 @@ async def main() -> None:
 
             resultado_generacion = orquestador.ejecutar()
 
+            nombre_proyecto_generado = resultado_generacion["nombre_proyecto"]
+
             print("======================================")
             print("GENERACIÓN FINALIZADA")
             print("======================================\n")
-            print(f"Proyecto generado: {resultado_generacion['nombre_proyecto']}")
+            print(f"Proyecto generado: {nombre_proyecto_generado}")
             print(f"Archivos creados: {len(resultado_generacion.get('archivos_creados', []))}\n")
 
-        # ==============================================
-        # MODO ASESOR
-        # ==============================================
+            # Determinar si el proyecto es publicable (fuente de verdad estructurada)
+            #
+            # `OrquestadorParcial` expone:
+            # - estado_final: "OK" | "OK_DEGRADED" | "ERROR"
+            # - publishable: bool
+            # - pytest_ok: bool (compat)
+            #
+            # Política:
+            # - Publish SOLO si `publishable=True`.
+            # - OK_DEGRADED sigue siendo publicable, pero SOLO si pytest (suite mínima) pasó.
+            estado_final = resultado_generacion.get("estado_final")
+            pytest_ok = resultado_generacion.get("pytest_ok")
+
+            publishable = resultado_generacion.get("publishable")
+            if publishable is None:
+                # compatibilidad: si no viene, caer a heurística antigua
+                publishable = estado_final in ("OK", "OK_DEGRADED")
+
+            generacion_exitosa = bool(publishable)
 
         else:
             print("=== ANÁLISIS ESTRATÉGICO ===\n")
@@ -133,7 +151,6 @@ async def main() -> None:
 
             from poc_it.generador_informes import generar_readme_asesor
             from poc_it.materializador_archivos import materializar_proyecto
-
             from poc_it.estimador_esfuerzo import calcular_estimacion_esfuerzo
 
             estimacion_manual = calcular_estimacion_esfuerzo(
@@ -162,7 +179,46 @@ async def main() -> None:
                 },
             )
 
+            nombre_proyecto_generado = user_data.nombre
+
+            # En modo ASESOR también se publica el repo: es un artefacto válido (README_ANÁLISIS.md).
+            generacion_exitosa = True
+
             print("Se ha generado README_ANÁLISIS.md con el análisis estratégico y estimación conceptual.\n")
+
+        # ==============================================
+        # PUBLICACIÓN CENTRALIZADA (ÚNICO PUNTO)
+        # ==============================================
+
+        try:
+            # Publicar SOLO si la generación fue realmente exitosa
+            if nombre_proyecto_generado and locals().get("generacion_exitosa", False):
+                from poc_it.integraciones.gitlab_publisher import GitLabPublisher
+                from pathlib import Path
+
+                ruta_generada = Path("output") / nombre_proyecto_generado
+
+                publisher = GitLabPublisher()
+                url_repo = publisher.publicar(
+                    nombre_proyecto_generado,
+                    str(ruta_generada)
+                )
+
+                if url_repo:
+                    print("======================================")
+                    print("REPOSITORIO PUBLICADO EN GITLAB")
+                    print("======================================\n")
+                    print(f"URL: {url_repo}\n")
+            elif nombre_proyecto_generado:
+                print("\n[GitLab] Publicación omitida: proyecto no publicable (publishable=False).")
+
+                    # FUTURO: limpieza opcional
+                    # if os.getenv("POCIT_CLEAN_LOCAL_AFTER_PUBLISH", "false").lower() == "true":
+                    #     shutil.rmtree(ruta_generada)
+
+        except Exception as e:
+            print("\n[GitLab] Publicación omitida o fallida:")
+            print(str(e))
 
         fin_ejecucion = time.perf_counter()
         duracion = fin_ejecucion - inicio_ejecucion
