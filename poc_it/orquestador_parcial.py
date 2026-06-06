@@ -238,15 +238,19 @@ Descripción:
                     spec0.setdefault("modo", modo_generacion)
                     resultado["spec"] = spec0
 
-            t_generacion_inicio = 0.0
-            t_generacion_fin = 0.0
+            # Medición real del tiempo de PoC-it (solo generación, sin input del usuario):
+            # - Se usa para README / tablas de estimación como "PoC-it (medido)".
+            # - NOTA: el tiempo del usuario rellenando la plantilla se mide fuera (main.py) y no debe influir aquí.
+            #
+            # En ASESOR no se genera PoC, por lo que lo dejamos a 0.
+            t_pocit_inicio = 0.0
+            t_pocit_fin = 0.0
             if modo_generacion != ModoGeneracion.ASESOR:
                 import time
 
-                # Mantener comportamiento: el tiempo real se medía solo si se generaba.
-                # (Aquí solo preservamos el contrato, no re-medimos; se usa para PERFORMANCE log)
-                t_generacion_inicio = time.perf_counter()
-                t_generacion_fin = t_generacion_inicio
+                t_pocit_inicio = time.perf_counter()
+                # ... el pipeline real (generación+materialización+repairs+tests+docs) ocurre a continuación ...
+                # Al final actualizamos t_pocit_fin para reflejar el tiempo total real del proceso PoC-it.
 
                 project_dir = os.path.join(OUTPUT_DIRNAME, self.nombre_proyecto)
 
@@ -482,13 +486,36 @@ Descripción:
 
             if modo_upper == ModoGeneracion.ASESOR:
                 # En ASESOR no se genera PoC, pero sí queremos estimación para README_ANALISIS.
-                estimacion_manual = self._estimacion_manual(spec=resultado.get("spec") if isinstance(resultado, dict) else None)
+                estimacion_manual = self._estimacion_manual(
+                    spec=resultado.get("spec") if isinstance(resultado, dict) else None
+                )
             else:
                 spec = resultado.get("spec") if isinstance(resultado, dict) else None
-                # En PARCIAL/COMPLETO se estima el alcance realmente generado.
-                estimacion_generada = self._estimacion_generada(modo_generacion, tiempo_generacion_horas, spec=spec)
+
+                # En PARCIAL/COMPLETO el valor "PoC-it (medido)" debe reflejar el TIEMPO REAL del pipeline
+                # (codegen+repairs+tests+docs), no solo el tiempo del primer codegen.
+                #
+                # `calcular_estimacion_esfuerzo` espera horas.
+                tiempo_real_pocit_horas = 0.0
+                try:
+                    if t_pocit_inicio and t_pocit_fin and t_pocit_fin >= t_pocit_inicio:
+                        tiempo_real_pocit_horas = (t_pocit_fin - t_pocit_inicio) / 3600
+                except Exception:
+                    tiempo_real_pocit_horas = 0.0
+
+                estimacion_generada = self._estimacion_generada(
+                    modo_generacion,
+                    tiempo_real_pocit_horas,
+                    spec=spec,
+                )
                 # Mantener también una estimación manual para README_ANALISIS (sin recalcular en docs).
                 estimacion_manual = self._estimacion_manual(spec=spec)
+
+            # Cerrar medición de tiempo real PoC-it
+            if modo_generacion != ModoGeneracion.ASESOR:
+                import time
+
+                t_pocit_fin = time.perf_counter()
 
             # Generación docs
             generar_documentacion(
@@ -502,8 +529,9 @@ Descripción:
                 estimacion_generada=estimacion_generada,
                 t_clasificacion_inicio=self.t_clasificacion_inicio,
                 t_clasificacion_fin=self.t_clasificacion_fin,
-                t_generacion_inicio=t_generacion_inicio,
-                t_generacion_fin=t_generacion_fin,
+                # Para métricas internas de docs (PERFORMANCE), reutilizamos el rango real del pipeline PoC-it.
+                t_generacion_inicio=t_pocit_inicio,
+                t_generacion_fin=t_pocit_fin,
             )
 
         except Exception as exc:

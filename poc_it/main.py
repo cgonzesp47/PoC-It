@@ -128,12 +128,16 @@ def _configure_logging() -> None:
 
 async def main() -> None:
     _configure_logging()
-    inicio_ejecucion = time.perf_counter()
 
     try:
         demo = _is_demo_mode()
 
+        # IMPORTANTE:
+        # - El tiempo total de ejecución NO debe incluir el tiempo del usuario rellenando la plantilla.
+        # - Por lo tanto, iniciamos el contador justo después de recoger el input.
         user_data = collect_user_input()
+        inicio_ejecucion = time.perf_counter()
+
         resultado = await analizar_viabilidad(user_data)
 
         if demo:
