@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List
 
-from poc_it.generador_tests_unitarios2 import (
+from poc_it.generador_tests_unitarios_hermetic import (
     generar_tests_hermeticos_parcial,
     generar_tests_spec_no_parcial,
     generar_tests_unitarios_minimos,
