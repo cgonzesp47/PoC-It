@@ -19,6 +19,10 @@ from poc_it.orquestacion.runtime_probe import run_runtime_probe
 
 logger = logging.getLogger(__name__)
 
+
+def _is_demo_mode() -> bool:
+    return os.getenv("POCIT_MODE", "").strip().lower() in ("demo", "1", "true", "yes")
+
 _MISSING_MODULE_RE = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
 _REQUIREMENTS_PKG_RE = re.compile(r"^([a-zA-Z0-9_.-]+)")
 
@@ -299,7 +303,12 @@ def ejecutar_reparacion_runtime(
                 + "Sugerencia: evita validar configuración/credenciales en import-time; "
                 + "haz lazy init y valida en runtime (en el endpoint que lo necesite)."
             )
-            logger.error("[RUNTIME_REPAIR] %s", msg)
+            if _is_demo_mode():
+                # En demo, no imprimir detalle/traceback crudo (ruido).
+                # El detalle completo se persistirá en RUNTIME_VERIFY_ERROR.txt dentro del proyecto generado.
+                logger.warning("[PIPELINE] Reparación automática en curso.")
+            else:
+                logger.error("[RUNTIME_REPAIR] %s", msg)
 
             # Persistimos un artefacto de error dentro del proyecto para que el usuario lo vea
             # incluso si la ejecución continúa y se devuelven los archivos generados.
