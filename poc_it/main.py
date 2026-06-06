@@ -104,6 +104,9 @@ def _configure_logging() -> None:
         import sys
 
         debug_line = re.compile(r"^\[DEBUG\]\s*")
+        demo_noise = re.compile(
+            r"^\s*(\[\{.*\}\]\s*)$|^(Traceback \(most recent call last\):)|^(ModuleNotFoundError: )|^(RUNTIME_WIRING_VERIFY_FAILED)|^(OpenAPI probe failed\.)$"
+        )
 
         class _StdoutFilter(io.TextIOBase):
             def __init__(self, underlying):
@@ -114,7 +117,7 @@ def _configure_logging() -> None:
                     return 0
                 # Preservar saltos de línea y filtrar por línea
                 parts = s.splitlines(True)
-                kept = [p for p in parts if not debug_line.match(p)]
+                kept = [p for p in parts if not debug_line.match(p) and not demo_noise.match(p.strip())]
                 if not kept:
                     return len(s)
                 return self._u.write("".join(kept))
