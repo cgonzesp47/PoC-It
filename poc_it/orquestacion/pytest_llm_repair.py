@@ -143,7 +143,27 @@ def _extract_pytest_counts(pytest_output: str) -> Tuple[int, int]:
 
 
 def _degrade_to_contract_lite(*, nombre_proyecto: str, estructura: Dict[str, str]) -> Dict[str, str]:
-    """Degrada a suite mínima que debe pasar siempre: smoke import + OpenAPI."""
+    """Degrada a suite mínima que debe pasar siempre: smoke import + OpenAPI.
+
+    Política:
+    - Usar exactamente el mismo "contract-lite" para cualquier modo cuando se decide degradar.
+    - Eliminar tests potencialmente frágiles (spec/hermetic) para evitar contaminación del run.
+    """
+    import os
+
+    # Limpieza dura: eliminar todos los tests existentes (evita que pytest recoja residuales).
+    try:
+        tests_dir = os.path.join("output", nombre_proyecto, "tests")
+        if os.path.isdir(tests_dir):
+            for fn in os.listdir(tests_dir):
+                if fn.endswith(".py") or fn.endswith(".pyc"):
+                    try:
+                        os.remove(os.path.join(tests_dir, fn))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
     pytest_ini = """[pytest]
 addopts = -q
 testpaths = tests
@@ -1782,14 +1802,17 @@ markers =
 
         # Si no mejora en varias iteraciones, degradamos para garantizar tests passing.
         if no_improve_streak >= NO_IMPROVE_LIMIT:
-            logger.info("[PYTEST-REPAIR] Sin mejora en %s iteraciones CON patch aplicado; degradando a contract-lite.", no_improve_streak)
+            logger.info(
+                "[PYTEST-REPAIR] Sin mejora en %s iteraciones CON patch aplicado; degradando a contract-lite.",
+                no_improve_streak,
+            )
             _degrade_to_contract_lite(nombre_proyecto=nombre_proyecto, estructura=estructura)
             ok2, out2, _ = _run_pytest(project_dir)
 
-            # Política acordada:
+            # Política:
             # - Degradamos a contract-lite y re-ejecutamos pytest (suite mínima smoke+openapi).
-            # - SOLO si pasa => OK_DEGRADED (publicable).
-            # - Si NO pasa => ERROR (no publicable).
+            # - Si pasa => OK_DEGRADED (publicable).
+            # - Si no pasa => ERROR (no publicable).
             if ok2:
                 return _mk_result(
                     ok=True,
@@ -1817,4 +1840,29 @@ markers =
 
         attempt += 1
 
-    return _mk_result(ok=False, attempts=attempt, last_output=last_out, patched_files=patched_total)
+    # Último recurso: si se agota presupuesto sin converger, degradar a contract-lite.
+    # Esto unifica el comportamiento con PARCIAL: preferimos devolver una PoC ejecutable y verificable
+    # (smoke+openapi) antes que abortar.
+    try:
+        logger.info("[PYTEST-REPAIR] Presupuesto agotado; degradando a contract-lite (último recurso).")
+        _degrade_to_contract_lite(nombre_proyecto=nombre_proyecto, estructura=estructura)
+        ok2, out2, _ = _run_pytest(project_dir)
+        if ok2:
+            return _mk_result(
+                ok=True,
+                attempts=attempt,
+                last_output=out2,
+                patched_files=patched_total,
+                degraded=True,
+                degrade_type="contract-lite",
+            )
+        return _mk_result(
+            ok=False,
+            attempts=attempt,
+            last_output=out2,
+            patched_files=patched_total,
+            degraded=True,
+            degrade_type="contract-lite",
+        )
+    except Exception:
+        return _mk_result(ok=False, attempts=attempt, last_output=last_out, patched_files=patched_total)

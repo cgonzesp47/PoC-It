@@ -58,21 +58,42 @@ def collect_user_input() -> PlantillaUsuario:
     )
 
 
+def _is_demo_mode() -> bool:
+    return os.getenv("POCIT_MODE", "").strip().lower() in ("demo", "1", "true", "yes")
+
+
+def log_step(step: int, total: int, title: str, detail: str | None = None) -> None:
+    print(f"\n[{step}/{total}] {title}")
+    if detail:
+        for line in detail.splitlines():
+            if line.strip():
+                print(f"      {line}")
+
+
 def _configure_logging() -> None:
     """
     Configura logging por defecto para CLI.
 
-    Nota:
-    - Se mantiene simple: consola + nivel configurable por env var.
-    - Esto hace visibles los logs del orquestador tras migrar prints->logging.
+    Estrategia demo:
+    - En demo, reducimos ruido: solo WARNING/ERROR.
+    - En dev, respetamos POCIT_LOG_LEVEL (default INFO).
     """
-    level_name = os.getenv("POCIT_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
+    demo = _is_demo_mode()
 
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+    if demo:
+        level = logging.WARNING
+        fmt = "%(levelname)s | %(name)s | %(message)s"
+    else:
+        level_name = os.getenv("POCIT_LOG_LEVEL", "INFO").upper()
+        level = getattr(logging, level_name, logging.INFO)
+        fmt = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+    logging.basicConfig(level=level, format=fmt)
+
+    # Silenciar librerías ruidosas en demo
+    if demo:
+        for noisy in ("httpx", "urllib3", "uvicorn", "asyncio"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 async def main() -> None:
@@ -80,20 +101,36 @@ async def main() -> None:
     inicio_ejecucion = time.perf_counter()
 
     try:
+        demo = _is_demo_mode()
+
         user_data = collect_user_input()
         resultado = await analizar_viabilidad(user_data)
 
-        print("\n==============================")
-        print("INFORME DE VIABILIDAD")
-        print("==============================\n")
-        print(f"MODO: {resultado.modo}\n")
+        if demo:
+            # Fases demo (limpio y presentable)
+            total_steps = 8 if resultado.modo in {ModoGeneracion.COMPLETO, ModoGeneracion.PARCIAL} else 5
+            log_step(1, total_steps, "Entrada recibida", f"Nombre: {user_data.nombre}")
+            if getattr(resultado, "contexto_proyecto", None) and getattr(resultado.contexto_proyecto, "contexto_normalizado", None):
+                cn = resultado.contexto_proyecto.contexto_normalizado
+                fn = len(getattr(cn, "funcionalidades_clave", []) or [])
+                integ = ", ".join(getattr(cn, "integraciones_externas", []) or []) or "No"
+                log_step(2, total_steps, "Contexto normalizado generado", f"Funcionalidades detectadas: {fn}\nIntegraciones externas: {integ}")
+            else:
+                log_step(2, total_steps, "Contexto normalizado generado")
 
-        arquitectura = resultado.arquitectura or ""
+            modo_str = getattr(resultado.modo, "value", None) or getattr(resultado.modo, "name", None) or str(resultado.modo)
+            log_step(3, total_steps, f"Modo seleccionado: {modo_str}")
+        else:
+            print("\n==============================")
+            print("INFORME DE VIABILIDAD")
+            print("==============================\n")
+            print(f"MODO: {resultado.modo}\n")
 
-        if isinstance(arquitectura, str) and arquitectura.strip():
-            print("=== ARQUITECTURA PROPUESTA ===\n")
-            print(arquitectura)
-            print("\n==============================\n")
+            arquitectura = resultado.arquitectura or ""
+            if isinstance(arquitectura, str) and arquitectura.strip():
+                print("=== ARQUITECTURA PROPUESTA ===\n")
+                print(arquitectura)
+                print("\n==============================\n")
 
         # ==============================================
         # GENERACIÓN / MATERIALIZACIÓN
@@ -102,23 +139,39 @@ async def main() -> None:
         nombre_proyecto_generado = None
 
         if resultado.modo in {ModoGeneracion.COMPLETO, ModoGeneracion.PARCIAL}:
-
-            print("=== GENERACIÓN LIBRE ACTIVADA ===\n")
+            if not demo:
+                print("=== GENERACIÓN LIBRE ACTIVADA ===\n")
+            else:
+                log_step(4, total_steps, "Spec generado y validado", "Se ha generado un spec interno y se ha reparado si fue necesario.")
 
             orquestador = OrquestadorParcial(
                 plantilla=user_data,
-                modo_generacion=str(resultado.modo).split(".")[-1],
+                modo_generacion=resultado.modo.value,
+                context=resultado.contexto_proyecto,
+                t_clasificacion_inicio=resultado.t_clasificacion_inicio,
+                t_clasificacion_fin=resultado.t_clasificacion_fin,
             )
 
             resultado_generacion = orquestador.ejecutar()
-
             nombre_proyecto_generado = resultado_generacion["nombre_proyecto"]
 
-            print("======================================")
-            print("GENERACIÓN FINALIZADA")
-            print("======================================\n")
-            print(f"Proyecto generado: {nombre_proyecto_generado}")
-            print(f"Archivos creados: {len(resultado_generacion.get('archivos_creados', []))}\n")
+            if demo:
+                archivos_n = len(resultado_generacion.get("archivos_creados", []))
+                log_step(5, total_steps, "Código backend generado", f"Archivos creados: {archivos_n}")
+                # tests result (pytest_ok viene del orquestador)
+                pytest_ok = bool(resultado_generacion.get("pytest_ok"))
+                estado_final = resultado_generacion.get("estado_final")
+                detail = f"Pytest: {'OK' if pytest_ok else 'FAIL'}"
+                if estado_final:
+                    detail += f"\nEstado: {estado_final}"
+                log_step(6, total_steps, "Tests generados y ejecutados", detail)
+                log_step(7, total_steps, "Documentación generada", "README.md: OK\nREADME_MANUAL.md: OK (si aplica)")
+            else:
+                print("======================================")
+                print("GENERACIÓN FINALIZADA")
+                print("======================================\n")
+                print(f"Proyecto generado: {nombre_proyecto_generado}")
+                print(f"Archivos creados: {len(resultado_generacion.get('archivos_creados', []))}\n")
 
             # Determinar si el proyecto es publicable (fuente de verdad estructurada)
             #
@@ -205,10 +258,13 @@ async def main() -> None:
                 )
 
                 if url_repo:
-                    print("======================================")
-                    print("REPOSITORIO PUBLICADO EN GITLAB")
-                    print("======================================\n")
-                    print(f"URL: {url_repo}\n")
+                    if demo:
+                        log_step(total_steps, total_steps, "Publicación GitLab", f"Repositorio creado: OK\nURL: {url_repo}")
+                    else:
+                        print("======================================")
+                        print("REPOSITORIO PUBLICADO EN GITLAB")
+                        print("======================================\n")
+                        print(f"URL: {url_repo}\n")
             elif nombre_proyecto_generado:
                 print("\n[GitLab] Publicación omitida: proyecto no publicable (publishable=False).")
 

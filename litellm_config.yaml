@@ -109,14 +109,14 @@ model_list:
   - model_name: estimate
     hidden: false
     litellm_params:
-      model: gemini/gemini-2.5-flash
-      api_key: os.environ/GEMINI_API_KEY
-
-  - model_name: estimate-cerebras
-    hidden: false
-    litellm_params:
       model: cerebras/gpt-oss-120b
       api_key: os.environ/CEREBRAS_API_KEY
+
+  - model_name: estimate-gemini
+    hidden: false
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
 
   - model_name: estimate-groq
     hidden: false
@@ -186,13 +186,17 @@ router_settings:
         - cls-json-openrouter
 
     - docs:
-        - docs-mistral
+        # Orden requerido:
+        # 1) OpenRouter (primary del grupo: model_name "docs")
+        # 2) Cerebras
+        # 3) Mistral
         - docs-gemini
-        - docs-cerebras
         - docs-groq
+        - docs-cerebras
+        - docs-mistral
 
     - estimate:
-        - estimate-cerebras
+        - estimate-gemini
         - estimate-groq
         - estimate-openrouter
 

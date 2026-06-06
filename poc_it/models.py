@@ -69,6 +69,9 @@ class ResultadoViabilidad:
     modo: ModoGeneracion
     arquitectura: str
     opciones: list[str]
+    contexto_proyecto: "ProjectContext"
+    t_clasificacion_inicio: float | None = None
+    t_clasificacion_fin: float | None = None
 
 
 class Decision(BaseModel):

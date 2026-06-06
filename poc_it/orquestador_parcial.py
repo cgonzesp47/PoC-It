@@ -19,6 +19,7 @@ Flujo nuevo:
 from __future__ import annotations
 
 import logging
+from multiprocessing import context
 import os
 from typing import Any, Dict, Tuple
 
@@ -93,13 +94,23 @@ Descripción:
             contexto_normalizado=self._contexto_normalizado.model_dump() if self._contexto_normalizado else None,
         )
 
-    def __init__(self, plantilla: PlantillaUsuario, modo_generacion: str):
+    def __init__(
+        self,
+        plantilla: PlantillaUsuario,
+        modo_generacion: str,
+        context: ProjectContext,
+        t_clasificacion_inicio: float | None = None,
+        t_clasificacion_fin: float | None = None,
+    ):
         self.plantilla = plantilla
         self.nombre_proyecto = plantilla.nombre
         self.descripcion_global = plantilla.problema
         self.tecnologias = plantilla.tecnologias
         self.modo_generacion = modo_generacion
-        self._contexto_normalizado: ContextoNormalizadoCache = None
+        self.context = context
+        self._contexto_normalizado = context.contexto_normalizado
+        self.t_clasificacion_inicio = t_clasificacion_inicio
+        self.t_clasificacion_fin = t_clasificacion_fin
 
     def _build_context(self) -> ProjectContext:
         context = ProjectContext(plantilla=self.plantilla)
@@ -124,7 +135,9 @@ Descripción:
         context = clasificar_viabilidad(context)
         t_clasificacion_fin = time.perf_counter()
 
-        logger.info("[DEBUG CONTEXT DESPUÉS DE CLASIFICACIÓN]\n%s", context.model_dump_json(indent=2))
+        # Ruido alto para demo: esto imprime mucho contexto interno.
+        # Mantener disponible en DEBUG para desarrollo.
+        logger.debug("[DEBUG CONTEXT DESPUÉS DE CLASIFICACIÓN]\n%s", context.model_dump_json(indent=2))
         return context, t_clasificacion_inicio, t_clasificacion_fin
 
     def _generar_y_materializar(
@@ -205,12 +218,8 @@ Descripción:
         Ejecuta el flujo completo incluyendo clasificación basada en ProjectContext.
         """
         try:
-            context = self._build_context()
-            self._normalizar_contexto(context)
-
-            context, t_clasificacion_inicio, t_clasificacion_fin = self._clasificar(context)
-
-            modo_generacion = (context.clasificacion or self.modo_generacion).upper()
+            context = self.context
+            modo_generacion = (self.modo_generacion or context.clasificacion or "").upper()
 
             estructura, archivos_creados, tiempo_generacion_horas, resultado = self._generar_y_materializar(
                 context=context,
@@ -441,6 +450,7 @@ Descripción:
                     degraded = False
                     degrade_type = None
 
+                # Política: considerar OK si pytest pasa, incluyendo el caso OK_DEGRADED (contract-lite).
                 if pytest_ok:
                     run_result = RunResult.ok(
                         mode=str(modo_generacion).upper(),
@@ -490,9 +500,8 @@ Descripción:
                 estructura=estructura,
                 resultado=resultado,
                 estimacion_generada=estimacion_generada,
-                estimacion_manual=estimacion_manual,
-                t_clasificacion_inicio=t_clasificacion_inicio,
-                t_clasificacion_fin=t_clasificacion_fin,
+                t_clasificacion_inicio=self.t_clasificacion_inicio,
+                t_clasificacion_fin=self.t_clasificacion_fin,
                 t_generacion_inicio=t_generacion_inicio,
                 t_generacion_fin=t_generacion_fin,
             )
