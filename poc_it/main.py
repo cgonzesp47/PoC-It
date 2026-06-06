@@ -83,7 +83,9 @@ def _configure_logging() -> None:
     demo = _is_demo_mode()
 
     if demo:
-        level = logging.WARNING
+        # En demo queremos output “presentable”: solo mostramos los pasos [x/n] por print().
+        # Cualquier logging del pipeline interno se silencia para evitar trazas/ruido.
+        level = logging.CRITICAL
         fmt = "%(levelname)s | %(name)s | %(message)s"
     else:
         level_name = os.getenv("POCIT_LOG_LEVEL", "INFO").upper()
@@ -105,7 +107,14 @@ def _configure_logging() -> None:
 
         debug_line = re.compile(r"^\[DEBUG\]\s*")
         demo_noise = re.compile(
-            r"^\s*(\[\{.*\}\]\s*)$|^(Traceback \(most recent call last\):)|^(ModuleNotFoundError: )|^(RUNTIME_WIRING_VERIFY_FAILED)|^(OpenAPI probe failed\.)$"
+            r"^\s*(\[\{.*\}\]\s*)$"
+            r"|^\s*(\['.*'\]\s*)$"
+            r"|^(Traceback \(most recent call last\):)"
+            r"|^(ModuleNotFoundError: )"
+            r"|^(RUNTIME_WIRING_VERIFY_FAILED)"
+            r"|^(OpenAPI probe failed\.)$"
+            r"|^WARNING\s*\|\s*poc_it\..*"
+            r"|^ERROR\s*\|\s*poc_it\..*"
         )
 
         class _StdoutFilter(io.TextIOBase):
