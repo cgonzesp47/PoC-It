@@ -76,6 +76,8 @@ def _configure_logging() -> None:
 
     Estrategia demo:
     - En demo, reducimos ruido: solo WARNING/ERROR.
+    - Además silenciamos prints/debug sueltos de librerías/módulos (stdout/stderr),
+      porque hay partes del pipeline que emiten "[DEBUG] ..." sin pasar por logging.
     - En dev, respetamos POCIT_LOG_LEVEL (default INFO).
     """
     demo = _is_demo_mode()
@@ -94,6 +96,34 @@ def _configure_logging() -> None:
     if demo:
         for noisy in ("httpx", "urllib3", "uvicorn", "asyncio"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
+
+        # Filtro de stdout/stderr para eliminar líneas "[DEBUG] ..." en modo demo.
+        # Motivo: aún existen mensajes legacy que NO pasan por logging y salen por print().
+        import io
+        import re
+        import sys
+
+        debug_line = re.compile(r"^\[DEBUG\]\s*")
+
+        class _StdoutFilter(io.TextIOBase):
+            def __init__(self, underlying):
+                self._u = underlying
+
+            def write(self, s: str) -> int:
+                if not s:
+                    return 0
+                # Preservar saltos de línea y filtrar por línea
+                parts = s.splitlines(True)
+                kept = [p for p in parts if not debug_line.match(p)]
+                if not kept:
+                    return len(s)
+                return self._u.write("".join(kept))
+
+            def flush(self) -> None:
+                return self._u.flush()
+
+        sys.stdout = _StdoutFilter(sys.stdout)
+        sys.stderr = _StdoutFilter(sys.stderr)
 
 
 async def main() -> None:
