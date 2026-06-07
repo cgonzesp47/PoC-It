@@ -9,16 +9,14 @@ from typing import Final
 # IMPORTANTE: usar el MISMO intérprete que ejecuta PoC-it.
 # En Windows, invocar "python" puede resolver a otro Python/venv por PATH/launcher.
 PYTHON_EXECUTABLE: Final[str] = sys.executable
-IMPORT_MAIN_CMD: Final[list[str]] = [PYTHON_EXECUTABLE, "-c", "import app.main; print('IMPORT_MAIN_OK')"]
+# NOTA: NO usamos `python -c "..."` porque en algunos entornos Windows (PowerShell/VSCode)
+# el quoting puede romperse y producir falsos errores como `ModuleNotFoundError`/`SyntaxError`.
+# Usamos scripts .py temporales en el directorio del proyecto y los ejecutamos con sys.executable.
+IMPORT_MAIN_CMD: Final[list[str]] = [PYTHON_EXECUTABLE, "_poc_it_runtime_import_main.py"]
 
 # Smoke básico: importa app.main y ejecuta un request mínimo a /openapi.json.
-# Esto captura bugs típicos de wiring que NO aparecen en import-time (p.ej. usar métodos de instancia como estáticos,
-# Depends mal cableados, etc.).
-SMOKE_OPENAPI_CMD: Final[list[str]] = [
-    PYTHON_EXECUTABLE,
-    "-c",
-    "from fastapi.testclient import TestClient; import app.main; c=TestClient(app.main.app); r=c.get('/openapi.json'); print('SMOKE_OPENAPI_OK', r.status_code); assert r.status_code < 500",
-]
+# Esto captura bugs típicos de wiring que NO aparecen en import-time.
+SMOKE_OPENAPI_CMD: Final[list[str]] = [PYTHON_EXECUTABLE, "_poc_it_runtime_smoke_openapi.py"]
 
 _MISSING_MODULE_RE: Final[re.Pattern[str]] = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
 _REQUIREMENTS_PKG_RE: Final[re.Pattern[str]] = re.compile(r"^([a-zA-Z0-9_.-]+)")
@@ -106,6 +104,35 @@ def _extract_endpoint_modules_from_spec(spec: dict | None) -> list[str]:
     return out
 
 
+def _ensure_probe_scripts(project_dir: str) -> None:
+    """
+    Crea/actualiza scripts de probe runtime dentro del proyecto generado.
+
+    Importante:
+    - Evitamos `python -c` porque el quoting puede romperse (especialmente en Windows + PowerShell/VSCode wrappers),
+      causando falsos negativos.
+    - Estos scripts se ejecutan con sys.executable (mismo intérprete que PoC-it).
+    """
+    p = Path(project_dir)
+
+    (p / "_poc_it_runtime_import_main.py").write_text(
+        "import app.main\\nprint('IMPORT_MAIN_OK')\\n",
+        encoding="utf-8",
+        errors="ignore",
+    )
+
+    (p / "_poc_it_runtime_smoke_openapi.py").write_text(
+        "from fastapi.testclient import TestClient\\n"
+        "import app.main\\n"
+        "c = TestClient(app.main.app)\\n"
+        "r = c.get('/openapi.json')\\n"
+        "print('SMOKE_OPENAPI_OK', r.status_code)\\n"
+        "assert r.status_code < 500\\n",
+        encoding="utf-8",
+        errors="ignore",
+    )
+
+
 def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -> tuple[bool, str]:
     """
     Verificación runtime mínima (genérica) para proyectos FastAPI generados.
@@ -120,6 +147,8 @@ def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -
     - No valida integraciones externas (Drive, DB, etc.). Solo valida "arranque/import-time".
     - Devuelve detalles ricos (stdout/stderr + hints) para repair loop.
     """
+    _ensure_probe_scripts(project_dir)
+
     ok_main, out_main = _run_cmd(IMPORT_MAIN_CMD, cwd=project_dir)
     if not ok_main:
         missing = _extract_missing_module(out_main)
@@ -152,7 +181,16 @@ def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -
     if endpoint_modules:
         # importamos todos en un solo intérprete para obtener un único traceback accionable
         imports = "; ".join(f"import {m}" for m in endpoint_modules)
-        cmd = [PYTHON_EXECUTABLE, "-c", f"import app.main; {imports}; print('IMPORT_ENDPOINTS_OK')"]
+        # Igual que arriba: evitamos -c, generando un script temporal.
+        p = Path(project_dir) / "_poc_it_runtime_import_endpoints.py"
+        p.write_text(
+            "import app.main\n"
+            + "\n".join(f"import {m}" for m in endpoint_modules)
+            + "\nprint('IMPORT_ENDPOINTS_OK')\n",
+            encoding="utf-8",
+            errors="ignore",
+        )
+        cmd = [PYTHON_EXECUTABLE, "_poc_it_runtime_import_endpoints.py"]
         ok_eps, out_eps = _run_cmd(cmd, cwd=project_dir)
         if not ok_eps:
             missing = _extract_missing_module(out_eps)
