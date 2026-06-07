@@ -116,18 +116,18 @@ def _ensure_probe_scripts(project_dir: str) -> None:
     p = Path(project_dir)
 
     (p / "_poc_it_runtime_import_main.py").write_text(
-        "import app.main\\nprint('IMPORT_MAIN_OK')\\n",
+        "import app.main\nprint('IMPORT_MAIN_OK')\n",
         encoding="utf-8",
         errors="ignore",
     )
 
     (p / "_poc_it_runtime_smoke_openapi.py").write_text(
-        "from fastapi.testclient import TestClient\\n"
-        "import app.main\\n"
-        "c = TestClient(app.main.app)\\n"
-        "r = c.get('/openapi.json')\\n"
-        "print('SMOKE_OPENAPI_OK', r.status_code)\\n"
-        "assert r.status_code < 500\\n",
+        "from fastapi.testclient import TestClient\n"
+        "import app.main\n"
+        "c = TestClient(app.main.app)\n"
+        "r = c.get('/openapi.json')\n"
+        "print('SMOKE_OPENAPI_OK', r.status_code)\n"
+        "assert r.status_code < 500\n",
         encoding="utf-8",
         errors="ignore",
     )
