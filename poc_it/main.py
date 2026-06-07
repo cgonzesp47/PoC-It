@@ -211,7 +211,10 @@ async def main() -> None:
                 if estado_final:
                     detail += f"\nEstado: {estado_final}"
                 log_step(6, total_steps, "Tests generados y ejecutados", detail)
-                log_step(7, total_steps, "Documentación generada", "README.md: OK\nREADME_MANUAL.md: OK (si aplica)")
+                if resultado.modo == ModoGeneracion.PARCIAL:
+                    log_step(7, total_steps, "Documentación generada", "README.md: OK\nREADME_MANUAL.md: OK\nREADME_ANALISIS.md: OK")
+                else:
+                    log_step(7, total_steps, "Documentación generada", "README.md: OK\nREADME_ANALISIS.md: OK")
             else:
                 print("======================================")
                 print("GENERACIÓN FINALIZADA")

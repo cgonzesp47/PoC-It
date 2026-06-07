@@ -457,11 +457,23 @@ Descripción:
                 if not pytest_ok and not degraded:
                     try:
                         # Degradación a contract-lite: suite mínima (smoke_import + openapi).
-                        # Esto permite continuar documentación/estimación y publicación incluso si los tests "completos"
-                        # no convergen. El detalle de pytest se conserva en .poc_it/pytest_last_output.txt.
+                        # IMPORTANTE: materializar a disco el patch mínimo, porque `_degrade_to_contract_lite`
+                        # actualiza `estructura` pero no siempre garantiza escritura final si el pipeline se corta.
                         from poc_it.orquestacion.pytest_llm_repair import _degrade_to_contract_lite, _run_pytest
 
-                        _degrade_to_contract_lite(nombre_proyecto=self.nombre_proyecto, estructura=estructura)
+                        patch_min = _degrade_to_contract_lite(
+                            nombre_proyecto=self.nombre_proyecto,
+                            estructura=estructura,
+                        )
+                        try:
+                            materializar_proyecto(
+                                nombre_proyecto=self.nombre_proyecto,
+                                estructura=patch_min,
+                                limpiar_directorio=False,
+                            )
+                        except Exception:
+                            pass
+
                         ok2, out2, _ = _run_pytest(project_dir)
                         degraded = True
                         degrade_type = "contract-lite"
