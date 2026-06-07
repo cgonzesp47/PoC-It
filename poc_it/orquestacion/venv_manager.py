@@ -122,11 +122,51 @@ def _run(cmd: list[str], *, cwd: str | None = None) -> tuple[int, str]:
     return p.returncode, out
 
 
+def _dedupe_project_dir(project_dir: str) -> str:
+    """Normaliza y deduplica paths tipo .../output/<name>/output/<name>.
+
+    Este bug se ha observado en logs cuando `project_dir` se construye de forma incorrecta
+    en algún caller y acaba concatenándose consigo mismo. Como `ensure_project_venv_ready`
+    es un punto crítico (invocado antes de runtime probes), aplicamos esta defensa aquí
+    para hacerlo imposible de reproducir.
+    """
+    p = os.path.normpath(str(project_dir or "")).strip()
+    if not p:
+        return p
+
+    # Heurística robusta: si el path contiene dos veces seguidas el patrón output/<name>,
+    # lo reducimos a una sola ocurrencia.
+    #
+    # Ejemplo:
+    #   output/<name>/output/<name>/.poc_it/venv/...
+    parts = Path(p).parts
+    try:
+        # Buscar la última ocurrencia de "output" y comprobar si inmediatamente antes había otra
+        # secuencia "output/<same_name>".
+        for i in range(len(parts) - 2):
+            if parts[i].lower() == "output" and i + 1 < len(parts):
+                name = parts[i + 1]
+                # patrón duplicado en i..i+1 y i+2..i+3
+                if (
+                    i + 3 < len(parts)
+                    and parts[i + 2].lower() == "output"
+                    and parts[i + 3] == name
+                ):
+                    # reconstruir quitando el bloque duplicado (i+2, i+3)
+                    new_parts = list(parts[: i + 2]) + list(parts[i + 4 :])
+                    return os.path.normpath(str(Path(*new_parts)))
+    except Exception:
+        pass
+
+    return p
+
+
 def ensure_project_venv_ready(*, project_dir: str, estructura: dict[str, str] | None, spec: Any) -> VenvReadyResult:
     """Garantiza best-effort que existe un venv usable con deps instaladas.
 
     NO lanza excepción: devuelve ok=False si no pudo prepararlo.
     """
+    project_dir = _dedupe_project_dir(project_dir)
     project = Path(project_dir)
     poc_it_dir = project / ".poc_it"
     poc_it_dir.mkdir(parents=True, exist_ok=True)
