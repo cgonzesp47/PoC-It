@@ -101,9 +101,15 @@ def ejecutar_reparacion_runtime(
     # Si se silencia este fallo, el pipeline acaba fallando más tarde en el OpenAPI probe con
     # un ModuleNotFoundError que parece "misterioso".
     try:
+        # Guardrail: normalizar `project_dir` para evitar paths corruptos (observado: duplicación
+        # .../output/<name>/output/<name>), que rompe venv/ensurepip y runtime probes.
+        project_dir = os.path.normpath(project_dir)
+
         vr = ensure_project_venv_ready(project_dir=project_dir, estructura=estructura, spec=resultado.get("spec"))
         if not getattr(vr, "ok", True):
-            logger.warning("[VENV] No se pudo preparar venv del proyecto (%s): %s", project_dir, getattr(vr, "detail", ""))
+            logger.warning(
+                "[VENV] No se pudo preparar venv del proyecto (%s): %s", project_dir, getattr(vr, "detail", "")
+            )
     except Exception as exc:
         # best-effort: no romper pipeline si no se puede crear venv por política del entorno
         logger.warning("[VENV] Excepción preparando venv del proyecto (%s): %s", project_dir, exc)

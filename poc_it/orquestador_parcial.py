@@ -252,7 +252,18 @@ Descripción:
                 # ... el pipeline real (generación+materialización+repairs+tests+docs) ocurre a continuación ...
                 # Al final actualizamos t_pocit_fin para reflejar el tiempo total real del proceso PoC-it.
 
-                project_dir = os.path.join(OUTPUT_DIRNAME, self.nombre_proyecto)
+                # Directorio real del proyecto materializado en disco.
+                # Fuente de verdad: `materializar_proyecto()` escribe bajo ./output/<nombre_proyecto>.
+                #
+                # Bug observado en logs: `project_dir` acababa duplicado (…/output/<name>/output/<name>),
+                # lo que rompía la creación del venv (.poc_it/venv) y el runtime probe.
+                #
+                # Normalizamos y "deduplicamos" de forma determinista:
+                project_dir = os.path.normpath(os.path.join(OUTPUT_DIRNAME, self.nombre_proyecto))
+                expected_suffix = os.path.normpath(os.path.join(OUTPUT_DIRNAME, self.nombre_proyecto))
+                double_suffix = os.path.normpath(os.path.join(expected_suffix, expected_suffix))
+                if project_dir.endswith(double_suffix):
+                    project_dir = os.path.normpath(project_dir[: -len(double_suffix)] + expected_suffix)
 
                 # Persistir artefacto intermedio con facts deterministas del CÓDIGO real
                 # para alinear la generación de tests con el wiring/DI realmente materializado.
