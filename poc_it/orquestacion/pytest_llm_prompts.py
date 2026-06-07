@@ -32,6 +32,7 @@ def build_prompt_c1_harness_repair(
     runtime_facts: dict | None = None,
     stub_signatures: dict | None = None,
     endpoint_code: dict | None = None,
+    pytest_json_report: dict | None = None,
 ) -> str:
     return f"""
 TAREA (C1 - HARNESS REPAIR)
@@ -75,6 +76,9 @@ ENDPOINT CODE (SI ESTÁ DISPONIBLE)
 
 PYTEST OUTPUT (head 12000)
 {(pytest_output or '')[:12000]}
+
+PYTEST JSON REPORT (si disponible; fuente estructurada, truncado)
+{json.dumps(pytest_json_report or {}, ensure_ascii=False)[:12000]}
 
 TESTS ACTUALES (archivos completos)
 {_files_payload(current_tests)}
@@ -147,6 +151,7 @@ def build_prompt_c2_asserts_repair(
     test_repair_context: dict,
     runtime_contracts: dict | None = None,
     stub_signatures: dict | None = None,
+    pytest_json_report: dict | None = None,
 ) -> str:
     return f"""
 TAREA (C2 - ASSERTS REPAIR)
@@ -208,6 +213,9 @@ STUB_SIGNATURES (DISPONIBLE)
 
 PYTEST OUTPUT (head 12000)
 {(pytest_output or '')[:12000]}
+
+PYTEST JSON REPORT (si disponible; fuente estructurada, truncado)
+{json.dumps(pytest_json_report or {}, ensure_ascii=False)[:12000]}
 
 TESTS ACTUALES (archivos completos)
 {_files_payload(current_tests)}

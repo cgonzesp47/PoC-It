@@ -213,7 +213,7 @@ class PytestRepairResult:
 
 def _run_pytest(project_dir: str) -> Tuple[bool, str, str]:
     """
-    Ejecuta pytest y genera un reporte estructurado mediante JUnit XML (built-in).
+    Ejecuta pytest y genera un reporte estructurado mediante JUnit XML (built-in) + JSON report (pytest-json-report).
 
     Importante (Windows):
     - Hemos observado fallos en `pytest_sessionfinish` (plugin junitxml) cuando el path del XML
@@ -227,9 +227,18 @@ def _run_pytest(project_dir: str) -> Tuple[bool, str, str]:
     report_dir = os.path.abspath(os.path.join(project_dir, ".poc_it"))
     os.makedirs(report_dir, exist_ok=True)
     junit_path = os.path.normpath(os.path.join(report_dir, "pytest_junit.xml"))
+    json_path = os.path.normpath(os.path.join(report_dir, "pytest_report.json"))
 
-    # Intento 1: con junitxml (preferido)
-    base_cmd = ["python", "-m", "pytest", "-q", f"--junitxml={junit_path}"]
+    # Intento 1: con junitxml + json-report (preferido)
+    base_cmd = [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        f"--junitxml={junit_path}",
+        "--json-report",
+        f"--json-report-file={json_path}",
+    ]
     p = subprocess.run(
         base_cmd,
         cwd=project_dir,
@@ -245,7 +254,7 @@ def _run_pytest(project_dir: str) -> Tuple[bool, str, str]:
     out_low = (out or "").lower()
     if ("junitxml.py" in out_low or "pytest_sessionfinish" in out_low) and ("filenotfounderror" in out_low or "winerror 3" in out_low):
         p2 = subprocess.run(
-            ["python", "-m", "pytest", "-q"],
+            ["python", "-m", "pytest", "-q", "--json-report", f"--json-report-file={json_path}"],
             cwd=project_dir,
             capture_output=True,
             text=True,
@@ -1213,6 +1222,7 @@ def _gate_patch_tests_endpoints_exist_in_openapi(
 _DEFAULT_ARTIFACTS = {
     "pytest_last_output": ".poc_it/pytest_last_output.txt",
     "pytest_junit": ".poc_it/pytest_junit.xml",
+    "pytest_report": ".poc_it/pytest_report.json",
 }
 
 
@@ -1285,6 +1295,14 @@ def repair_tests_until_pytest_passes(
     # Presupuesto adaptativo (harness suele necesitar más iteraciones)
     hard_budget = max(3, int(max_repairs or 3))
     max_allowed = max(hard_budget, 10)
+
+    # Acceptance gate: nunca aceptar un patch que empeore (errors+fails) o que no mejore en absoluto.
+    # - Si empeora vs baseline => rollback del patch aplicado en esa iteración.
+    # - Si no mejora durante NO_IMPROVE_LIMIT => degradar (ya existe).
+    baseline_total = None
+    baseline_fp = None
+    last_accepted_total = None
+    last_accepted_fp = None
 
     attempt = 0
     while attempt <= max_allowed:
@@ -1374,6 +1392,15 @@ def repair_tests_until_pytest_passes(
             except Exception:
                 pass
 
+            # Persistir json-report si existe (pytest-json-report)
+            try:
+                jr_path = os.path.join(project_dir, ".poc_it", "pytest_report.json")
+                if os.path.exists(jr_path):
+                    with open(jr_path, "r", encoding="utf-8") as f:
+                        estructura[".poc_it/pytest_report.json"] = f.read()
+            except Exception:
+                pass
+
             head = (out or "").strip()[:800]
             tail = "\n".join((out or "").splitlines()[-120:])  # tail humano (últimas ~120 líneas)
             logger.info("[PYTEST-REPAIR] pytest output (head 800): %s", head)
@@ -1406,6 +1433,13 @@ def repair_tests_until_pytest_passes(
             pass
 
         improved = (total_n < total_prev) or (fp and fp != prev_fp)
+
+        # baseline: primera ejecución antes de aplicar patches
+        if baseline_total is None:
+            baseline_total = total_n
+            baseline_fp = fp
+            last_accepted_total = total_n
+            last_accepted_fp = fp
 
         if fp and fp == prev_fp:
             stuck_fp_streak += 1
@@ -1527,12 +1561,20 @@ def repair_tests_until_pytest_passes(
             except Exception:
                 stub_signatures = None
 
+            pytest_json_report_obj = None
+            try:
+                jr_raw = estructura.get(".poc_it/pytest_report.json") or ""
+                pytest_json_report_obj = json.loads(jr_raw) if isinstance(jr_raw, str) and jr_raw.strip() else None
+            except Exception:
+                pytest_json_report_obj = None
+
             prompt = build_prompt_c2_asserts_repair(
                 pytest_output=out,
                 current_tests=current_tests,
                 test_repair_context=test_ctx,
                 runtime_contracts=runtime_contracts,
                 stub_signatures=stub_signatures,
+                pytest_json_report=pytest_json_report_obj,
             )
             subphase = "C2"
         else:
@@ -1561,6 +1603,13 @@ def repair_tests_until_pytest_passes(
             except Exception:
                 endpoint_code = None
 
+            pytest_json_report_obj = None
+            try:
+                jr_raw = estructura.get(".poc_it/pytest_report.json") or ""
+                pytest_json_report_obj = json.loads(jr_raw) if isinstance(jr_raw, str) and jr_raw.strip() else None
+            except Exception:
+                pytest_json_report_obj = None
+
             prompt = build_prompt_c1_harness_repair(
                 pytest_output=out,
                 current_tests=current_tests,
@@ -1569,6 +1618,7 @@ def repair_tests_until_pytest_passes(
                 runtime_facts=runtime_facts,
                 stub_signatures=stub_signatures,
                 endpoint_code=endpoint_code,
+                pytest_json_report=pytest_json_report_obj,
             )
             subphase = "C1"
 
@@ -1757,7 +1807,10 @@ def repair_tests_until_pytest_passes(
 
                 patch = patch2
 
-        # Aplicar patch a disco + estructura in-memory
+        # Aplicar patch a disco + estructura in-memory (con snapshot para rollback)
+        snapshot_tests = dict(current_tests)
+        snapshot_estructura = dict(estructura)
+
         materializar_proyecto(
             nombre_proyecto=nombre_proyecto,
             estructura=patch,
@@ -1766,6 +1819,79 @@ def repair_tests_until_pytest_passes(
         estructura.update(patch)
         current_tests.update(patch)
         patched_total.update(patch)
+
+        # Acceptance gate: re-run pytest inmediatamente y aceptar SOLO si mejora vs baseline o vs prev
+        ok_after, out_after, _ = _run_pytest(project_dir)
+        last_out = out_after
+
+        junit_xml_after = _read_pytest_junit_xml(project_dir)
+        counts_after = _extract_counts_from_junit_xml(junit_xml_after)
+        if counts_after:
+            err_a, fail_a, *_rest = counts_after
+            total_after = err_a + fail_a
+        else:
+            err_a, fail_a = _extract_pytest_counts(out_after)
+            total_after = err_a + fail_a
+
+        fp_after = _fingerprint_from_pytest_output(out_after)
+
+        # aceptación:
+        # - pasa => aceptar
+        # - o mejora total failures/errors vs último aceptado
+        # - o cambia fingerprint vs último aceptado (indicando progreso real)
+        #
+        # Nota: NO comparamos contra `total_n` porque pertenece al run pre-patch de ESTA iteración;
+        # lo correcto es comparar contra el último estado aceptado (evita aceptar "flapping" o regresiones).
+        accept = bool(ok_after) or bool(
+            (last_accepted_total is not None and total_after < last_accepted_total)
+        ) or bool(fp_after and last_accepted_fp and fp_after != last_accepted_fp)
+
+        if not accept:
+            logger.info(
+                "[PYTEST-REPAIR][GATE] Patch rechazado (no mejora). before(total=%s fp=%s) after(total=%s fp=%s). Rollback.",
+                total_n,
+                (fp or "")[:8],
+                total_after,
+                (fp_after or "")[:8],
+            )
+            # rollback in-memory
+            estructura.clear()
+            estructura.update(snapshot_estructura)
+            current_tests.clear()
+            current_tests.update(snapshot_tests)
+
+            # rollback on-disk: re-materializar snapshot (solo tests/ + pytest.ini)
+            rollback_patch = {p: c for p, c in snapshot_tests.items()}
+            try:
+                materializar_proyecto(
+                    nombre_proyecto=nombre_proyecto,
+                    estructura=rollback_patch,
+                    limpiar_directorio=False,
+                )
+            except Exception:
+                pass
+
+            append_trace_event(
+                project_dir,
+                TraceEvent(
+                    ts=now_ts(),
+                    phase=subphase,
+                    attempt=attempt,
+                    action="gate_reject_no_improve",
+                    files_changed=list(patch.keys()),
+                ),
+            )
+
+            attempt += 1
+            continue
+
+        # Patch aceptado => actualizar estado aceptado.
+        last_accepted_total = total_after
+        last_accepted_fp = fp_after or last_accepted_fp
+
+        # Si ya pasa tras el patch, devolver OK inmediatamente
+        if ok_after:
+            return _mk_result(ok=True, attempts=attempt, last_output=out_after, patched_files=patched_total)
 
         # 🔒 Reinyectar configuración base de pytest.ini tras cada patch (anti-LLM override)
         try:
@@ -1795,10 +1921,8 @@ markers =
         if subphase == "C1":
             c1_no_patch_streak = 0
 
-        if improved:
-            no_improve_streak = 0
-        else:
-            no_improve_streak += 1
+        # En esta iteración, si llegamos aquí el patch ha sido aceptado (mejoró).
+        no_improve_streak = 0
 
         # Si no mejora en varias iteraciones, degradamos para garantizar tests passing.
         if no_improve_streak >= NO_IMPROVE_LIMIT:

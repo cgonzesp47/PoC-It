@@ -181,7 +181,10 @@ def ejecutar_reparacion_runtime(
         #
         # Nota: NO usa fixers deterministas. Solo LLM + gates + rollback.
         # ------------------------------------------------------------
-        safe_enabled = str(os.getenv("POC_IT_SAFE_LLM_REPAIR", "")).strip() in ("1", "true", "True", "yes", "YES")
+        # Safe repair es el camino principal (feature-flag solo para desactivar).
+        # Objetivo: evitar el repair legacy sin gates/rollback cuando hay fallos import-time típicos.
+        safe_disabled = str(os.getenv("POC_IT_SAFE_LLM_REPAIR", "")).strip() in ("0", "false", "False", "no", "NO")
+        safe_enabled = not safe_disabled
         safe_max = int(os.getenv("POC_IT_SAFE_LLM_REPAIR_MAX", "2") or "2")
         require_probe_ok = str(os.getenv("POC_IT_SAFE_LLM_REPAIR_REQUIRE_PROBE_OK", "")).strip() in (
             "1",
@@ -320,6 +323,35 @@ def ejecutar_reparacion_runtime(
             except Exception as exc:
                 logger.info("[RUNTIME_REPAIR] No se pudo materializar RUNTIME_VERIFY_ERROR.txt: %s", exc)
 
+            # IMPORTANTE:
+            # Aunque el código NO sea importable (code_ok=False), seguimos con la ejecución global
+            # y necesitamos que el pipeline pueda "degradar" a contract-lite más adelante.
+            #
+            # Para que esa degradación sea posible, intentamos dejar un suite mínimo de tests
+            # (smoke_import + openapi) materializado en el proyecto. Esto sirve para:
+            # - permitir un pytest mínimo (si el entorno tiene dependencias instaladas)
+            # - y, aunque no pase, dejar una base coherente para el usuario.
+            try:
+                from poc_it.orquestacion.pytest_llm_repair import _degrade_to_contract_lite
+
+                patch_min = _degrade_to_contract_lite(nombre_proyecto=nombre_proyecto, estructura=estructura)
+                materializar_proyecto(
+                    nombre_proyecto=nombre_proyecto,
+                    estructura=patch_min,
+                    limpiar_directorio=False,
+                )
+                estructura.update(patch_min)
+                archivos_creados.extend([os.path.join(project_dir, p.replace("/", os.sep)) for p in patch_min.keys()])
+            except Exception:
+                pass
+
+            # Marcar explícitamente que no se pudo completar runtime_verify (ayuda a la política del orquestador)
+            try:
+                if isinstance(resultado, dict):
+                    resultado["runtime_ok"] = False
+            except Exception:
+                pass
+
             return
 
         missing_mod = _extraer_modulo_faltante(detail)
@@ -405,6 +437,11 @@ SALIDA
 - Devuelve JSON con la lista completa de archivos corregidos (solo los modificados) con formato:
   {{ "files": [{{"path":"...", "content":"..."}}] }}
 """
+
+        # Si safe repair está habilitado, evitamos el repair legacy (sin gates) salvo que esté explícitamente desactivado.
+        # Motivo: el repair legacy suele empeorar la convergencia y no tiene rollback.
+        if safe.enabled:
+            continue
 
         spec = resultado.get("spec")
         files_iniciales = [{"path": p, "content": c} for p, c in (estructura or {}).items()]
