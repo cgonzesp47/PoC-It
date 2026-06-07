@@ -583,6 +583,7 @@ Descripción:
                 estructura=estructura,
                 resultado=resultado,
                 estimacion_generada=estimacion_generada,
+                estimacion_manual=estimacion_manual,
                 t_clasificacion_inicio=self.t_clasificacion_inicio,
                 t_clasificacion_fin=self.t_clasificacion_fin,
                 # Para métricas internas de docs (PERFORMANCE), reutilizamos el rango real del pipeline PoC-it.
