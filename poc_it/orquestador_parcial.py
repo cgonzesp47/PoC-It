@@ -419,34 +419,20 @@ Descripción:
                     regenerar_tests=True,
                 )
 
-                # Estado final: determinista y estructurado
+                # Estado final: determinista y estructurado.
                 #
-                # Fuente de verdad:
-                # - `.poc_it/pytest_junit.xml` y `.poc_it/pytest_last_output.txt` (generados por pytest_llm_repair)
-                # - `pytest_llm_repair.PytestRepairResult` ahora expone `degraded/degrade_type` y `ok`
-                #
-                # Política acordada:
-                # - Si degrada a contract-lite, se re-ejecuta pytest con suite mínima.
-                # - Si esa suite mínima no pasa => NO publicar.
+                # Política requerida:
+                # - Tanto en COMPLETO como en PARCIAL: si el loop de reparación de tests no converge,
+                #   degradar a "contract-lite" (suite mínima) y re-ejecutar pytest.
+                # - Si esa suite mínima pasa => continuar (docs/estimación/publicación) SIN generar README_ERROR fatal.
+                # - Si incluso contract-lite falla => no publicar.
                 run_result = RunResult.error(mode=str(modo_generacion).upper(), reason="pytest_failed")
-                try:
-                    from poc_it.orquestacion.pytest_llm_repair import _read_pytest_junit_xml, _extract_counts_from_junit_xml
 
-                    xml = _read_pytest_junit_xml(project_dir)
-                    counts = _extract_counts_from_junit_xml(xml)
-                    pytest_ok = bool(counts and (counts[0] + counts[1] == 0))
-                except Exception:
-                    pytest_ok = False
-
-                # degraded se toma del runtime_contracts (si existe) pero, como el loop lo escribe a disco,
-                # aquí lo inferimos leyendo `runtime_contracts.json` NO es necesario; preferimos el indicador en resultado si lo tenemos.
-                # En este punto, `ejecutar_reparacion_runtime` ya pudo setear `resultado["pytest_repair"]` (nuevo contrato).
+                # 1) Leer resultado del loop de repair si existe (lo setea ejecutar_reparacion_runtime)
                 degraded = False
                 degrade_type = None
                 try:
-                    pr = None
-                    if isinstance(resultado, dict):
-                        pr = resultado.get("pytest_repair")
+                    pr = (resultado or {}).get("pytest_repair") if isinstance(resultado, dict) else None
                     if isinstance(pr, dict):
                         degraded = bool(pr.get("degraded"))
                         degrade_type = pr.get("degrade_type")
@@ -454,7 +440,54 @@ Descripción:
                     degraded = False
                     degrade_type = None
 
-                # Política: considerar OK si pytest pasa, incluyendo el caso OK_DEGRADED (contract-lite).
+                # 2) Evaluar pytest actual
+                try:
+                    from poc_it.orquestacion.pytest_llm_repair import (
+                        _extract_counts_from_junit_xml,
+                        _read_pytest_junit_xml,
+                    )
+
+                    xml = _read_pytest_junit_xml(project_dir)
+                    counts = _extract_counts_from_junit_xml(xml)
+                    pytest_ok = bool(counts and (counts[0] + counts[1] == 0))
+                except Exception:
+                    pytest_ok = False
+
+                # 3) Si no pasó y no degradó todavía, degradar aquí (contract-lite) como último recurso.
+                if not pytest_ok and not degraded:
+                    try:
+                        # Degradación a contract-lite: suite mínima (smoke_import + openapi).
+                        # Esto permite continuar documentación/estimación y publicación incluso si los tests "completos"
+                        # no convergen. El detalle de pytest se conserva en .poc_it/pytest_last_output.txt.
+                        from poc_it.orquestacion.pytest_llm_repair import _degrade_to_contract_lite, _run_pytest
+
+                        _degrade_to_contract_lite(nombre_proyecto=self.nombre_proyecto, estructura=estructura)
+                        ok2, out2, _ = _run_pytest(project_dir)
+                        degraded = True
+                        degrade_type = "contract-lite"
+
+                        # refrescar estado pytest tras degradación (suite mínima)
+                        # Nota: el report XML puede no existir si pytest corrió sin junitxml fallback;
+                        # en ese caso, ok2 es la fuente de verdad.
+                        pytest_ok = bool(ok2)
+
+                        # reflejar en `resultado` para el resto del pipeline
+                        try:
+                            if isinstance(resultado, dict):
+                                resultado["pytest_repair"] = {
+                                    "ok": bool(pytest_ok),
+                                    "attempts": int((pr or {}).get("attempts") or 0) if isinstance(pr, dict) else 0,
+                                    "degraded": True,
+                                    "degrade_type": "contract-lite",
+                                    "artifacts": dict((pr or {}).get("artifacts") or {}) if isinstance(pr, dict) else {},
+                                }
+                        except Exception:
+                            pass
+                    except Exception:
+                        # best-effort: si falla degradación, seguimos con pytest_ok=False
+                        pass
+
+                # 4) Política: considerar OK si pytest pasa, incluyendo el caso OK_DEGRADED (contract-lite).
                 if pytest_ok:
                     run_result = RunResult.ok(
                         mode=str(modo_generacion).upper(),
