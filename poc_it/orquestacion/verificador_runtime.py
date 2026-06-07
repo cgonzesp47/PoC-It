@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Final
 
-PYTHON_EXECUTABLE: Final[str] = "python"
+# IMPORTANTE: usar el MISMO intérprete que ejecuta PoC-it.
+# En Windows, invocar "python" puede resolver a otro Python/venv por PATH/launcher.
+PYTHON_EXECUTABLE: Final[str] = sys.executable
 IMPORT_MAIN_CMD: Final[list[str]] = [PYTHON_EXECUTABLE, "-c", "import app.main; print('IMPORT_MAIN_OK')"]
 
 # Smoke básico: importa app.main y ejecuta un request mínimo a /openapi.json.
