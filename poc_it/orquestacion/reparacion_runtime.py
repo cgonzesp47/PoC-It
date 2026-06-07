@@ -96,11 +96,17 @@ def ejecutar_reparacion_runtime(
 
     # Asegurar entorno hermético para runtime verify/probe:
     # - En máquinas limpias, sin esto fallará con ModuleNotFoundError (p.ej. fastapi).
+    #
+    # IMPORTANTE: si no se puede crear/preparar el venv, lo registramos de forma visible.
+    # Si se silencia este fallo, el pipeline acaba fallando más tarde en el OpenAPI probe con
+    # un ModuleNotFoundError que parece "misterioso".
     try:
-        ensure_project_venv_ready(project_dir=project_dir, estructura=estructura, spec=resultado.get("spec"))
-    except Exception:
+        vr = ensure_project_venv_ready(project_dir=project_dir, estructura=estructura, spec=resultado.get("spec"))
+        if not getattr(vr, "ok", True):
+            logger.warning("[VENV] No se pudo preparar venv del proyecto (%s): %s", project_dir, getattr(vr, "detail", ""))
+    except Exception as exc:
         # best-effort: no romper pipeline si no se puede crear venv por política del entorno
-        pass
+        logger.warning("[VENV] Excepción preparando venv del proyecto (%s): %s", project_dir, exc)
 
     for attempt in range(max_runtime_repairs + 1):
         ok_runtime, detail = runtime_verify_fastapi_project(project_dir, resultado.get("spec"))
