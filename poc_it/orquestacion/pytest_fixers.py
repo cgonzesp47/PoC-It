@@ -83,7 +83,7 @@ _EXPECTED_500_GOT_200_RE = re.compile(
 )
 
 _EXPECTED_200_GOT_422_RE = re.compile(
-    r"assert\\s+422\\s*==\\s*200|assert\\s+response\\.status_code\\s*==\\s*expected_status\\s*\\n\\s*E\\s*assert\\s+422\\s*==\\s*200",
+    r"assert\\s+422\\s*==\\s*(200|201)|assert\\s+response\\.status_code\\s*==\\s*expected_status\\s*\\n\\s*E\\s*assert\\s+422\\s*==\\s*(200|201)",
     re.IGNORECASE,
 )
 
@@ -548,9 +548,12 @@ def fix_expected_200_got_422_request_shape(pytest_output: str, estructura: Dict[
     if not pytest_output or not _EXPECTED_200_GOT_422_RE.search(pytest_output):
         return None
 
-    # Extraer path del traceback (línea: response = client.post('/upload', json={...}))
+    # Detectar la llamada real en el test dentro del traceback para saber:
+    # - método HTTP
+    # - path
+    # - nombre de la variable del payload (payload, project_data, task_data, data, etc.)
     call_re = re.compile(
-        r"response\\s*=\\s*client\\.(?P<call>post|put|patch)\\(\\s*(?P<q>['\\\"])(?P<path>[^'\\\"]+)\\2\\s*,\\s*json\\s*=",
+        r"response\\s*=\\s*client\\.(?P<call>get|post|put|patch|delete)\\(\\s*(?P<q>['\\\"])(?P<path>[^'\\\"]+)\\2\\s*,\\s*json\\s*=\\s*(?P<payload>[A-Za-z_][A-Za-z0-9_]*)",
         re.IGNORECASE,
     )
     m = call_re.search(pytest_output)
@@ -559,6 +562,7 @@ def fix_expected_200_got_422_request_shape(pytest_output: str, estructura: Dict[
 
     method = str(m.group("call") or "").upper()
     path = str(m.group("path") or "")
+    payload_var = str(m.group("payload") or "payload")
 
     rc = _get_runtime_contracts_obj(estructura)
     ep = _find_endpoint_contract(rc or {}, method, path)
@@ -567,6 +571,7 @@ def fix_expected_200_got_422_request_shape(pytest_output: str, estructura: Dict[
 
     qreq = ep.get("query_params_required") or []
     body = ep.get("request_body_param")
+
     # Solo actuamos si es un caso CLARO: query required y sin body
     if not (isinstance(qreq, list) and qreq) or (body is not None and str(body).strip()):
         return None
@@ -579,19 +584,35 @@ def fix_expected_200_got_422_request_shape(pytest_output: str, estructura: Dict[
             continue
         if not isinstance(content, str) or not content.strip():
             continue
+
         if path not in content or "json=" not in content:
             continue
 
         new = content
-        # Reescritura conservadora: solo para la primera ocurrencia del endpoint.
+
+        # Reescritura conservadora: solo para la primera ocurrencia del endpoint y preservando el nombre de la variable.
+        #
+        # Ejemplos:
+        #   client.post("/projects", json=project_data) -> client.post("/projects", params=project_data)
+        #   client.put("/x", json=payload) -> client.put("/x", params=payload)
         new2 = re.sub(
-            rf'client\\.{method.lower()}\\(\\s*([\'\\"]{re.escape(path)}[\'\\"])\\s*,\\s*json\\s*=\\s*',
-            r'client.' + method.lower() + r'(\1, params=',
+            rf'client\\.{method.lower()}\\(\\s*([\'\\"]{re.escape(path)}[\'\\"])\\s*,\\s*json\\s*=\\s*{re.escape(payload_var)}\\s*\\)',
+            r"client." + method.lower() + r"(\\1, params=" + payload_var + r")",
             new,
             count=1,
         )
         if new2 != new:
             new = new2
+        else:
+            # Fallback: si el payload no se detectó exactamente (whitespace/kwargs extra), sustituimos solo el kw.
+            new2 = re.sub(
+                rf'(client\\.{method.lower()}\\(\\s*[\'\\"]{re.escape(path)}[\'\\"][^\\)]*?)\\bjson\\s*=\\s*',
+                r"\\1params=",
+                new,
+                count=1,
+            )
+            if new2 != new:
+                new = new2
 
         if new != content:
             patched_files[tpath] = new
