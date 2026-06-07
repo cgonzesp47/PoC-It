@@ -11,6 +11,7 @@ from poc_it.materializador_archivos import materializar_proyecto
 from poc_it.models import ProjectContext
 from poc_it.orquestacion.llm_safe_repair import SafeRepairConfig, run_llm_safe_repair
 from poc_it.orquestacion.verificador_runtime import runtime_verify_fastapi_project
+from poc_it.orquestacion.venv_manager import ensure_project_venv_ready
 from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
 from poc_it.orquestacion.pytest_llm_repair import repair_tests_until_pytest_passes
 from poc_it.orquestacion.tests_coverage_llm_repair import repair_tests_coverage_until_ok
@@ -92,6 +93,14 @@ def ejecutar_reparacion_runtime(
         "[PIPELINE][A] Code correctness loop (max=%s): import-time + wiring(OpenAPI) + request-time probe",
         max_runtime_repairs,
     )
+
+    # Asegurar entorno hermético para runtime verify/probe:
+    # - En máquinas limpias, sin esto fallará con ModuleNotFoundError (p.ej. fastapi).
+    try:
+        ensure_project_venv_ready(project_dir=project_dir, estructura=estructura, spec=resultado.get("spec"))
+    except Exception:
+        # best-effort: no romper pipeline si no se puede crear venv por política del entorno
+        pass
 
     for attempt in range(max_runtime_repairs + 1):
         ok_runtime, detail = runtime_verify_fastapi_project(project_dir, resultado.get("spec"))

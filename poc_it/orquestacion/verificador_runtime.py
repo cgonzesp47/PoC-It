@@ -6,17 +6,41 @@ import sys
 from pathlib import Path
 from typing import Final
 
-# IMPORTANTE: usar el MISMO intérprete que ejecuta PoC-it.
-# En Windows, invocar "python" puede resolver a otro Python/venv por PATH/launcher.
+# IMPORTANTE:
+# No podemos depender del intérprete que ejecuta PoC-it, porque el proyecto generado debe
+# verificarse en un entorno hermético (otra máquina / runner limpio).
+#
+# Política:
+# - Si existe un venv del proyecto generado en `.poc_it/venv`, usamos SU python.
+# - Si no existe, hacemos fallback a sys.executable (comportamiento previo).
 PYTHON_EXECUTABLE: Final[str] = sys.executable
-# NOTA: NO usamos `python -c "..."` porque en algunos entornos Windows (PowerShell/VSCode)
-# el quoting puede romperse y producir falsos errores como `ModuleNotFoundError`/`SyntaxError`.
-# Usamos scripts .py temporales en el directorio del proyecto y los ejecutamos con sys.executable.
-IMPORT_MAIN_CMD: Final[list[str]] = [PYTHON_EXECUTABLE, "_poc_it_runtime_import_main.py"]
 
-# Smoke básico: importa app.main y ejecuta un request mínimo a /openapi.json.
-# Esto captura bugs típicos de wiring que NO aparecen en import-time.
-SMOKE_OPENAPI_CMD: Final[list[str]] = [PYTHON_EXECUTABLE, "_poc_it_runtime_smoke_openapi.py"]
+
+def _venv_python(project_dir: str) -> str:
+    """Devuelve el python a usar para verificar el proyecto generado.
+
+    Preferimos el venv local del proyecto (si existe) para asegurar que están instaladas
+    las dependencias declaradas en requirements.txt, evitando falsos negativos como:
+    `ModuleNotFoundError: No module named 'fastapi'`.
+    """
+    try:
+        venv_py = Path(project_dir) / ".poc_it" / "venv" / "Scripts" / "python.exe"  # Windows
+        if venv_py.exists():
+            return str(venv_py)
+        venv_py2 = Path(project_dir) / ".poc_it" / "venv" / "bin" / "python"  # Linux/macOS
+        if venv_py2.exists():
+            return str(venv_py2)
+    except Exception:
+        pass
+    return PYTHON_EXECUTABLE
+
+
+def _cmd_import_main(project_dir: str) -> list[str]:
+    return [_venv_python(project_dir), "_poc_it_runtime_import_main.py"]
+
+
+def _cmd_smoke_openapi(project_dir: str) -> list[str]:
+    return [_venv_python(project_dir), "_poc_it_runtime_smoke_openapi.py"]
 
 _MISSING_MODULE_RE: Final[re.Pattern[str]] = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
 _REQUIREMENTS_PKG_RE: Final[re.Pattern[str]] = re.compile(r"^([a-zA-Z0-9_.-]+)")
@@ -149,7 +173,7 @@ def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -
     """
     _ensure_probe_scripts(project_dir)
 
-    ok_main, out_main = _run_cmd(IMPORT_MAIN_CMD, cwd=project_dir)
+    ok_main, out_main = _run_cmd(_cmd_import_main(project_dir), cwd=project_dir)
     if not ok_main:
         missing = _extract_missing_module(out_main)
         if missing:
@@ -190,7 +214,7 @@ def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -
             encoding="utf-8",
             errors="ignore",
         )
-        cmd = [PYTHON_EXECUTABLE, "_poc_it_runtime_import_endpoints.py"]
+        cmd = [_venv_python(project_dir), "_poc_it_runtime_import_endpoints.py"]
         ok_eps, out_eps = _run_cmd(cmd, cwd=project_dir)
         if not ok_eps:
             missing = _extract_missing_module(out_eps)
@@ -216,7 +240,7 @@ def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -
             return False, f"[runtime_verify] endpoints modules import failed:\nModules={endpoint_modules}\n{out_eps}\n{hint}"
 
     # Smoke runtime adicional: /openapi.json con TestClient.
-    ok_smoke, out_smoke = _run_cmd(SMOKE_OPENAPI_CMD, cwd=project_dir)
+    ok_smoke, out_smoke = _run_cmd(_cmd_smoke_openapi(project_dir), cwd=project_dir)
     if not ok_smoke:
         hint = (
             "HINTS:\n"
