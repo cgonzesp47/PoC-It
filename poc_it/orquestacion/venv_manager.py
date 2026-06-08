@@ -50,7 +50,8 @@ def _sha256(s: str) -> str:
 
 
 def _venv_python(project_dir: str) -> Path:
-    p = Path(project_dir) / ".poc_it" / "venv"
+    # Nuevo: venv fuera del output/ para evitar rutas largas o nombres no válidos en Windows
+    p = _safe_venv_root_for_project(project_dir)
     # Windows
     win = p / "Scripts" / "python.exe"
     if win.exists():
@@ -66,7 +67,11 @@ def _venv_exists(project_dir: str) -> bool:
 
 
 def _state_path(project_dir: str) -> Path:
-    return Path(project_dir) / ".poc_it" / "venv_state.json"
+    # Guardamos el estado junto al proyecto si existe; si no, lo guardamos junto al venv_root
+    p = Path(project_dir)
+    if p.exists():
+        return p / ".poc_it" / "venv_state.json"
+    return _safe_venv_root_for_project(project_dir) / "venv_state.json"
 
 
 def _compute_fingerprint(project_dir: str, *, estructura: dict[str, str] | None, spec: Any) -> str:
@@ -161,6 +166,24 @@ def _dedupe_project_dir(project_dir: str) -> str:
     return p
 
 
+def _safe_venv_root_for_project(project_dir: str) -> Path:
+    """Calcula una ruta de venv segura en Windows aunque el project_dir tenga caracteres raros o sea largo.
+
+    Motivo:
+    - `python -m venv` puede fallar en Windows con WinError 267/123 cuando el path contiene
+      combinaciones extrañas, longitud excesiva, o cuando el directorio ni siquiera existe.
+    - En vez de crear el venv *dentro* del proyecto (output/<nombre>/.poc_it/venv),
+      lo creamos en un directorio estable y corto, derivado por hash del project_dir.
+
+    Ruta:
+      ./.poc_it/venvs/<sha1(project_dir)>/
+    """
+    base = Path(".poc_it") / "venvs"
+    base.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha1((project_dir or "").encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return (base / h).resolve()
+
+
 def ensure_project_venv_ready(*, project_dir: str, estructura: dict[str, str] | None, spec: Any) -> VenvReadyResult:
     """Garantiza best-effort que existe un venv usable con deps instaladas.
 
@@ -168,17 +191,37 @@ def ensure_project_venv_ready(*, project_dir: str, estructura: dict[str, str] | 
     """
     project_dir = _dedupe_project_dir(project_dir)
     project = Path(project_dir)
+
+    # Crear/validar el directorio del proyecto: en algunos fallos reales el path recibido
+    # no existía (nombre "lógico" != carpeta materializada), lo que dispara WinError 267.
+    try:
+        project.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        # Si NO podemos crear el directorio del proyecto, de todas formas podemos preparar un venv global
+        # para ejecutar probes/tests herméticos. Continuamos con venv_root seguro.
+        pass
+
+    # Venv root seguro (siempre corto/estable). No depende del nombre del proyecto en output/.
+    venv_root = _safe_venv_root_for_project(str(project.resolve() if project.exists() else project))
+
+    # Directorio de estado del proyecto (seguimos guardando state junto al proyecto si es posible)
     poc_it_dir = project / ".poc_it"
-    poc_it_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        poc_it_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # fallback: si no se puede crear dentro del proyecto, guardamos state en el venv_root
+        poc_it_dir = venv_root
+        poc_it_dir.mkdir(parents=True, exist_ok=True)
 
     fingerprint = _compute_fingerprint(project_dir, estructura=estructura, spec=spec)
     state = _load_state(project_dir)
     if state.get("fingerprint") == fingerprint and _venv_exists(project_dir):
         return VenvReadyResult(ok=True, detail="venv up-to-date")
 
-    # 1) Crear venv si no existe
+    # 1) Crear venv si no existe (en venv_root seguro)
     if not _venv_exists(project_dir):
-        rc, out = _run([sys.executable, "-m", "venv", str(poc_it_dir / "venv")], cwd=project_dir)
+        venv_root.mkdir(parents=True, exist_ok=True)
+        rc, out = _run([sys.executable, "-m", "venv", str(venv_root)], cwd=str(project if project.exists() else None) or None)
         if rc != 0:
             return VenvReadyResult(ok=False, detail=f"venv create failed: {out}")
 
@@ -187,14 +230,14 @@ def ensure_project_venv_ready(*, project_dir: str, estructura: dict[str, str] | 
         return VenvReadyResult(ok=False, detail="venv python not found after creation")
 
     # 2) Upgrade pip (best-effort)
-    _run([str(py), "-m", "pip", "install", "--upgrade", "pip"], cwd=project_dir)
+    _run([str(py), "-m", "pip", "install", "--upgrade", "pip"], cwd=str(project) if project.exists() else None)
 
     # 3) Instalar requirements si existe
     req_path = project / "requirements.txt"
     req_dev_path = project / "requirements-dev.txt"
 
     if req_path.exists():
-        rc, out = _run([str(py), "-m", "pip", "install", "-r", str(req_path)], cwd=project_dir)
+        rc, out = _run([str(py), "-m", "pip", "install", "-r", str(req_path)], cwd=str(project) if project.exists() else None)
         if rc != 0:
             return VenvReadyResult(ok=False, detail=f"pip install requirements.txt failed: {out}")
     else:
