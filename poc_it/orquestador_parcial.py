@@ -238,19 +238,19 @@ Descripción:
                     spec0.setdefault("modo", modo_generacion)
                     resultado["spec"] = spec0
 
-            # Medición real del tiempo de PoC-it (solo generación, sin input del usuario):
+            # Medición real del tiempo de PoC-it (pipeline real, sin input del usuario):
             # - Se usa para README / tablas de estimación como "PoC-it (medido)".
             # - NOTA: el tiempo del usuario rellenando la plantilla se mide fuera (main.py) y no debe influir aquí.
             #
-            # En ASESOR no se genera PoC, por lo que lo dejamos a 0.
+            # IMPORTANTE: abrir el contador ANTES de repairs/tests/docs.
+            # El contador se cerrará justo ANTES de llamar a `generar_documentacion()`,
+            # para que también incluya reparación+pytest pero no el tiempo de generación de readmes.
             t_pocit_inicio = 0.0
             t_pocit_fin = 0.0
             if modo_generacion != ModoGeneracion.ASESOR:
                 import time
 
                 t_pocit_inicio = time.perf_counter()
-                # ... el pipeline real (generación+materialización+repairs+tests+docs) ocurre a continuación ...
-                # Al final actualizamos t_pocit_fin para reflejar el tiempo total real del proceso PoC-it.
 
                 # Directorio real del proyecto materializado en disco.
                 # Fuente de verdad: `materializar_proyecto()` escribe bajo ./output/<nombre_proyecto>.
@@ -567,11 +567,40 @@ Descripción:
                 # Mantener también una estimación manual para README_ANALISIS (sin recalcular en docs).
                 estimacion_manual = self._estimacion_manual(spec=spec)
 
-            # Cerrar medición de tiempo real PoC-it
+            # Cerrar medición de tiempo real PoC-it (incluye repairs+pytest).
+            # Nota: no incluye generación de documentación, para evitar que timeouts del LLM "docs"
+            # falseen el "PoC-it (medido)".
             if modo_generacion != ModoGeneracion.ASESOR:
                 import time
 
                 t_pocit_fin = time.perf_counter()
+
+            # Persistencia de artefactos "fuente de verdad" (solo una vez) dentro de la PoC.
+            #
+            # Objetivo:
+            # - facilitar diagnósticos post-mortem sin depender de output/_debug
+            # - alimentar reparaciones posteriores (manuales o automáticas) con el SPEC usado realmente
+            # - mantenerlo fuera del código publicado (en `.poc_it/`)
+            try:
+                patch_truth = {}
+                if self._contexto_normalizado:
+                    patch_truth[".poc_it/contexto_normalizado.json"] = self._contexto_normalizado.model_dump_json(
+                        indent=2
+                    )
+                if isinstance(resultado, dict) and isinstance(resultado.get("spec"), dict):
+                    import json as _json
+
+                    patch_truth[".poc_it/spec.json"] = _json.dumps(
+                        resultado.get("spec"), ensure_ascii=False, indent=2
+                    )
+                if patch_truth:
+                    materializar_proyecto(
+                        nombre_proyecto=self.nombre_proyecto,
+                        estructura=patch_truth,
+                        limpiar_directorio=False,
+                    )
+            except Exception:
+                pass
 
             # Generación docs
             generar_documentacion(

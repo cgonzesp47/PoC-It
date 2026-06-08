@@ -110,19 +110,21 @@ def generar_documentacion(
             spec=spec_dict,
         )
 
-        future_analisis = executor.submit(
-            generar_readme_asesor,
-            nombre_proyecto,
-            context.plantilla.problema,
-            usuarios_reales,
-            funcionalidades_reales,
-            limites_reales,
-            tecnologias_reales,
-            arquitectura_real,
-            opciones_estrategicas,
-            estimacion_manual,
-            spec_dict,
-        )
+        future_analisis = None
+        if modo_generacion.upper() == ModoGeneracion.ASESOR:
+            future_analisis = executor.submit(
+                generar_readme_asesor,
+                nombre_proyecto,
+                context.plantilla.problema,
+                usuarios_reales,
+                funcionalidades_reales,
+                limites_reales,
+                tecnologias_reales,
+                arquitectura_real,
+                opciones_estrategicas,
+                estimacion_manual,
+                spec_dict,
+            )
 
         future_manual = None
         if modo_generacion.upper() == ModoGeneracion.PARCIAL:
@@ -137,7 +139,7 @@ def generar_documentacion(
             )
 
         readme_final = future_final.result()
-        readme_analisis = future_analisis.result()
+        readme_analisis = future_analisis.result() if future_analisis else None
         readme_manual = future_manual.result() if future_manual else None
 
     materializar_proyecto(
@@ -146,11 +148,12 @@ def generar_documentacion(
         limpiar_directorio=False,
     )
 
-    materializar_proyecto(
-        nombre_proyecto=nombre_proyecto,
-        estructura={README_ANALISIS_FILENAME: readme_analisis},
-        limpiar_directorio=False,
-    )
+    if readme_analisis:
+        materializar_proyecto(
+            nombre_proyecto=nombre_proyecto,
+            estructura={README_ANALISIS_FILENAME: readme_analisis},
+            limpiar_directorio=False,
+        )
 
     if readme_manual:
         materializar_proyecto(
