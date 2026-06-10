@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
+
+from poc_it.demo_progress import is_demo_mode
 from poc_it.rate_limiter import (
     GLOBAL_BUCKET,
     exponential_backoff_sleep,
@@ -532,7 +534,7 @@ def _build_messages(user_prompt: str, system_prompt: Optional[str]) -> List[Dict
     return messages
 
 
-def chat_completion_text(
+def solicitarRespuestaTextual(
     prompt: str,
     system: Optional[str] = None,
     temperature: float = 0.0,
@@ -676,7 +678,8 @@ def chat_completion_text(
                 proxy_last_exc: Optional[Exception] = None
                 effective_timeout = timeout if isinstance(timeout, int) and timeout > 0 else 70
                 for alias in aliases_to_try:
-                    logger.debug("[LLM] Provider: LITELLM_PROXY (model=%s)", alias or FALLBACK_PROVIDER)
+                    if not is_demo_mode():
+                        logger.debug("[LLM] Provider: LITELLM_PROXY (model=%s)", alias or FALLBACK_PROVIDER)
                     try:
                         return _call_litellm_proxy(
                             messages,
@@ -688,49 +691,60 @@ def chat_completion_text(
                     except Exception as exc:
                         proxy_last_exc = exc
                         # Si es rate limit/fallo, probamos el siguiente alias
-                        logger.debug("[LLM] ERROR en LITELLM_PROXY (model=%s): %s", alias or FALLBACK_PROVIDER, exc)
+                        if not is_demo_mode():
+                            logger.debug(
+                                "[LLM] ERROR en LITELLM_PROXY (model=%s): %s",
+                                alias or FALLBACK_PROVIDER,
+                                exc,
+                            )
                         continue
 
                 # Si todos los aliases fallan (p.ej. timeouts en docs), saltamos al siguiente proveedor
                 # del chain (groq/cerebras/mistral/gemini/openrouter/ollama).
                 raise proxy_last_exc or LLMError("LiteLLM Proxy failed for all aliases.")
             elif provider == "groq":
-                logger.debug("[LLM] Provider: GROQ")
+                if not is_demo_mode():
+                    logger.debug("[LLM] Provider: GROQ")
                 return _call_groq(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
             elif provider == "cerebras":
-                logger.debug("[LLM] Provider: CEREBRAS")
+                if not is_demo_mode():
+                    logger.debug("[LLM] Provider: CEREBRAS")
                 return _call_cerebras(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
             elif provider == "mistral":
-                logger.debug("[LLM] Provider: MISTRAL")
+                if not is_demo_mode():
+                    logger.debug("[LLM] Provider: MISTRAL")
                 return _call_mistral(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
             elif provider == "gemini":
-                logger.debug("[LLM] Provider: GEMINI")
+                if not is_demo_mode():
+                    logger.debug("[LLM] Provider: GEMINI")
                 return _call_gemini(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
             elif provider == "openrouter":
-                logger.debug("[LLM] Provider: OPENROUTER")
+                if not is_demo_mode():
+                    logger.debug("[LLM] Provider: OPENROUTER")
                 return _call_openrouter(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
             else:
-                logger.debug("[LLM] Provider: OLLAMA (local)")
+                if not is_demo_mode():
+                    logger.debug("[LLM] Provider: OLLAMA (local)")
                 return _call_ollama(
                     messages,
                     temperature=temperature,
@@ -738,7 +752,8 @@ def chat_completion_text(
                 )
 
         except Exception as exc:
-            logger.debug("[LLM] ERROR en %s: %s", provider.upper(), exc)
+            if not is_demo_mode():
+                logger.debug("[LLM] ERROR en %s: %s", provider.upper(), exc)
 
             # Si es error fuerte de rate limit, activar cooldown
             if "rate limit" in str(exc).lower() or "429" in str(exc):
@@ -779,7 +794,8 @@ def chat_completion_text(
             # Si no es el último proveedor, cuenta como fallback
             if idx < len(providers) - 1:
                 LLM_METRICS["fallbacks"] += 1
-                logger.debug("[LLM] → Activando fallback al siguiente proveedor...")
+                if not is_demo_mode():
+                    logger.debug("[LLM] → Activando fallback al siguiente proveedor...")
 
             continue
 
@@ -791,12 +807,13 @@ def chat_completion_text(
     if ollama_error:
         error_msg += f"- Ollama error: {ollama_error}\n"
 
-    logger.debug("[LLM METRICS]\n%s", "\n".join([f"  - {k}: {v}" for k, v in LLM_METRICS.items()]))
+    if not is_demo_mode():
+        logger.debug("[LLM METRICS]\n%s", "\n".join([f"  - {k}: {v}" for k, v in LLM_METRICS.items()]))
 
     raise LLMError(error_msg)
 
 
-def chat_completion_json(
+def solicitarJSONEstructurado(
     prompt: str,
     system: Optional[str] = None,
     temperature: float = 0.0,
@@ -815,7 +832,7 @@ def chat_completion_json(
     # Refuerza instrucción de JSON en el system prompt
     system_prompt = (system or "") + "\nResponde exclusivamente con JSON válido."
 
-    raw = chat_completion_text(
+    raw = solicitarRespuestaTextual(
         prompt=prompt,
         system=system_prompt.strip(),
         temperature=temperature,
@@ -842,3 +859,11 @@ def chat_completion_json(
         return candidate
     except Exception:
         return raw
+
+
+# ==========================================================
+# COMPATIBILIDAD (nombres antiguos)
+# ==========================================================
+# Mantener estos aliases evita tener que tocar imports existentes en el repo.
+chat_completion_text = solicitarRespuestaTextual
+chat_completion_json = solicitarJSONEstructurado

@@ -19,9 +19,10 @@ Flujo nuevo:
 from __future__ import annotations
 
 import logging
-from multiprocessing import context
 import os
 from typing import Any, Dict, Tuple
+
+from poc_it.demo_progress import demo_progress, is_demo_mode
 
 from poc_it.clasificador import clasificar_viabilidad
 from poc_it.generador_artefactos import generar_proyecto_completo, generar_proyecto_desde_spec
@@ -124,9 +125,22 @@ Descripción:
             context.contexto_normalizado = contexto_normalizado
             self._contexto_normalizado = contexto_normalizado
             context.registrar_modelo("normalizacion_contexto", "chat_completion_json")
+
+            # [2/8] Demo progress
+            if is_demo_mode():
+                demo_progress.step(2, 8, "Contexto normalizado generado")
+                funcionalidades = ", ".join(contexto_normalizado.funcionalidades_clave or []) or "N/D"
+                integ_list = contexto_normalizado.integraciones_externas or []
+                integ = ", ".join(integ_list) if integ_list else "No"
+                contratos = len(contexto_normalizado.contratos_api or [])
+                demo_progress.info(f"Funcionalidades detectadas: {funcionalidades}")
+                demo_progress.info(f"Integraciones externas: {integ}")
+                demo_progress.info(f"Contratos API identificados: {contratos}")
         except Exception:
             context.contexto_normalizado = None
             self._contexto_normalizado = None
+            if is_demo_mode():
+                demo_progress.step(2, 8, "Contexto normalizado generado")
 
     def _clasificar(self, context: ProjectContext) -> tuple[ProjectContext, float, float]:
         import time
@@ -135,9 +149,22 @@ Descripción:
         context = clasificar_viabilidad(context)
         t_clasificacion_fin = time.perf_counter()
 
-        # Ruido alto para demo: esto imprime mucho contexto interno.
-        # Mantener disponible en DEBUG para desarrollo.
-        logger.debug("[DEBUG CONTEXT DESPUÉS DE CLASIFICACIÓN]\n%s", context.model_dump_json(indent=2))
+        if is_demo_mode():
+            modo = (context.clasificacion or "").upper() or "N/D"
+            demo_progress.step(3, 8, f"Modo seleccionado: {modo}")
+            # “Motivo breve”: usar la señal más cercana (complejidad + integraciones)
+            cn = context.contexto_normalizado
+            integ = ", ".join((cn.integraciones_externas or [])) if cn else ""
+            if integ:
+                motivo = f"Requiere integraciones externas: {integ}"
+            else:
+                motivo = "API backend sin integraciones externas obligatorias"
+            demo_progress.info(f"Motivo: {motivo}")
+        else:
+            # Ruido alto para demo: esto imprime mucho contexto interno.
+            # Mantener disponible en DEBUG para desarrollo.
+            logger.debug("[DEBUG CONTEXT DESPUÉS DE CLASIFICACIÓN]\n%s", context.model_dump_json(indent=2))
+
         return context, t_clasificacion_inicio, t_clasificacion_fin
 
     def _generar_y_materializar(
@@ -195,6 +222,9 @@ Descripción:
             nombre_proyecto=self.nombre_proyecto,
             estructura=estructura,
         )
+
+        if is_demo_mode():
+            demo_progress.info(f"Archivos creados: {len(archivos_creados)}")
 
         return estructura, archivos_creados, tiempo_generacion_horas, resultado
 

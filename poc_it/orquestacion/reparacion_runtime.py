@@ -17,12 +17,14 @@ from poc_it.orquestacion.pytest_llm_repair import repair_tests_until_pytest_pass
 from poc_it.orquestacion.tests_coverage_llm_repair import repair_tests_coverage_until_ok
 from poc_it.orquestacion.wiring_verifier import verify_wiring_against_runtime_contracts
 from poc_it.orquestacion.runtime_probe import run_runtime_probe
+from poc_it.demo_progress import demo_progress, is_demo_mode
 
 logger = logging.getLogger(__name__)
 
 
 def _is_demo_mode() -> bool:
-    return os.getenv("POCIT_MODE", "").strip().lower() in ("demo", "1", "true", "yes")
+    # compat con lógica antigua en este módulo
+    return is_demo_mode()
 
 _MISSING_MODULE_RE = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
 _REQUIREMENTS_PKG_RE = re.compile(r"^([a-zA-Z0-9_.-]+)")
@@ -89,10 +91,14 @@ def ejecutar_reparacion_runtime(
     last_missing_module: Optional[str] = None
     llm_attempted_for_missing: bool = False
 
-    logger.info(
-        "[PIPELINE][A] Code correctness loop (max=%s): import-time + wiring(OpenAPI) + request-time probe",
-        max_runtime_repairs,
-    )
+    if is_demo_mode():
+        demo_progress.step(6, 8, "Verificación y reparación automática")
+        demo_progress.info("Ejecutando verificación de runtime e intentando autoreparación...")
+    else:
+        logger.info(
+            "[PIPELINE][A] Code correctness loop (max=%s): import-time + wiring(OpenAPI) + request-time probe",
+            max_runtime_repairs,
+        )
 
     # Asegurar entorno hermético para runtime verify/probe:
     # - En máquinas limpias, sin esto fallará con ModuleNotFoundError (p.ej. fastapi).
@@ -500,7 +506,11 @@ SALIDA
     # Fase B: generación de tests (LLM) sobre código ya validado (import + wiring).
     # Nota: aquí NO se repara código. Solo se generan tests.
     if regenerar_tests and code_ok:
-        logger.info("[PIPELINE][B] Generación de tests herméticos (LLM)")
+        if is_demo_mode():
+            demo_progress.step(7, 8, "Generación de tests y ejecución local")
+            demo_progress.info("Generando tests unitarios y ejecutando pytest...")
+        else:
+            logger.info("[PIPELINE][B] Generación de tests herméticos (LLM)")
         try:
             # FIX: Propagar modo de generación real (sin hardcodear).
             #
@@ -557,7 +567,8 @@ SALIDA
         #     logger.info("[TESTS] Aviso: coverage repair loop no ejecutable: %s", exc)
 
         # Fase C: loop de pytest SOLO sobre tests (prohibido tocar app/**).
-        logger.info("[PIPELINE][C] Pytest loop (solo tests/ + pytest.ini)")
+        if not is_demo_mode():
+            logger.info("[PIPELINE][C] Pytest loop (solo tests/ + pytest.ini)")
         try:
             import json as _json
             import os as _os

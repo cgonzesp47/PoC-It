@@ -17,6 +17,7 @@ from poc_it.orquestacion.constantes import (
     README_MANUAL_FILENAME,
 )
 from poc_it.orquestacion.verificador_runtime import runtime_verify_fastapi_project
+from poc_it.demo_progress import demo_progress, is_demo_mode
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,13 @@ def generar_documentacion(
         readme_analisis = future_analisis.result() if future_analisis else None
         readme_manual = future_manual.result() if future_manual else None
 
+    if is_demo_mode():
+        demo_progress.step(8, 8, "Documentación generada")
+        demo_progress.info("README.md: OK")
+        if modo_generacion.upper() == ModoGeneracion.PARCIAL:
+            demo_progress.info("README_MANUAL.md: OK")
+        demo_progress.info("README_ANALISIS.md: OK")
+
     materializar_proyecto(
         nombre_proyecto=nombre_proyecto,
         estructura={README_FINAL_FILENAME: readme_final},
@@ -164,7 +172,8 @@ def generar_documentacion(
 
     t_documentacion_fin = time.perf_counter()
 
-    logger.info("\n[PERFORMANCE]")
-    logger.info("- Clasificación: %.2fs", t_clasificacion_fin - t_clasificacion_inicio)
-    logger.info("- Generación libre: %.2fs", t_generacion_fin - t_generacion_inicio)
-    logger.info("- Documentación: %.2fs\n", t_documentacion_fin - t_documentacion_inicio)
+    if not is_demo_mode():
+        logger.info("\n[PERFORMANCE]")
+        logger.info("- Clasificación: %.2fs", t_clasificacion_fin - t_clasificacion_inicio)
+        logger.info("- Generación libre: %.2fs", t_generacion_fin - t_generacion_inicio)
+        logger.info("- Documentación: %.2fs\n", t_documentacion_fin - t_documentacion_inicio)

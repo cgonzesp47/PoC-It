@@ -75,7 +75,8 @@ from poc_it.generador.validators import (
     validar_paths_generados as _validar_paths_generados,
     validar_proyecto as _validar_proyecto,
 )
-from poc_it.llm_client import chat_completion_json
+from poc_it.demo_progress import demo_progress, is_demo_mode
+from poc_it.llm_client import chat_completion_json, solicitarJSONEstructurado
 
 
 # ==========================================================
@@ -243,13 +244,16 @@ def _generar_archivos_por_lotes(
         errores_lote: List[str] = []
 
         for intento_lote in range(max(1, intentos)):
-            raw = chat_completion_json(
+            raw = solicitarJSONEstructurado(
                 prompt=prompt_lote,
                 system=None,
                 temperature=0.2,
                 max_tokens=2500,
                 fase="generacion_codigo",
+                provider_hint="gen-code",
             )
+
+            
             ultimo_raw = raw
             data = extraer_json_tolerante(raw)
             if not data:
@@ -269,7 +273,8 @@ def _generar_archivos_por_lotes(
             missing = sorted(list(lote_set - {ff.get("path") for ff in cand_norm if ff.get("path")}))
             empty = sorted([ff.get("path") for ff in cand_norm if not (ff.get("content") or "").strip()])
             if missing or empty:
-                print(f"[DEBUG] Lote generado incompleto. Missing={missing} Empty={empty}")
+                if not is_demo_mode():
+                    print(f"[DEBUG] Lote generado incompleto. Missing={missing} Empty={empty}")
 
             empty = [p for p in empty if not str(p).endswith("/__init__.py")]
             ok_nonempty = not missing and not empty
@@ -302,9 +307,10 @@ def _generar_archivos_por_lotes(
                 )
 
         if not lote_files:
-            print("[DEBUG] No se pudo generar un lote válido.")
-            if errores_lote:
-                print("[DEBUG] Errores lote:", errores_lote)
+            if not is_demo_mode():
+                print("[DEBUG] No se pudo generar un lote válido.")
+                if errores_lote:
+                    print("[DEBUG] Errores lote:", errores_lote)
             return None
 
         # Merge estable (centralizado): no sobreescribir contenido no vacío con contenido vacío.
@@ -358,7 +364,8 @@ def _validar_y_reparar_final(
     # 3) Guardrails por SPEC (contrato usuario): si fallan, intentamos repair dirigido
     guard = guardrails_por_spec(spec, files_generados)
     if guard.warnings:
-        print("[DEBUG] Guardrails warnings:", guard.warnings)
+        if not is_demo_mode():
+            print("[DEBUG] Guardrails warnings:", guard.warnings)
 
     if not guard.ok:
         if not guard.repair_paths:
@@ -481,7 +488,8 @@ def _generar_desde_spec_validado(
         allowed_paths=allowed_paths,
         intentos=intentos,
     ):
-        print("[DEBUG] Fase final de validación/repair no convergió.")
+        if not is_demo_mode():
+            print("[DEBUG] Fase final de validación/repair no convergió.")
         # Importante: si el SPEC es válido pero la fase final no converge, devolvemos el SPEC
         # para permitir reintentos aguas arriba (orquestador) reutilizando la “fuente de verdad”.
         return {"files": [], "spec": spec}

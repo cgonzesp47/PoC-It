@@ -17,6 +17,7 @@ import os
 import time
 
 from poc_it.analizador_viabilidad import PlantillaUsuario, analizar_viabilidad
+from poc_it.demo_progress import demo_progress, is_demo_mode
 from poc_it.models import ModoGeneracion
 from poc_it.opciones import generar_opciones
 from poc_it.orquestador_parcial import OrquestadorParcial
@@ -58,16 +59,13 @@ def collect_user_input() -> PlantillaUsuario:
     )
 
 
-def _is_demo_mode() -> bool:
-    return os.getenv("POCIT_MODE", "").strip().lower() in ("demo", "1", "true", "yes")
-
-
+# demo_mode se gestiona en poc_it.demo_progress
 def log_step(step: int, total: int, title: str, detail: str | None = None) -> None:
-    print(f"\n[{step}/{total}] {title}")
+    demo_progress.step(step, total, title)
     if detail:
         for line in detail.splitlines():
             if line.strip():
-                print(f"      {line}")
+                demo_progress.info(line)
 
 
 def _configure_logging() -> None:
@@ -80,7 +78,7 @@ def _configure_logging() -> None:
       porque hay partes del pipeline que emiten "[DEBUG] ..." sin pasar por logging.
     - En dev, respetamos POCIT_LOG_LEVEL (default INFO).
     """
-    demo = _is_demo_mode()
+    demo = is_demo_mode()
 
     if demo:
         # En demo queremos output “presentable”: solo mostramos los pasos [x/n] por print().
@@ -142,30 +140,39 @@ async def main() -> None:
     _configure_logging()
 
     try:
-        demo = _is_demo_mode()
+        demo = is_demo_mode()
 
         # IMPORTANTE:
         # - El tiempo total de ejecución NO debe incluir el tiempo del usuario rellenando la plantilla.
         # - Por lo tanto, iniciamos el contador justo después de recoger el input.
         user_data = collect_user_input()
+        if demo:
+            demo_progress.step(1, 8, "Entrada recibida")
+            demo_progress.info(f"Nombre: {user_data.nombre}")
+            demo_progress.info(f"Tecnologías solicitadas: {user_data.tecnologias}")
         inicio_ejecucion = time.perf_counter()
 
         resultado = await analizar_viabilidad(user_data)
 
         if demo:
-            # Fases demo (limpio y presentable)
             total_steps = 8 if resultado.modo in {ModoGeneracion.COMPLETO, ModoGeneracion.PARCIAL} else 5
-            log_step(1, total_steps, "Entrada recibida", f"Nombre: {user_data.nombre}")
+
+            # [2/8] y [3/8] se imprimen en orquestador_parcial para tener más detalles reales.
+            # Aquí mantenemos únicamente fallback si no hay contexto disponible.
             if getattr(resultado, "contexto_proyecto", None) and getattr(resultado.contexto_proyecto, "contexto_normalizado", None):
                 cn = resultado.contexto_proyecto.contexto_normalizado
-                fn = len(getattr(cn, "funcionalidades_clave", []) or [])
+                funcionalidades = ", ".join(getattr(cn, "funcionalidades_clave", []) or []) or "N/D"
                 integ = ", ".join(getattr(cn, "integraciones_externas", []) or []) or "No"
-                log_step(2, total_steps, "Contexto normalizado generado", f"Funcionalidades detectadas: {fn}\nIntegraciones externas: {integ}")
+                contratos = len(getattr(cn, "contratos_api", []) or [])
+                demo_progress.step(2, total_steps, "Contexto normalizado generado")
+                demo_progress.info(f"Funcionalidades detectadas: {funcionalidades}")
+                demo_progress.info(f"Integraciones externas: {integ}")
+                demo_progress.info(f"Contratos API identificados: {contratos}")
             else:
-                log_step(2, total_steps, "Contexto normalizado generado")
+                demo_progress.step(2, total_steps, "Contexto normalizado generado")
 
             modo_str = getattr(resultado.modo, "value", None) or getattr(resultado.modo, "name", None) or str(resultado.modo)
-            log_step(3, total_steps, f"Modo seleccionado: {modo_str}")
+            demo_progress.step(3, total_steps, f"Modo seleccionado: {modo_str}")
         else:
             print("\n==============================")
             print("INFORME DE VIABILIDAD")
@@ -188,7 +195,8 @@ async def main() -> None:
             if not demo:
                 print("=== GENERACIÓN LIBRE ACTIVADA ===\n")
             else:
-                log_step(4, total_steps, "Spec generado y validado", "Se ha generado un spec interno y se ha reparado si fue necesario.")
+                demo_progress.step(4, total_steps, "Generación y validación del spec")
+                demo_progress.info("Generando especificación técnica...")
 
             orquestador = OrquestadorParcial(
                 plantilla=user_data,
@@ -203,18 +211,27 @@ async def main() -> None:
 
             if demo:
                 archivos_n = len(resultado_generacion.get("archivos_creados", []))
-                log_step(5, total_steps, "Código backend generado", f"Archivos creados: {archivos_n}")
+                demo_progress.step(5, total_steps, "Código backend generado")
+                demo_progress.info(f"Archivos creados: {archivos_n}")
                 # tests result (pytest_ok viene del orquestador)
                 pytest_ok = bool(resultado_generacion.get("pytest_ok"))
                 estado_final = resultado_generacion.get("estado_final")
                 detail = f"Pytest: {'OK' if pytest_ok else 'FAIL'}"
                 if estado_final:
                     detail += f"\nEstado: {estado_final}"
-                log_step(6, total_steps, "Tests generados y ejecutados", detail)
+                demo_progress.step(6, total_steps, "Tests generados y ejecutados")
+                for line in detail.splitlines():
+                    if line.strip():
+                        demo_progress.info(line)
                 if resultado.modo == ModoGeneracion.PARCIAL:
-                    log_step(7, total_steps, "Documentación generada", "README.md: OK\nREADME_MANUAL.md: OK\nREADME_ANALISIS.md: OK")
+                    demo_progress.step(7, total_steps, "Documentación generada")
+                    demo_progress.info("README.md: OK")
+                    demo_progress.info("README_MANUAL.md: OK")
+                    demo_progress.info("README_ANALISIS.md: OK")
                 else:
-                    log_step(7, total_steps, "Documentación generada", "README.md: OK\nREADME_ANALISIS.md: OK")
+                    demo_progress.step(7, total_steps, "Documentación generada")
+                    demo_progress.info("README.md: OK")
+                    demo_progress.info("README_ANALISIS.md: OK")
             else:
                 print("======================================")
                 print("GENERACIÓN FINALIZADA")
@@ -322,14 +339,21 @@ async def main() -> None:
                     #     shutil.rmtree(ruta_generada)
 
         except Exception as e:
-            print("\n[GitLab] Publicación omitida o fallida:")
-            print(str(e))
+            if demo:
+                demo_progress.step(8, total_steps, "Publicación GitLab")
+                demo_progress.info("Estado: NO COMPLETADA")
+                demo_progress.info(f"Motivo: {str(e).strip()}")
+                demo_progress.info("La PoC se ha generado correctamente en local")
+            else:
+                print("\n[GitLab] Publicación omitida o fallida:")
+                print(str(e))
 
         fin_ejecucion = time.perf_counter()
         duracion = fin_ejecucion - inicio_ejecucion
         minutos = int(duracion // 60)
         segundos = int(duracion % 60)
-        print(f"\nTiempo total de ejecución: {minutos}m {segundos}s\n")
+        if not demo:
+            print(f"\nTiempo total de ejecución: {minutos}m {segundos}s\n")
 
     except KeyboardInterrupt:
         print("\nEjecución cancelada por el usuario.")
