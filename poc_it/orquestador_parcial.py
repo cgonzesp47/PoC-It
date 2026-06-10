@@ -571,10 +571,36 @@ Descripción:
             estimacion_manual = None
 
             if modo_upper == ModoGeneracion.ASESOR:
-                # En ASESOR no se genera PoC, pero sí queremos estimación para README_ANALISIS.
+                # En ASESOR no se genera PoC, pero SÍ queremos reflejar el tiempo real medido por PoC-it.
+                #
+                # Importante: aunque no haya generación de código, el pipeline de análisis y docs puede tardar.
+                # Este tiempo medido debe reflejarse en README_ANALISIS (fila "PoC-it").
+                import time
+
+                # Si por algún motivo no se inicializó antes, lo iniciamos aquí.
+                if not t_pocit_inicio:
+                    t_pocit_inicio = time.perf_counter()
+                t_pocit_fin = time.perf_counter()
+
+                tiempo_real_pocit_horas = 0.0
+                try:
+                    if t_pocit_fin >= t_pocit_inicio:
+                        tiempo_real_pocit_horas = (t_pocit_fin - t_pocit_inicio) / 3600
+                except Exception:
+                    tiempo_real_pocit_horas = 0.0
+
+                # Guardrail anti-0: si el contador no quedó bien, forzamos 1s mínimo
+                if tiempo_real_pocit_horas <= 0.0:
+                    tiempo_real_pocit_horas = 1.0 / 3600.0  # 1 segundo
+
                 estimacion_manual = self._estimacion_manual(
                     spec=resultado.get("spec") if isinstance(resultado, dict) else None
                 )
+                # Parcheamos el tiempo medido en la estimación manual (la que consume README_ANALISIS en ASESOR)
+                try:
+                    estimacion_manual.horas_scopeguardian = float(tiempo_real_pocit_horas)
+                except Exception:
+                    pass
             else:
                 spec = resultado.get("spec") if isinstance(resultado, dict) else None
 
