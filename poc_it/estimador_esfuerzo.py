@@ -43,7 +43,8 @@ Actúa como un arquitecto software senior pragmático.
 Debes estimar el tiempo TOTAL necesario para implementar una **PoC mínima funcional (MVP)**.
 
 Fuente de verdad:
-- Si se proporciona un SPEC o un CONTEXTO_NORMALIZADO, debes basarte principalmente en esos datos estructurados.
+- Si se proporciona un SPEC, debes basarte principalmente en el SPEC.
+- Si NO hay SPEC (p.ej. modo ASESOR), debes basarte en el CONTEXTO_NORMALIZADO.
 - Si faltan datos, utiliza la descripción textual solo como apoyo (sin inventar requisitos).
 
 Principios obligatorios:
@@ -255,13 +256,14 @@ def _build_prompt_estimacion(
     spec: Optional[Mapping[str, Any]],
     contexto_normalizado: Optional[Mapping[str, Any]],
 ) -> str:
-    # El usuario ha pedido que la estimación se base SOLO en spec.
-    # Aun así, mantenemos `descripcion_proyecto` como fallback si el spec llega vacío,
-    # pero el prompt fuerza la prioridad del spec.
-    metricas_spec = _metricas_desde_spec(spec)
-    metricas_block = _to_json_block("MÉTRICAS ESTRUCTURALES DERIVADAS DEL SPEC", metricas_spec)
+    # Política:
+    # - Si hay SPEC: estimar basado SOLO en SPEC + métricas derivadas del SPEC.
+    # - Si NO hay SPEC (modo ASESOR): estimar basado SOLO en CONTEXTO_NORMALIZADO.
+    if spec and isinstance(spec, Mapping):
+        metricas_spec = _metricas_desde_spec(spec)
+        metricas_block = _to_json_block("MÉTRICAS ESTRUCTURALES DERIVADAS DEL SPEC", metricas_spec)
 
-    return f"""
+        return f"""
 {PROMPT_ESTIMACION_ESTRUCTURADA}
 
 INSTRUCCIÓN OPERATIVA:
@@ -270,6 +272,18 @@ INSTRUCCIÓN OPERATIVA:
 {_to_json_block("SPEC (FUENTE DE VERDAD)", spec)}
 {metricas_block}
 DESCRIPCIÓN (solo apoyo si el SPEC está incompleto o vacío):
+{descripcion_proyecto}
+""".strip()
+
+    # Fallback estructurado para ASESOR: contexto_normalizado
+    return f"""
+{PROMPT_ESTIMACION_ESTRUCTURADA}
+
+INSTRUCCIÓN OPERATIVA:
+{_modo_a_instruccion(modo)}
+
+{_to_json_block("CONTEXTO_NORMALIZADO (FUENTE DE VERDAD)", contexto_normalizado)}
+DESCRIPCIÓN (solo apoyo si el CONTEXTO_NORMALIZADO está incompleto o vacío):
 {descripcion_proyecto}
 """.strip()
 
@@ -285,16 +299,16 @@ def _estimar_horas_desde_inputs(
     """
     Estima horas con UNA llamada LLM.
 
-    Política: basar estimación en el SPEC (fuente de verdad).
-    - `contexto_normalizado` se ignora aquí a propósito (para evitar deriva / duplicidad).
-    - `metricas` legacy se ignoran (las métricas se derivan del spec).
+    Política:
+    - Si hay SPEC: basar estimación en SPEC (fuente de verdad) + métricas derivadas del SPEC.
+    - Si NO hay SPEC (modo ASESOR): basar estimación en CONTEXTO_NORMALIZADO.
     """
     prompt_estimacion = _build_prompt_estimacion(
         descripcion_proyecto=descripcion_proyecto,
         modo=modo,
         metricas=None,
         spec=spec,
-        contexto_normalizado=None,
+        contexto_normalizado=contexto_normalizado,
     )
 
     try:
@@ -417,27 +431,25 @@ def calcular_estimacion_esfuerzo(
     )
 
     # Guardrails sin heurísticas por keywords:
-    # - No intentamos inferir semánticas (DB/auth) desde texto.
-    # - Calibramos únicamente por tamaño del spec (endpoints/archivos/deps/env/contracts/restrictions).
-    m = _metricas_desde_spec(spec)
-    num_endpoints = int(m.get("num_endpoints", 0) or 0)
-    num_dependencies = int(m.get("num_dependencies", 0) or 0)
-    num_env_vars = int(m.get("num_env_vars", 0) or 0)
-    num_contract_rules = int(m.get("num_contract_rules", 0) or 0)
-
-    # Definición operativa de “integraciones” para clamps: dependencias + env vars.
-    # (Es una proxy estructural, no semántica).
-    num_integraciones = max(0, num_dependencies + num_env_vars)
-
-    # Persistencia/auth no se fuerzan por texto; quedan en False para no sobreestimar por semántica.
+    # - Si hay SPEC: calibrar por tamaño del SPEC (endpoints/archivos/deps/env/contracts/restrictions).
+    # - Si NO hay SPEC (ASESOR): no inventar métricas; dejar integraciones=0 y no aplicar ajustes extra.
+    num_integraciones = 0
     requiere_auth = False
     requiere_persistencia = False
 
-    # Ajuste adicional determinista: si hay muchos endpoints/reglas, sube ligeramente el senior/junior,
-    # pero sin tocar semántica.
-    # (se aplica antes de clamps/márgenes)
-    senior += max(0.0, (num_endpoints - 3) * 0.75) + max(0.0, (num_contract_rules - 3) * 0.25)
-    junior += max(0.0, (num_endpoints - 3) * 1.0) + max(0.0, (num_contract_rules - 3) * 0.35)
+    if spec and isinstance(spec, Mapping):
+        m = _metricas_desde_spec(spec)
+        num_endpoints = int(m.get("num_endpoints", 0) or 0)
+        num_dependencies = int(m.get("num_dependencies", 0) or 0)
+        num_env_vars = int(m.get("num_env_vars", 0) or 0)
+        num_contract_rules = int(m.get("num_contract_rules", 0) or 0)
+
+        # Proxy estructural de integraciones para clamps: dependencias + env vars.
+        num_integraciones = max(0, num_dependencies + num_env_vars)
+
+        # Ajuste adicional determinista: si hay muchos endpoints/reglas, sube ligeramente el senior/junior.
+        senior += max(0.0, (num_endpoints - 3) * 0.75) + max(0.0, (num_contract_rules - 3) * 0.25)
+        junior += max(0.0, (num_endpoints - 3) * 1.0) + max(0.0, (num_contract_rules - 3) * 0.35)
 
     junior_min, junior_max, senior_min, senior_max = _aplicar_limites_y_margen(
         junior=junior,

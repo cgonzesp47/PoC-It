@@ -617,7 +617,37 @@ Descripción:
             except Exception:
                 pass
 
-            # Generación docs
+            # Cerrar medición real de tiempo PoC-it ANTES de generar documentación.
+            #
+            # Motivo: `generacion_documentacion` puede salir temprano o no llegar a parchear si el flujo
+            # se interrumpe, y entonces `estimacion_generada` se queda con horas=0.0 (lo que acaba en
+            # "0 min 0 s" en README). Midiendo y recalculando aquí garantizamos que `generar_readme_final`
+            # ya recibe el tiempo medido correcto.
+            if modo_generacion != ModoGeneracion.ASESOR:
+                import time
+
+                t_pocit_fin = time.perf_counter()
+
+                # Recalcular estimación generada con el tiempo real final (en horas)
+                spec = resultado.get("spec") if isinstance(resultado, dict) else None
+                tiempo_real_pocit_horas = 0.0
+                try:
+                    if t_pocit_inicio and t_pocit_fin and t_pocit_fin >= t_pocit_inicio:
+                        tiempo_real_pocit_horas = (t_pocit_fin - t_pocit_inicio) / 3600
+                except Exception:
+                    tiempo_real_pocit_horas = 0.0
+
+                # Guardrail anti-0: si por alguna rama el contador no quedó bien, forzamos 1s mínimo.
+                if tiempo_real_pocit_horas <= 0.0:
+                    tiempo_real_pocit_horas = 1.0 / 3600.0  # 1 segundo
+
+                estimacion_generada = self._estimacion_generada(
+                    modo_generacion,
+                    tiempo_real_pocit_horas,
+                    spec=spec,
+                )
+
+            # Generación docs (usa `estimacion_generada` ya recalculada con tiempo real medido)
             generar_documentacion(
                 nombre_proyecto=self.nombre_proyecto,
                 descripcion_global=self.descripcion_global,
@@ -635,30 +665,10 @@ Descripción:
                 t_generacion_fin=t_pocit_fin,
             )
 
-            # Cerrar medición real de tiempo PoC-it incluyendo documentación,
-            # recalcular la estimación y parchear SOLO el bloque de estimación en los README (sin LLM).
+            # Parche determinista del bloque de estimación (sin LLM) una vez que README(s) existen en disco.
             if modo_generacion != ModoGeneracion.ASESOR:
-                import time
-
                 from poc_it.orquestacion.patch_estimacion_readme import (
                     parchear_bloque_estimacion,
-                )
-
-                t_pocit_fin = time.perf_counter()
-
-                # Recalcular estimación generada con el tiempo real final (en horas)
-                spec = resultado.get("spec") if isinstance(resultado, dict) else None
-                tiempo_real_pocit_horas = 0.0
-                try:
-                    if t_pocit_inicio and t_pocit_fin and t_pocit_fin >= t_pocit_inicio:
-                        tiempo_real_pocit_horas = (t_pocit_fin - t_pocit_inicio) / 3600
-                except Exception:
-                    tiempo_real_pocit_horas = 0.0
-
-                estimacion_generada = self._estimacion_generada(
-                    modo_generacion,
-                    tiempo_real_pocit_horas,
-                    spec=spec,
                 )
 
                 parchear_bloque_estimacion(
