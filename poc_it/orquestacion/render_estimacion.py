@@ -15,17 +15,26 @@ def generar_bloque_estimacion_markdown(estimacion: "EstimacionEsfuerzo") -> str:
     """
     horas = estimacion.horas_scopeguardian
 
-    # Mostrar siempre PoC-it en minutos para que sea más legible (aunque sean 2h -> 120 min).
-    total_segundos = max(0, int(horas * 3600))
+    # PoC-it es tiempo MEDIDO, así que lo mostramos como duración real (min/seg).
+    # Para poder compararlo contra Junior/Senior (en horas), añadimos también la equivalencia en horas.
+    total_segundos = max(0, int(float(horas) * 3600))
     minutos = total_segundos // 60
     segundos = total_segundos % 60
 
+    # Formato humano estable:
+    # - si dura >= 1h, mostramos Hh Mm (sin segundos para no meter ruido)
+    # - si dura < 1h, mostramos Mm Ss
     if minutos >= 60:
-        # Para duraciones largas, mantener minutos absolutos (requisito: “en minutos”),
-        # pero evitando ruido de segundos si no aportan.
-        tiempo_pocit = f"{minutos} min (medido)"
+        hh = minutos // 60
+        mm = minutos % 60
+        duracion = f"{hh} h {mm} min"
     else:
-        tiempo_pocit = f"{minutos} min {segundos} s (medido)"
+        duracion = f"{minutos} min {segundos} s"
+
+    horas_pocit = max(0.0, float(horas))
+    horas_pocit = round(horas_pocit, 2)
+
+    tiempo_pocit = f"{duracion} ({horas_pocit} h, medido)"
 
     return f"""
 ## Estimación comparativa de esfuerzo

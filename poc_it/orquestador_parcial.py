@@ -272,9 +272,9 @@ Descripción:
             # - Se usa para README / tablas de estimación como "PoC-it (medido)".
             # - NOTA: el tiempo del usuario rellenando la plantilla se mide fuera (main.py) y no debe influir aquí.
             #
-            # IMPORTANTE: abrir el contador ANTES de repairs/tests/docs.
-            # El contador se cerrará justo ANTES de llamar a `generar_documentacion()`,
-            # para que también incluya reparación+pytest pero no el tiempo de generación de readmes.
+            # IMPORTANTE:
+            # - Abrir el contador ANTES de repairs/tests/docs.
+            # - Cerrar el contador DESPUÉS de generar documentación (para incluirla en el tiempo medido).
             t_pocit_inicio = 0.0
             t_pocit_fin = 0.0
             if modo_generacion != ModoGeneracion.ASESOR:
@@ -578,16 +578,9 @@ Descripción:
             else:
                 spec = resultado.get("spec") if isinstance(resultado, dict) else None
 
-                # En PARCIAL/COMPLETO el valor "PoC-it (medido)" debe reflejar el TIEMPO REAL del pipeline
-                # (codegen+repairs+tests+docs), no solo el tiempo del primer codegen.
-                #
-                # `calcular_estimacion_esfuerzo` espera horas.
+                # Estimación se construye tras generar documentación (para incluirla en el tiempo medido).
+                # Inicializamos con 0.0 y se recalculará al final.
                 tiempo_real_pocit_horas = 0.0
-                try:
-                    if t_pocit_inicio and t_pocit_fin and t_pocit_fin >= t_pocit_inicio:
-                        tiempo_real_pocit_horas = (t_pocit_fin - t_pocit_inicio) / 3600
-                except Exception:
-                    tiempo_real_pocit_horas = 0.0
 
                 estimacion_generada = self._estimacion_generada(
                     modo_generacion,
@@ -596,14 +589,6 @@ Descripción:
                 )
                 # Mantener también una estimación manual para README_ANALISIS (sin recalcular en docs).
                 estimacion_manual = self._estimacion_manual(spec=spec)
-
-            # Cerrar medición de tiempo real PoC-it (incluye repairs+pytest).
-            # Nota: no incluye generación de documentación, para evitar que timeouts del LLM "docs"
-            # falseen el "PoC-it (medido)".
-            if modo_generacion != ModoGeneracion.ASESOR:
-                import time
-
-                t_pocit_fin = time.perf_counter()
 
             # Persistencia de artefactos "fuente de verdad" (solo una vez) dentro de la PoC.
             #
@@ -649,6 +634,37 @@ Descripción:
                 t_generacion_inicio=t_pocit_inicio,
                 t_generacion_fin=t_pocit_fin,
             )
+
+            # Cerrar medición real de tiempo PoC-it incluyendo documentación,
+            # recalcular la estimación y parchear SOLO el bloque de estimación en los README (sin LLM).
+            if modo_generacion != ModoGeneracion.ASESOR:
+                import time
+
+                from poc_it.orquestacion.patch_estimacion_readme import (
+                    parchear_bloque_estimacion,
+                )
+
+                t_pocit_fin = time.perf_counter()
+
+                # Recalcular estimación generada con el tiempo real final (en horas)
+                spec = resultado.get("spec") if isinstance(resultado, dict) else None
+                tiempo_real_pocit_horas = 0.0
+                try:
+                    if t_pocit_inicio and t_pocit_fin and t_pocit_fin >= t_pocit_inicio:
+                        tiempo_real_pocit_horas = (t_pocit_fin - t_pocit_inicio) / 3600
+                except Exception:
+                    tiempo_real_pocit_horas = 0.0
+
+                estimacion_generada = self._estimacion_generada(
+                    modo_generacion,
+                    tiempo_real_pocit_horas,
+                    spec=spec,
+                )
+
+                parchear_bloque_estimacion(
+                    nombre_proyecto=self.nombre_proyecto,
+                    estimacion_generada=estimacion_generada,
+                )
 
         except Exception as exc:
             fallback_readme, fallback_error = self._build_fallback_docs(exc)
