@@ -262,6 +262,12 @@ async def main() -> None:
         else:
             if not demo:
                 print("=== ANÁLISIS ESTRATÉGICO ===\n")
+            else:
+                # En ASESOR mantenemos un flujo de 5 pasos y reservamos:
+                # - [4/5] Generación de README_ANÁLISIS.md
+                # - [5/5] Publicación GitLab (o error controlado)
+                demo_progress.step(4, total_steps, "Generación del análisis estratégico")
+                demo_progress.info("Generando README_ANÁLISIS.md...")
 
             opciones = resultado.opciones or generar_opciones(
                 arquitectura=resultado.arquitectura,
@@ -294,10 +300,12 @@ async def main() -> None:
 
             materializar_proyecto(
                 nombre_proyecto=user_data.nombre,
-                estructura={
-                    "README_ANÁLISIS.md": contenido_asesor
-                },
+                estructura={"README_ANÁLISIS.md": contenido_asesor},
             )
+
+            if demo:
+                demo_progress.step(5, total_steps, "Análisis materializado")
+                demo_progress.info("README_ANÁLISIS.md: OK")
 
             nombre_proyecto_generado = user_data.nombre
 
@@ -310,41 +318,51 @@ async def main() -> None:
         # PUBLICACIÓN CENTRALIZADA (ÚNICO PUNTO)
         # ==============================================
 
+        # En demo, garantizamos que el último step siempre se emita.
+        # En ASESOR, el total_steps=5, y el paso final es Publicación GitLab (éxito o error).
         try:
             # Publicar SOLO si la generación fue realmente exitosa
             if nombre_proyecto_generado and locals().get("generacion_exitosa", False):
-                from poc_it.integraciones.gitlab_publisher import GitLabPublisher
                 from pathlib import Path
+
+                from poc_it.integraciones.gitlab_publisher import GitLabPublisher
 
                 ruta_generada = Path("output") / nombre_proyecto_generado
 
                 publisher = GitLabPublisher()
-                url_repo = publisher.publicar(
-                    nombre_proyecto_generado,
-                    str(ruta_generada)
-                )
+                url_repo = publisher.publicar(nombre_proyecto_generado, str(ruta_generada))
 
                 if url_repo:
                     if demo:
-                        log_step(total_steps, total_steps, "Publicación GitLab", f"Repositorio creado: OK\nURL: {url_repo}")
+                        demo_progress.step(total_steps, total_steps, "Publicación GitLab")
+                        demo_progress.info("Repositorio creado: OK")
+                        demo_progress.info(f"URL: {url_repo}")
                     else:
                         print("======================================")
                         print("REPOSITORIO PUBLICADO EN GITLAB")
                         print("======================================\n")
                         print(f"URL: {url_repo}\n")
+                else:
+                    # Si el publisher no devuelve URL, al menos cerrar el último step en demo.
+                    if demo:
+                        demo_progress.step(total_steps, total_steps, "Publicación GitLab")
+                        demo_progress.info("Estado: NO COMPLETADA")
+                        demo_progress.info("Motivo: el publisher no devolvió URL (resultado vacío)")
             elif nombre_proyecto_generado:
-                print("\n[GitLab] Publicación omitida: proyecto no publicable (publishable=False).")
-
-                    # FUTURO: limpieza opcional
-                    # if os.getenv("POCIT_CLEAN_LOCAL_AFTER_PUBLISH", "false").lower() == "true":
-                    #     shutil.rmtree(ruta_generada)
+                if demo:
+                    demo_progress.step(total_steps, total_steps, "Publicación GitLab")
+                    demo_progress.info("Estado: OMITIDA")
+                    demo_progress.info("Motivo: proyecto no publicable (publishable=False).")
+                else:
+                    print("\n[GitLab] Publicación omitida: proyecto no publicable (publishable=False).")
 
         except Exception as e:
             if demo:
-                demo_progress.step(8, total_steps, "Publicación GitLab")
+                # No hardcodear step=8: en ASESOR total_steps=5.
+                demo_progress.step(total_steps, total_steps, "Publicación GitLab")
                 demo_progress.info("Estado: NO COMPLETADA")
                 demo_progress.info(f"Motivo: {str(e).strip()}")
-                demo_progress.info("La PoC se ha generado correctamente en local")
+                demo_progress.info("El artefacto se ha generado correctamente en local")
             else:
                 print("\n[GitLab] Publicación omitida o fallida:")
                 print(str(e))

@@ -8,6 +8,8 @@ from poc_it.orquestacion.constantes import OUTPUT_DIRNAME
 from poc_it.orquestacion.render_estimacion import generar_bloque_estimacion_markdown
 
 
+# Header canónico (en README_FINAL), pero toleramos el bloque interno que empieza por:
+# "## Estimación comparativa de esfuerzo" (generado por render_estimacion).
 _ESTIMACION_HEADER = "## Estimación de esfuerzo – PoC generada automáticamente"
 
 
@@ -26,8 +28,23 @@ def _patch_estimacion_section(markdown: str, new_section: str) -> str:
     if not markdown:
         markdown = ""
 
-    # Localizar el inicio de la sección por header H2 exacto.
-    m = re.search(rf"(?m)^{re.escape(_ESTIMACION_HEADER)}\s*$", markdown)
+    # Localizar el inicio de la sección de estimación:
+    # - En README_FINAL: header de la sección "Estimación de esfuerzo – PoC generada automáticamente"
+    # - En algunos README antiguos/variantes: puede existir solo el bloque "Estimación comparativa de esfuerzo"
+    #
+    # Soportamos ambos para asegurar que el patch SIEMPRE sustituye el bloque viejo.
+    headers_rx = [
+        rf"(?m)^{re.escape(_ESTIMACION_HEADER)}\s*$",
+        r"(?mi)^##\s*Estimación comparativa de esfuerzo\s*$",
+        r"(?mi)^##\s*Estimaci[oó]n comparativa de esfuerzo\s*$",
+    ]
+
+    m = None
+    for pat in headers_rx:
+        m = re.search(pat, markdown)
+        if m:
+            break
+
     if not m:
         # No existe: añadimos al final.
         suffix = "\n\n---\n\n" if markdown.strip() else ""
@@ -35,14 +52,41 @@ def _patch_estimacion_section(markdown: str, new_section: str) -> str:
 
     start = m.start()
 
-    # Encontrar el inicio del siguiente H2 después del header encontrado (excluyendo el propio).
-    m2 = re.search(r"(?m)^##\s+", markdown[m.end() :])
-    end = (m.end() + m2.start()) if m2 else len(markdown)
+    # Determinar el final del bloque a reemplazar.
+    #
+    # Caso 1: header "Estimación de esfuerzo – ..." (sección contenedora) -> cortar en siguiente H2.
+    # Caso 2: header "Estimación comparativa de esfuerzo" (bloque interno) -> cortar en siguiente separador
+    #         o EOF, para eliminar el bloque entero (tabla + ahorro + nota).
+    if re.match(r"(?mi)^##\s*Estimaci[oó]n comparativa de esfuerzo\s*$", markdown[m.start() : m.end()]):
+        # Buscar el siguiente separador de sección (---) tras el bloque.
+        m2 = re.search(r"(?m)^\s*---\s*$", markdown[m.end() :])
+        end = (m.end() + m2.start()) if m2 else len(markdown)
+    else:
+        # Encontrar el inicio del siguiente H2 después del header encontrado (excluyendo el propio).
+        m2 = re.search(r"(?m)^##\s+", markdown[m.end() :])
+        end = (m.end() + m2.start()) if m2 else len(markdown)
 
     before = markdown[:start].rstrip()
     after = markdown[end:].lstrip()
 
     glued = before + "\n\n" + new_section.strip() + "\n\n" + after
+
+    # Limpieza determinista: si por ejecuciones anteriores quedaron múltiples copias del bloque interno
+    # "## Estimación comparativa de esfuerzo" (duplicado), eliminamos todos los bloques extra dejando solo el primero.
+    #
+    # Esto es importante porque:
+    # - README.md puede contener el bloque interno varias veces por parches fallidos anteriores.
+    # - El bloque de sección canónico siempre debe quedar una sola vez.
+    internal_rx = re.compile(
+        # Bloque interno: desde el header H2 hasta el siguiente H2/H1, separador '---' o EOF.
+        r"(?mis)^##\s*Estimaci[oó]n comparativa de esfuerzo\s*$.*?(?=^##\s+|^#\s+|^\s*---\s*$|\Z)"
+    )
+    matches = list(internal_rx.finditer(glued))
+    if len(matches) > 1:
+        # Mantener el primero; eliminar el resto (de atrás hacia delante para no invalidar offsets).
+        for mm in reversed(matches[1:]):
+            glued = glued[: mm.start()].rstrip() + "\n\n" + glued[mm.end() :].lstrip()
+
     return glued.rstrip() + "\n"
 
 
@@ -50,7 +94,7 @@ def parchear_bloque_estimacion(
     *,
     nombre_proyecto: str,
     estimacion_generada,
-    readme_final_filename: str = "README_FINAL.md",
+    readme_final_filename: str = "README.md",
     readme_analisis_filename: str = "README_ANALISIS.md",
 ) -> None:
     """

@@ -205,6 +205,48 @@ def _to_json_block(label: str, data: Optional[Mapping[str, Any]]) -> str:
     return f"{label}:\n{payload}\n"
 
 
+def _metricas_desde_spec(spec: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+    """
+    Deriva métricas estrictamente a partir del SPEC (sin heurísticas por keywords).
+
+    Nota: No asumimos semántica “DB/persistencia/auth” por strings.
+    Solo contamos elementos estructurados presentes en el spec.
+    """
+    if not spec or not isinstance(spec, Mapping):
+        return {
+            "num_endpoints": 0,
+            "num_files": 0,
+            "num_dependencies": 0,
+            "num_env_vars": 0,
+            "num_contract_rules": 0,
+            "num_restrictions": 0,
+        }
+
+    endpoints = spec.get("endpoints") or []
+    files = spec.get("files") or []
+    deps = spec.get("dependencies") or []
+    env = spec.get("env") or []
+    contracts = spec.get("contracts") or []
+    restrictions = spec.get("restrictions") or []
+
+    num_contract_rules = 0
+    if isinstance(contracts, list):
+        for c in contracts:
+            if isinstance(c, Mapping):
+                rules = c.get("rules") or []
+                if isinstance(rules, list):
+                    num_contract_rules += len(rules)
+
+    return {
+        "num_endpoints": len(endpoints) if isinstance(endpoints, list) else 0,
+        "num_files": len(files) if isinstance(files, list) else 0,
+        "num_dependencies": len(deps) if isinstance(deps, list) else 0,
+        "num_env_vars": len(env) if isinstance(env, list) else 0,
+        "num_contract_rules": num_contract_rules,
+        "num_restrictions": len(restrictions) if isinstance(restrictions, list) else 0,
+    }
+
+
 def _build_prompt_estimacion(
     *,
     descripcion_proyecto: str,
@@ -213,9 +255,11 @@ def _build_prompt_estimacion(
     spec: Optional[Mapping[str, Any]],
     contexto_normalizado: Optional[Mapping[str, Any]],
 ) -> str:
-    metricas_block = ""
-    if metricas:
-        metricas_block = _to_json_block("MÉTRICAS ESTRUCTURALES (resumen, si están presentes)", metricas)
+    # El usuario ha pedido que la estimación se base SOLO en spec.
+    # Aun así, mantenemos `descripcion_proyecto` como fallback si el spec llega vacío,
+    # pero el prompt fuerza la prioridad del spec.
+    metricas_spec = _metricas_desde_spec(spec)
+    metricas_block = _to_json_block("MÉTRICAS ESTRUCTURALES DERIVADAS DEL SPEC", metricas_spec)
 
     return f"""
 {PROMPT_ESTIMACION_ESTRUCTURADA}
@@ -223,10 +267,9 @@ def _build_prompt_estimacion(
 INSTRUCCIÓN OPERATIVA:
 {_modo_a_instruccion(modo)}
 
-{_to_json_block("SPEC (FUENTE DE VERDAD, si está presente)", spec)}
-{_to_json_block("CONTEXTO_NORMALIZADO (FUENTE DE VERDAD, si está presente)", contexto_normalizado)}
+{_to_json_block("SPEC (FUENTE DE VERDAD)", spec)}
 {metricas_block}
-DESCRIPCIÓN (solo apoyo si falta detalle en spec/contexto):
+DESCRIPCIÓN (solo apoyo si el SPEC está incompleto o vacío):
 {descripcion_proyecto}
 """.strip()
 
@@ -240,16 +283,18 @@ def _estimar_horas_desde_inputs(
     contexto_normalizado: Optional[Mapping[str, Any]] = None,
 ) -> tuple[float, float, str]:
     """
-    Estima horas con UNA llamada LLM, usando inputs estructurados cuando existan.
-    - Si hay spec/contexto_normalizado, se priorizan como fuente de verdad.
-    - `metricas` se usa como fallback estructurado si se aporta.
+    Estima horas con UNA llamada LLM.
+
+    Política: basar estimación en el SPEC (fuente de verdad).
+    - `contexto_normalizado` se ignora aquí a propósito (para evitar deriva / duplicidad).
+    - `metricas` legacy se ignoran (las métricas se derivan del spec).
     """
     prompt_estimacion = _build_prompt_estimacion(
         descripcion_proyecto=descripcion_proyecto,
         modo=modo,
-        metricas=metricas,
+        metricas=None,
         spec=spec,
-        contexto_normalizado=contexto_normalizado,
+        contexto_normalizado=None,
     )
 
     try:
@@ -371,11 +416,28 @@ def calcular_estimacion_esfuerzo(
         contexto_normalizado=contexto_normalizado,
     )
 
-    # Guardrails: sin métricas estructurales legacy, aplicamos valores conservadores.
-    # (Se mantiene el comportamiento de clamps/márgenes sin dependencia de extracción previa).
-    num_integraciones = 1
+    # Guardrails sin heurísticas por keywords:
+    # - No intentamos inferir semánticas (DB/auth) desde texto.
+    # - Calibramos únicamente por tamaño del spec (endpoints/archivos/deps/env/contracts/restrictions).
+    m = _metricas_desde_spec(spec)
+    num_endpoints = int(m.get("num_endpoints", 0) or 0)
+    num_dependencies = int(m.get("num_dependencies", 0) or 0)
+    num_env_vars = int(m.get("num_env_vars", 0) or 0)
+    num_contract_rules = int(m.get("num_contract_rules", 0) or 0)
+
+    # Definición operativa de “integraciones” para clamps: dependencias + env vars.
+    # (Es una proxy estructural, no semántica).
+    num_integraciones = max(0, num_dependencies + num_env_vars)
+
+    # Persistencia/auth no se fuerzan por texto; quedan en False para no sobreestimar por semántica.
     requiere_auth = False
     requiere_persistencia = False
+
+    # Ajuste adicional determinista: si hay muchos endpoints/reglas, sube ligeramente el senior/junior,
+    # pero sin tocar semántica.
+    # (se aplica antes de clamps/márgenes)
+    senior += max(0.0, (num_endpoints - 3) * 0.75) + max(0.0, (num_contract_rules - 3) * 0.25)
+    junior += max(0.0, (num_endpoints - 3) * 1.0) + max(0.0, (num_contract_rules - 3) * 0.35)
 
     junior_min, junior_max, senior_min, senior_max = _aplicar_limites_y_margen(
         junior=junior,
