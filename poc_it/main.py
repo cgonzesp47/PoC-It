@@ -260,7 +260,8 @@ async def main() -> None:
             generacion_exitosa = bool(publishable)
 
         else:
-            print("=== ANÁLISIS ESTRATÉGICO ===\n")
+            if not demo:
+                print("=== ANÁLISIS ESTRATÉGICO ===\n")
 
             opciones = resultado.opciones or generar_opciones(
                 arquitectura=resultado.arquitectura,
