@@ -195,6 +195,12 @@ async def main() -> None:
             if not demo:
                 print("=== GENERACIÓN LIBRE ACTIVADA ===\n")
             else:
+                # En demo, main.py SOLO emite steps 1..4 y el step final (Publicación).
+                # Los steps intermedios (5..7/8) los emiten los módulos del pipeline (reparacion_runtime, docs, etc.)
+                # para evitar:
+                # - duplicidad
+                # - pasos fuera de orden (6/8 antes que 5/8)
+                # - líneas en blanco "fantasma" mezclando stdout filtrado y demo_progress
                 demo_progress.step(4, total_steps, "Generación y validación del spec")
                 demo_progress.info("Generando especificación técnica...")
 
@@ -209,30 +215,7 @@ async def main() -> None:
             resultado_generacion = orquestador.ejecutar()
             nombre_proyecto_generado = resultado_generacion["nombre_proyecto"]
 
-            if demo:
-                archivos_n = len(resultado_generacion.get("archivos_creados", []))
-                demo_progress.step(5, total_steps, "Código backend generado")
-                demo_progress.info(f"Archivos creados: {archivos_n}")
-                # tests result (pytest_ok viene del orquestador)
-                pytest_ok = bool(resultado_generacion.get("pytest_ok"))
-                estado_final = resultado_generacion.get("estado_final")
-                detail = f"Pytest: {'OK' if pytest_ok else 'FAIL'}"
-                if estado_final:
-                    detail += f"\nEstado: {estado_final}"
-                demo_progress.step(6, total_steps, "Tests generados y ejecutados")
-                for line in detail.splitlines():
-                    if line.strip():
-                        demo_progress.info(line)
-                if resultado.modo == ModoGeneracion.PARCIAL:
-                    demo_progress.step(7, total_steps, "Documentación generada")
-                    demo_progress.info("README.md: OK")
-                    demo_progress.info("README_MANUAL.md: OK")
-                    demo_progress.info("README_ANALISIS.md: OK")
-                else:
-                    demo_progress.step(7, total_steps, "Documentación generada")
-                    demo_progress.info("README.md: OK")
-                    demo_progress.info("README_ANALISIS.md: OK")
-            else:
+            if not demo:
                 print("======================================")
                 print("GENERACIÓN FINALIZADA")
                 print("======================================\n")
@@ -279,10 +262,17 @@ async def main() -> None:
             from poc_it.materializador_archivos import materializar_proyecto
             from poc_it.estimador_esfuerzo import calcular_estimacion_esfuerzo
 
+            # En ASESOR también medimos el tiempo real del pipeline PoC-it (sin incluir input usuario).
+            # Este valor debe reflejarse en la fila "PoC-it" de la tabla de estimación.
+            fin_ejecucion = time.perf_counter()
+            tiempo_real_pocit_horas = (fin_ejecucion - inicio_ejecucion) / 3600.0
+            if tiempo_real_pocit_horas <= 0.0:
+                tiempo_real_pocit_horas = 1.0 / 3600.0  # 1 segundo
+
             estimacion_manual = calcular_estimacion_esfuerzo(
                 descripcion_proyecto=user_data.problema,
                 modo=None,
-                tiempo_real_scopeguardian_horas=0.0,
+                tiempo_real_scopeguardian_horas=tiempo_real_pocit_horas,
                 generable=False,
             )
 

@@ -25,7 +25,7 @@ para respetar tests_style (se corrige en pytest_fixers/tests_sanitizer, fuera de
 """
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 import re
 
 
@@ -195,7 +195,7 @@ def _render_expected_response_asserts(*, method: str, path: str, hints_by_ep: Di
     return []
 
 
-def render_conftest_py(runtime_contracts: dict) -> str:
+def render_conftest_py(runtime_contracts: dict, runtime_facts: Optional[dict] = None) -> str:
     plan = build_harness_plan(runtime_contracts)
 
     allowed = _dedup_keep_order(plan.allowed_overrides)
@@ -301,6 +301,7 @@ def render_conftest_py(runtime_contracts: dict) -> str:
         lines.append("    # Dependency overrides (keys must be callables)")
         for dep in db_deps:
             lines.append(f"    dep_callable = _import_callable({dep!r})")
+            lines.append("    # DB override: nunca conectar a DB real en modo hermético")
             lines.append("    async def _override_get_db():")
             lines.append("        yield MagicMock()")
             lines.append("    app.dependency_overrides[dep_callable] = _override_get_db")
@@ -335,6 +336,7 @@ def render_conftest_py(runtime_contracts: dict) -> str:
         lines.append("    # Dependency overrides (keys must be callables)")
         for dep in db_deps:
             lines.append(f"    dep_callable = _import_callable({dep!r})")
+            lines.append("    # DB override: nunca conectar a DB real en modo hermético")
             lines.append("    async def _override_get_db():")
             lines.append("        yield MagicMock()")
             lines.append("    app.dependency_overrides[dep_callable] = _override_get_db")

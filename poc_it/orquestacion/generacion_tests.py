@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from poc_it.generador_tests_unitarios_hermetic import (
     generar_tests_hermeticos_parcial,
@@ -9,7 +9,9 @@ from poc_it.generador_tests_unitarios_hermetic import (
     generar_tests_unitarios_minimos,
 )
 from poc_it.materializador_archivos import materializar_proyecto
+from poc_it.orquestacion.contract_test_renderer import render_tests_from_test_plan
 from poc_it.orquestacion.stub_gen_llm import generate_conftest_with_llm
+from poc_it.orquestacion.test_plan import build_test_plan, persist_test_plan
 from poc_it.orquestacion.tests_harness import render_conftest_py
 from poc_it.runtime_contracts import RUNTIME_CONTRACTS_PATH
 
@@ -302,6 +304,75 @@ def _hermetic_suite_from_llm(nombre_proyecto: str, resultado: Dict[str, Any], es
     return tests_result.estructura_tests
 
 
+def _build_test_validation_report(
+    *,
+    nombre_proyecto: str,
+    plan: Any,
+    runtime_contracts: Optional[dict],
+    tests_patch: Dict[str, str],
+) -> Dict[str, Any]:
+    """
+    Artefacto de diagnóstico estable para el usuario:
+    - Cuántos endpoints se testean herméticamente vs degradados a OpenAPI-only.
+    - Qué overrides están disponibles (allowlist) y si falta get_db/get_settings.
+    - Qué required_response_keys/expected_status se están usando por endpoint.
+    """
+    endpoints = []
+    try:
+        for e in getattr(plan, "endpoints", []) or []:
+            endpoints.append(
+                {
+                    "path": getattr(e, "path", None),
+                    "method": getattr(e, "method", None),
+                    "level": getattr(e, "level", None),
+                    "reason": getattr(e, "reason", None),
+                    "expected_status": getattr(e, "expected_status", None),
+                    "allowed_statuses": getattr(e, "allowed_statuses", None),
+                    "required_response_keys": getattr(e, "required_response_keys", None),
+                    "response_media_type": getattr(e, "response_media_type", None),
+                    "hermetic": getattr(e, "hermetic", None),
+                }
+            )
+    except Exception:
+        endpoints = []
+
+    allow = []
+    try:
+        allow = list((runtime_contracts or {}).get("allowed_dependency_overrides") or [])
+    except Exception:
+        allow = []
+
+    has_db_override = any(str(x).strip().endswith(".get_db") for x in allow)
+    has_settings_override = any(str(x).strip().endswith(".get_settings") for x in allow) or any(
+        str(x).strip().endswith(".get_config") for x in allow
+    )
+
+    totals = {}
+    try:
+        totals = getattr(plan, "totals", {}) or {}
+    except Exception:
+        totals = {}
+
+    return {
+        "project": nombre_proyecto,
+        "strategy": "contract-first",
+        "test_plan": {
+            "mode": getattr(plan, "mode", None),
+            "totals": totals,
+            "endpoints": endpoints,
+        },
+        "overrides": {
+            "allowed_dependency_overrides": allow,
+            "has_get_db_override": bool(has_db_override),
+            "has_get_settings_override": bool(has_settings_override),
+        },
+        "rendered_tests": {
+            "files": sorted(list((tests_patch or {}).keys())),
+            "has_conftest": bool("tests/conftest.py" in (tests_patch or {})),
+        },
+    }
+
+
 def generar_tests_unitarios(
     nombre_proyecto: str,
     resultado: Dict[str, Any],
@@ -311,9 +382,15 @@ def generar_tests_unitarios(
 ) -> bool:
     """Genera y materializa tests unitarios.
 
-    Política actual:
-    - PARCIAL: suite hermética generada por LLM guiada por runtime_facts/runtime_contracts (anti-alucinación).
-    - Otros modos: mantiene generador existente (LLM) con fallback mínimo.
+    Política nueva (contract-first):
+    1) Construir TestPlan determinista desde runtime_contracts (+ hints del probe).
+    2) Persistir `.poc_it/test_plan.json`.
+    3) Renderizar tests deterministas desde el TestPlan (sin LLM).
+    4) Usar LLM solo como fallback opcional para stubs/overrides cuando el harness determinista
+       no sea suficiente (mantenemos compat con pipeline actual).
+
+    Nota: el rol del bucle de repair posterior cambia: ya no debe \"arreglar asserts\"
+    cuando hay 500, sino degradar endpoints en el plan.
     """
     try:
         estructura_generada = dict(estructura)
@@ -331,45 +408,94 @@ def generar_tests_unitarios(
             except Exception:
                 pass
 
-        if _is_parcial(resultado, modo_generacion):
-            # Limpieza dura de residuales: evitamos que tests viejos contaminen la suite hermética.
-            try:
-                import os
+        # Limpieza dura de residuales: evitamos que tests viejos contaminen la suite nueva.
+        try:
+            import os
 
-                tests_dir = os.path.join("output", nombre_proyecto, "tests")
-                if os.path.isdir(tests_dir):
-                    for fn in os.listdir(tests_dir):
-                        if fn.endswith(".py"):
-                            try:
-                                os.remove(os.path.join(tests_dir, fn))
-                            except Exception:
-                                pass
+            tests_dir = os.path.join("output", nombre_proyecto, "tests")
+            if os.path.isdir(tests_dir):
+                for fn in os.listdir(tests_dir):
+                    if fn.endswith(".py"):
+                        try:
+                            os.remove(os.path.join(tests_dir, fn))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # ----------------------------
+        # Fase B nueva: TestPlan + render determinista
+        # ----------------------------
+        spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
+        plan = build_test_plan(
+            structure=estructura_generada,
+            spec=spec_dict if isinstance(spec_dict, dict) else None,
+            mode=str(modo_generacion or (resultado or {}).get("clasificacion") or (resultado or {}).get("modo") or "").strip() or ("PARCIAL" if _is_parcial(resultado, modo_generacion) else "COMPLETO"),
+        )
+        estructura_generada = persist_test_plan(structure=estructura_generada, plan=plan)
+
+        # materializar el plan dentro del proyecto (artefacto)
+        try:
+            materializar_proyecto(
+                nombre_proyecto=nombre_proyecto,
+                estructura={".poc_it/test_plan.json": estructura_generada.get(".poc_it/test_plan.json", "")},
+                limpiar_directorio=False,
+            )
+        except Exception:
+            pass
+
+        # Render tests deterministas desde el plan
+        rc_obj = None
+        try:
+            import json as _json
+
+            rc_raw = estructura_generada.get(RUNTIME_CONTRACTS_PATH) or ""
+            rc_obj = _json.loads(rc_raw) if isinstance(rc_raw, str) and rc_raw.strip() else None
+        except Exception:
+            rc_obj = None
+
+        tests_patch = render_tests_from_test_plan(
+            structure=estructura_generada,
+            runtime_contracts=rc_obj if isinstance(rc_obj, dict) else None,
+            runtime_facts=None,
+        )
+
+        # ----------------------------
+        # Artefacto nuevo: test_validation_report.json
+        # ----------------------------
+        try:
+            import json as _json
+
+            report = _build_test_validation_report(
+                nombre_proyecto=nombre_proyecto,
+                plan=plan,
+                runtime_contracts=rc_obj if isinstance(rc_obj, dict) else None,
+                tests_patch=tests_patch,
+            )
+            report_txt = _json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+            estructura_generada[".poc_it/test_validation_report.json"] = report_txt
+            materializar_proyecto(
+                nombre_proyecto=nombre_proyecto,
+                estructura={".poc_it/test_validation_report.json": report_txt},
+                limpiar_directorio=False,
+            )
+        except Exception:
+            # No debe romper generación de tests.
+            pass
+
+        # Mantener compat: si el plan marca invocables pero no hay conftest (falló render),
+        # aplicamos el conftest determinista legacy como fallback.
+        if "tests/conftest.py" not in tests_patch and any(
+            e.level in ("HERMETIC_ENDPOINT_CONTRACT", "SEMANTIC_STATEFUL") for e in getattr(plan, "endpoints", [])
+        ):
+            try:
+                tests_patch["tests/conftest.py"] = render_conftest_py(rc_obj if isinstance(rc_obj, dict) else {})
             except Exception:
                 pass
 
-            # Selección explícita por modo: PARCIAL -> hermético (o contract-lite).
-            spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
-            tests_result = generar_tests_hermeticos_parcial(
-                nombre_proyecto=nombre_proyecto,
-                spec=spec_dict if isinstance(spec_dict, dict) else None,
-                estructura_generada=estructura_generada,
-                intentos=2,
-            )
-
-            # Invariante: PARCIAL nunca debe exigir suite legacy.
-            if any("test_endpoints_spec.py" in (e or "") for e in (tests_result.errores or [])):
-                raise RuntimeError(
-                    "BUG: en PARCIAL se ha generado/loggeado un error asociado a test_endpoints_spec.py"
-                )
-        else:
-            # Selección explícita por modo: NO PARCIAL -> suite spec legacy.
-            spec_dict = resultado.get("spec") if isinstance(resultado, dict) else None
-            tests_result = generar_tests_spec_no_parcial(
-                nombre_proyecto=nombre_proyecto,
-                spec=spec_dict if isinstance(spec_dict, dict) else None,
-                estructura_generada=estructura_generada,
-                intentos=1,
-            )
+        tests_result = type("Tmp", (), {})()
+        tests_result.estructura_tests = tests_patch
+        tests_result.errores = []
 
         if tests_result.errores:
             joined = "\n".join([str(e) for e in (tests_result.errores or [])])

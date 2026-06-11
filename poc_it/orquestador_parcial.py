@@ -229,6 +229,8 @@ Descripción:
         return estructura, archivos_creados, tiempo_generacion_horas, resultado
 
     def _build_fallback_docs(self, exc: Exception) -> Tuple[str, str]:
+        import traceback
+
         fallback_readme = (
             f"# {self.nombre_proyecto}\n\n"
             "## Estado\n\n"
@@ -238,7 +240,9 @@ Descripción:
         fallback_error = (
             f"# {self.nombre_proyecto} – Error de generación\n\n"
             "## Error durante la generación libre\n\n"
-            f"Error detectado:\n\n```\n{str(exc)}\n```\n"
+            f"Error detectado:\n\n```\n{str(exc)}\n```\n\n"
+            "## Traceback\n\n"
+            f"```\n{traceback.format_exc()}\n```\n"
         )
 
         return fallback_readme, fallback_error
@@ -703,6 +707,7 @@ Descripción:
                 )
 
         except Exception as exc:
+            logger.exception("[ORQUESTADOR] Error no recuperable durante generación libre")
             fallback_readme, fallback_error = self._build_fallback_docs(exc)
 
             archivos_creados = materializar_proyecto(

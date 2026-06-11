@@ -49,21 +49,29 @@ def _sha256(s: str) -> str:
     return hashlib.sha256((s or "").encode("utf-8", errors="ignore")).hexdigest()
 
 
-def _venv_python(project_dir: str) -> Path:
-    # Nuevo: venv fuera del output/ para evitar rutas largas o nombres no válidos en Windows
-    p = _safe_venv_root_for_project(project_dir)
+def _canonical_project_dir(project_dir: str) -> str:
+    """Canonicaliza project_dir para que el hash del venv sea estable (relativo vs absoluto)."""
+    p = _dedupe_project_dir(project_dir)
+    p = os.path.normpath(str(p or "")).strip()
+    if not p:
+        return p
+    try:
+        return str(Path(p).resolve())
+    except Exception:
+        return p
+
+
+def _venv_python_from_root(venv_root: Path) -> Path:
     # Windows
-    win = p / "Scripts" / "python.exe"
+    win = venv_root / "Scripts" / "python.exe"
     if win.exists():
         return win
     # POSIX
-    posix = p / "bin" / "python"
-    return posix
+    return venv_root / "bin" / "python"
 
 
-def _venv_exists(project_dir: str) -> bool:
-    py = _venv_python(project_dir)
-    return py.exists()
+def _venv_exists_from_root(venv_root: Path) -> bool:
+    return _venv_python_from_root(venv_root).exists()
 
 
 def _state_path(project_dir: str) -> Path:
@@ -189,7 +197,7 @@ def ensure_project_venv_ready(*, project_dir: str, estructura: dict[str, str] | 
 
     NO lanza excepción: devuelve ok=False si no pudo prepararlo.
     """
-    project_dir = _dedupe_project_dir(project_dir)
+    project_dir = _canonical_project_dir(project_dir)
     project = Path(project_dir)
 
     # Crear/validar el directorio del proyecto: en algunos fallos reales el path recibido
@@ -202,7 +210,8 @@ def ensure_project_venv_ready(*, project_dir: str, estructura: dict[str, str] | 
         pass
 
     # Venv root seguro (siempre corto/estable). No depende del nombre del proyecto en output/.
-    venv_root = _safe_venv_root_for_project(str(project.resolve() if project.exists() else project))
+    # IMPORTANTE: usar exactamente el mismo project_dir canonicalizado para evitar hashes distintos.
+    venv_root = _safe_venv_root_for_project(project_dir)
 
     # Directorio de estado del proyecto (seguimos guardando state junto al proyecto si es posible)
     poc_it_dir = project / ".poc_it"
@@ -215,19 +224,22 @@ def ensure_project_venv_ready(*, project_dir: str, estructura: dict[str, str] | 
 
     fingerprint = _compute_fingerprint(project_dir, estructura=estructura, spec=spec)
     state = _load_state(project_dir)
-    if state.get("fingerprint") == fingerprint and _venv_exists(project_dir):
+    if state.get("fingerprint") == fingerprint and _venv_exists_from_root(venv_root):
         return VenvReadyResult(ok=True, detail="venv up-to-date")
 
     # 1) Crear venv si no existe (en venv_root seguro)
-    if not _venv_exists(project_dir):
+    if not _venv_exists_from_root(venv_root):
         venv_root.mkdir(parents=True, exist_ok=True)
-        rc, out = _run([sys.executable, "-m", "venv", str(venv_root)], cwd=str(project if project.exists() else None) or None)
+        rc, out = _run(
+            [sys.executable, "-m", "venv", str(venv_root)],
+            cwd=str(project) if project.exists() else None,
+        )
         if rc != 0:
             return VenvReadyResult(ok=False, detail=f"venv create failed: {out}")
 
-    py = _venv_python(project_dir)
+    py = _venv_python_from_root(venv_root)
     if not py.exists():
-        return VenvReadyResult(ok=False, detail="venv python not found after creation")
+        return VenvReadyResult(ok=False, detail=f"venv python not found after creation: {py}")
 
     # 2) Upgrade pip (best-effort)
     _run([str(py), "-m", "pip", "install", "--upgrade", "pip"], cwd=str(project) if project.exists() else None)
