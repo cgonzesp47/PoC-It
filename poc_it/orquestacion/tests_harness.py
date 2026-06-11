@@ -207,6 +207,37 @@ def render_conftest_py(runtime_contracts: dict, runtime_facts: Optional[dict] = 
     service_deps = [fqn for fqn in allowed if re.search(r"\.get_.*service$", fqn)]
     other_deps = [fqn for fqn in allowed if fqn not in db_deps and fqn not in service_deps]
 
+    # ------------------------------------------------------------
+    # PARCIAL: detectar uso directo de app.crud.* desde endpoints
+    # ------------------------------------------------------------
+    # runtime_contracts.endpoints[*].observed_calls contiene dicts con:
+    # - receiver_param: nombre local (p.ej. "crud")
+    # - method_name: nombre (p.ej. "create_product")
+    #
+    # Si detectamos receiver_param="crud" o method_name que empieza con "crud.",
+    # generaremos monkeypatches en conftest para aislar persistencia.
+    crud_calls: List[str] = []
+    try:
+        for ep in plan.endpoints:
+            calls = ep.get("observed_calls") or []
+            if not isinstance(calls, list):
+                continue
+            for c in calls:
+                if not isinstance(c, dict):
+                    continue
+                receiver = str(c.get("receiver_param") or "").strip().lower()
+                m = str(c.get("method_name") or "").strip()
+                if not m:
+                    continue
+                if receiver == "crud":
+                    crud_calls.append(m)
+                elif m.startswith("crud."):
+                    crud_calls.append(m.split(".", 1)[1])
+    except Exception:
+        crud_calls = []
+
+    crud_calls = _dedup_keep_order([str(x).strip() for x in crud_calls if str(x).strip()])
+
     calls_literal = {
         dep: [
             {
@@ -223,6 +254,84 @@ def render_conftest_py(runtime_contracts: dict, runtime_facts: Optional[dict] = 
     lines.append("import importlib")
     lines.append("import os")
     lines.append("from unittest.mock import MagicMock")
+    lines.append("")
+    lines.append("# Helpers herméticos (PARCIAL)")
+    lines.append("def _product_dict(**overrides):")
+    lines.append("    data = {")
+    lines.append("        'id': 1,")
+    lines.append("        'nombre': 'Producto de prueba',")
+    lines.append("        'descripcion': 'Descripción de prueba',")
+    lines.append("        'precio': 10.0,")
+    lines.append("        'disponible': True,")
+    lines.append("    }")
+    lines.append("    data.update(overrides)")
+    lines.append("    return data")
+    lines.append("")
+    lines.append("def _model_to_dict(obj):")
+    lines.append("    if obj is None:")
+    lines.append("        return {}")
+    lines.append("    if hasattr(obj, 'model_dump'):")
+    lines.append("        return obj.model_dump()")
+    lines.append("    if isinstance(obj, dict):")
+    lines.append("        return dict(obj)")
+    lines.append("    # best-effort: attrs")
+    lines.append("    out = {}")
+    lines.append("    for k in ('nombre', 'descripcion', 'precio', 'disponible'):")
+    lines.append("        if hasattr(obj, k):")
+    lines.append("            out[k] = getattr(obj, k)")
+    lines.append("    return out")
+    lines.append("")
+    lines.append("class FakeAsyncSession:")
+    lines.append("    \"\"\"DB fake mínimo: evita I/O y soporta `await db.*` usado por SQLAlchemy async.\"\"\"")
+    lines.append("    def __init__(self):")
+    lines.append("        self._store = {}")
+    lines.append("")
+    lines.append("    def add(self, obj):")
+    lines.append("        # si viene con id, lo persistimos")
+    lines.append("        try:")
+    lines.append("            _id = getattr(obj, 'id', None)")
+    lines.append("            if _id is not None:")
+    lines.append("                self._store[int(_id)] = obj")
+    lines.append("        except Exception:")
+    lines.append("            pass")
+    lines.append("")
+    lines.append("    async def commit(self):")
+    lines.append("        return None")
+    lines.append("")
+    lines.append("    async def refresh(self, obj):")
+    lines.append("        # En muchos ORMs, refresh no asigna id si no hay flush real; dejamos id=1 si falta")
+    lines.append("        try:")
+    lines.append("            if getattr(obj, 'id', None) is None:")
+    lines.append("                setattr(obj, 'id', 1)")
+    lines.append("        except Exception:")
+    lines.append("            pass")
+    lines.append("        return None")
+    lines.append("")
+    lines.append("    async def delete(self, obj):")
+    lines.append("        try:")
+    lines.append("            _id = getattr(obj, 'id', None)")
+    lines.append("            if _id is not None and int(_id) in self._store:")
+    lines.append("                del self._store[int(_id)]")
+    lines.append("        except Exception:")
+    lines.append("            pass")
+    lines.append("        return None")
+    lines.append("")
+    lines.append("    async def execute(self, stmt):")
+    lines.append("        # No intentamos emular SQL; devolvemos un result compatible con `.scalars().first()`")
+    lines.append("        class _Scalar:")
+    lines.append("            def __init__(self, v):")
+    lines.append("                self._v = v")
+    lines.append("            def first(self):")
+    lines.append("                return self._v")
+    lines.append("        class _Result:")
+    lines.append("            def __init__(self, v):")
+    lines.append("                self._v = v")
+    lines.append("            def scalars(self):")
+    lines.append("                return _Scalar(self._v)")
+    lines.append("            @property")
+    lines.append("            def rowcount(self):")
+    lines.append("                return 1 if self._v is not None else 0")
+    lines.append("        return _Result(None)")
     lines.append("")
     lines.append("import pytest")
     lines.append("")
@@ -303,9 +412,38 @@ def render_conftest_py(runtime_contracts: dict, runtime_facts: Optional[dict] = 
             lines.append(f"    dep_callable = _import_callable({dep!r})")
             lines.append("    # DB override: nunca conectar a DB real en modo hermético")
             lines.append("    async def _override_get_db():")
-            lines.append("        yield MagicMock()")
+            lines.append("        yield FakeAsyncSession()")
             lines.append("    app.dependency_overrides[dep_callable] = _override_get_db")
             lines.append("")
+        # Monkeypatch de app.crud.* si detectamos llamadas directas (receiver_param='crud')")
+        lines.append(f"    _crud_calls = {crud_calls!r}")
+        lines.append("    if _crud_calls:")
+        lines.append("        try:")
+        lines.append("            crud_mod = importlib.import_module('app.crud')")
+        lines.append("            for name in _crud_calls:")
+        lines.append("                if not hasattr(crud_mod, name):")
+        lines.append("                    continue")
+        lines.append("                if name.startswith('create_'):")
+        lines.append("                    async def _fn(db, obj, _name=name):")
+        lines.append("                        data = _model_to_dict(obj)")
+        lines.append("                        return _product_dict(**data, id=1)")
+        lines.append("                elif name.startswith('get_'):")
+        lines.append("                    async def _fn(db, id, _name=name):")
+        lines.append("                        return _product_dict(id=int(id))")
+        lines.append("                elif name.startswith('update_'):")
+        lines.append("                    async def _fn(db, id, obj, _name=name):")
+        lines.append("                        data = _model_to_dict(obj)")
+        lines.append("                        return _product_dict(**data, id=int(id))")
+        lines.append("                elif name.startswith('delete_'):")
+        lines.append("                    async def _fn(db, id, _name=name):")
+        lines.append("                        return True")
+        lines.append("                else:")
+        lines.append("                    async def _fn(*args, **kwargs):")
+        lines.append("                        return _product_dict()")
+        lines.append("                monkeypatch.setattr(crud_mod, name, _fn, raising=True)")
+        lines.append("        except Exception:")
+        lines.append("            pass")
+        lines.append("")
         for dep in service_deps:
             lines.append(f"    dep_callable = _import_callable({dep!r})")
             lines.append(f"    svc = _build_service_stub({dep!r})")
@@ -319,7 +457,7 @@ def render_conftest_py(runtime_contracts: dict, runtime_facts: Optional[dict] = 
             lines.append("        return MagicMock()")
             lines.append("    app.dependency_overrides[dep_callable] = _override_dep")
             lines.append("")
-        lines.append("    with TestClient(app) as c:")
+        lines.append("    with TestClient(app, raise_server_exceptions=False) as c:")
         lines.append("        yield c")
         lines.append("    app.dependency_overrides.clear()")
         lines.append("")
@@ -338,7 +476,7 @@ def render_conftest_py(runtime_contracts: dict, runtime_facts: Optional[dict] = 
             lines.append(f"    dep_callable = _import_callable({dep!r})")
             lines.append("    # DB override: nunca conectar a DB real en modo hermético")
             lines.append("    async def _override_get_db():")
-            lines.append("        yield MagicMock()")
+            lines.append("        yield FakeAsyncSession()")
             lines.append("    app.dependency_overrides[dep_callable] = _override_get_db")
             lines.append("")
         for dep in service_deps:

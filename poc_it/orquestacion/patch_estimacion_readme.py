@@ -123,6 +123,10 @@ def parchear_bloque_estimacion(
     project_dir = os.path.normpath(os.path.join(OUTPUT_DIRNAME, nombre_proyecto))
 
     for fname in (readme_final_filename, readme_analisis_filename):
+        # README_MANUAL.md nunca debe llevar estimación (es guía de pasos manuales).
+        if str(fname).upper() == "README_MANUAL.MD":
+            continue
+
         path = os.path.join(project_dir, fname)
         if not os.path.exists(path):
             continue

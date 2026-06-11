@@ -210,6 +210,7 @@ async def main() -> None:
                 context=resultado.contexto_proyecto,
                 t_clasificacion_inicio=resultado.t_clasificacion_inicio,
                 t_clasificacion_fin=resultado.t_clasificacion_fin,
+                t_ejecucion_inicio=inicio_ejecucion,
             )
 
             resultado_generacion = orquestador.ejecutar()

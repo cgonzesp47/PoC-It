@@ -102,6 +102,7 @@ Descripción:
         context: ProjectContext,
         t_clasificacion_inicio: float | None = None,
         t_clasificacion_fin: float | None = None,
+        t_ejecucion_inicio: float | None = None,
     ):
         self.plantilla = plantilla
         self.nombre_proyecto = plantilla.nombre
@@ -112,6 +113,9 @@ Descripción:
         self._contexto_normalizado = context.contexto_normalizado
         self.t_clasificacion_inicio = t_clasificacion_inicio
         self.t_clasificacion_fin = t_clasificacion_fin
+        # Fuente de verdad del tiempo total PoC-it (sin tiempo de input del usuario).
+        # Lo inicializa main.py justo después de collect_user_input().
+        self.t_ejecucion_inicio = t_ejecucion_inicio
 
     def _build_context(self) -> ProjectContext:
         context = ProjectContext(plantilla=self.plantilla)
@@ -272,19 +276,19 @@ Descripción:
                     spec0.setdefault("modo", modo_generacion)
                     resultado["spec"] = spec0
 
-            # Medición real del tiempo de PoC-it (pipeline real, sin input del usuario):
-            # - Se usa para README / tablas de estimación como "PoC-it (medido)".
-            # - NOTA: el tiempo del usuario rellenando la plantilla se mide fuera (main.py) y no debe influir aquí.
-            #
-            # IMPORTANTE:
-            # - Abrir el contador ANTES de repairs/tests/docs.
-            # - Cerrar el contador DESPUÉS de generar documentación (para incluirla en el tiempo medido).
-            t_pocit_inicio = 0.0
+            # Medición real del tiempo de PoC-it (pipeline real, sin input del usuario)
+            # Fuente de verdad: contador global de main.py (self.inicio_ejecucion) si está disponible.
+            # Debe incluir: repairs + tests + docs + parches finales.
+            # Tiempo total real de PoC-it:
+            # - Fuente de verdad: contador global iniciado en main.py tras collect_user_input()
+            # - Fallback: inicio local del orquestador (best-effort)
+            t_pocit_inicio_global = float(self.t_ejecucion_inicio or 0.0)
+            t_pocit_inicio_local = 0.0
             t_pocit_fin = 0.0
             if modo_generacion != ModoGeneracion.ASESOR:
                 import time
 
-                t_pocit_inicio = time.perf_counter()
+                t_pocit_inicio_local = time.perf_counter()
 
                 # Directorio real del proyecto materializado en disco.
                 # Fuente de verdad: `materializar_proyecto()` escribe bajo ./output/<nombre_proyecto>.
@@ -647,37 +651,17 @@ Descripción:
             except Exception:
                 pass
 
-            # Cerrar medición real de tiempo PoC-it ANTES de generar documentación.
-            #
-            # Motivo: `generacion_documentacion` puede salir temprano o no llegar a parchear si el flujo
-            # se interrumpe, y entonces `estimacion_generada` se queda con horas=0.0 (lo que acaba en
-            # "0 min 0 s" en README). Midiendo y recalculando aquí garantizamos que `generar_readme_final`
-            # ya recibe el tiempo medido correcto.
+            # ------------------------------------------------------------
+            # Documentación + estimación final (determinista)
+            # ------------------------------------------------------------
+            # 1) Capturar tiempo actual para métricas de docs (PERFORMANCE).
+            #    Importante: antes estaba a 0.0, lo que producía "0 min 0 s" en la tabla.
             if modo_generacion != ModoGeneracion.ASESOR:
                 import time
 
                 t_pocit_fin = time.perf_counter()
 
-                # Recalcular estimación generada con el tiempo real final (en horas)
-                spec = resultado.get("spec") if isinstance(resultado, dict) else None
-                tiempo_real_pocit_horas = 0.0
-                try:
-                    if t_pocit_inicio and t_pocit_fin and t_pocit_fin >= t_pocit_inicio:
-                        tiempo_real_pocit_horas = (t_pocit_fin - t_pocit_inicio) / 3600
-                except Exception:
-                    tiempo_real_pocit_horas = 0.0
-
-                # Guardrail anti-0: si por alguna rama el contador no quedó bien, forzamos 1s mínimo.
-                if tiempo_real_pocit_horas <= 0.0:
-                    tiempo_real_pocit_horas = 1.0 / 3600.0  # 1 segundo
-
-                estimacion_generada = self._estimacion_generada(
-                    modo_generacion,
-                    tiempo_real_pocit_horas,
-                    spec=spec,
-                )
-
-            # Generación docs (usa `estimacion_generada` ya recalculada con tiempo real medido)
+            # 2) Generación docs con la mejor estimación disponible (puede ser provisional).
             generar_documentacion(
                 nombre_proyecto=self.nombre_proyecto,
                 descripcion_global=self.descripcion_global,
@@ -691,20 +675,49 @@ Descripción:
                 t_clasificacion_inicio=self.t_clasificacion_inicio,
                 t_clasificacion_fin=self.t_clasificacion_fin,
                 # Para métricas internas de docs (PERFORMANCE), reutilizamos el rango real del pipeline PoC-it.
-                t_generacion_inicio=t_pocit_inicio,
+                t_generacion_inicio=(float(t_pocit_inicio_global or 0.0) or float(t_pocit_inicio_local or 0.0)),
                 t_generacion_fin=t_pocit_fin,
             )
 
-            # Parche determinista del bloque de estimación (sin LLM) una vez que README(s) existen en disco.
+            # 3) Cerrar tiempo real PoC-it DESPUÉS de docs (tiempo total real).
             if modo_generacion != ModoGeneracion.ASESOR:
-                from poc_it.orquestacion.patch_estimacion_readme import (
-                    parchear_bloque_estimacion,
+                import time
+
+                t_pocit_fin = time.perf_counter()
+
+                inicio_medicion = float(t_pocit_inicio_global or 0.0) or float(t_pocit_inicio_local or 0.0)
+
+                spec = resultado.get("spec") if isinstance(resultado, dict) else None
+                tiempo_real_pocit_horas = 0.0
+                try:
+                    if inicio_medicion and t_pocit_fin and t_pocit_fin >= inicio_medicion:
+                        tiempo_real_pocit_horas = (t_pocit_fin - inicio_medicion) / 3600.0
+                except Exception:
+                    tiempo_real_pocit_horas = 0.0
+                if tiempo_real_pocit_horas <= 0.0:
+                    tiempo_real_pocit_horas = 1.0 / 3600.0  # nunca 0
+
+                segundos = max(int(round(tiempo_real_pocit_horas * 3600)), 1)
+
+                logger.info("[ESTIMACION] inicio_global=%s", str(t_pocit_inicio_global) if t_pocit_inicio_global else "None")
+                logger.info("[ESTIMACION] fin=%s", t_pocit_fin)
+                logger.info("[ESTIMACION] segundos=%s", segundos)
+                logger.info("[ESTIMACION] horas=%s", tiempo_real_pocit_horas)
+
+                estimacion_generada = self._estimacion_generada(
+                    modo_generacion,
+                    tiempo_real_pocit_horas,
+                    spec=spec,
                 )
+
+                # 4) Parche determinista del bloque de estimación (sin LLM) con el tiempo FINAL.
+                from poc_it.orquestacion.patch_estimacion_readme import parchear_bloque_estimacion
 
                 parchear_bloque_estimacion(
                     nombre_proyecto=self.nombre_proyecto,
                     estimacion_generada=estimacion_generada,
                 )
+                logger.info("[ESTIMACION] archivos_parcheados=README.md,README_ANALISIS.md")
 
         except Exception as exc:
             logger.exception("[ORQUESTADOR] Error no recuperable durante generación libre")

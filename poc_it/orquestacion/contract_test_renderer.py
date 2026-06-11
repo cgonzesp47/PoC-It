@@ -118,6 +118,20 @@ def _render_test_openapi(plan: dict) -> str:
     )
 
 
+def _materialize_path(path: str) -> str:
+    # Convierte rutas tipo "/items/{id}" a "/items/1" para invocación real.
+    # Heurística pragmática: cualquier "{...id...}" -> 1, el resto -> "test".
+    import re
+
+    def repl(m: re.Match) -> str:
+        name = (m.group(1) or "").lower()
+        if "id" in name:
+            return "1"
+        return "test"
+
+    return re.sub(r"\{([^}]+)\}", repl, path or "")
+
+
 def _render_test_endpoint_contracts(plan: dict) -> str:
     eps = plan.get("endpoints") or []
 
@@ -146,10 +160,14 @@ def _render_test_endpoint_contracts(plan: dict) -> str:
         tid = _endpoint_id(method, path)
 
         call_lines = ""
+        call_path = _materialize_path(path)
+
         if method in ("POST", "PUT", "PATCH"):
-            call_lines = f"    resp = client.request('{method}', '{path}', json={_py_literal(sample_request or {})})\n"
+            call_lines = (
+                f"    resp = client.request('{method}', '{call_path}', json={_py_literal(sample_request or {})})\n"
+            )
         else:
-            call_lines = f"    resp = client.request('{method}', '{path}')\n"
+            call_lines = f"    resp = client.request('{method}', '{call_path}')\n"
 
         # 1) Nunca aceptar 5xx
         assert_lines = "    assert resp.status_code < 500\n"
@@ -208,7 +226,7 @@ def _render_test_endpoint_contracts(plan: dict) -> str:
     header = (
         "import pytest\n\n\n"
         "# Nota: este archivo DEBE usar el fixture `client` de tests/conftest.py.\n"
-        "# Prohibido: instanciar TestClient(app) aquí.\n\n\n"
+        "# Prohibido: instanciar el cliente FastAPI manualmente en este archivo.\n\n\n"
     )
     return header + "\n\n\n".join(blocks).rstrip() + "\n"
 
@@ -255,14 +273,36 @@ def render_tests_from_test_plan(
     # Guardrails post-render (hermetic)
     # ----------------------------
     try:
+        import ast
+
         ep_tests = patch.get("tests/test_endpoint_contracts.py") or ""
-        if "TestClient(" in ep_tests or "from app.main import app" in ep_tests:
-            raise ValueError("Guardrail: test_endpoint_contracts.py no puede instanciar TestClient(app) ni importar app")
+
+        # Guardrail 1: el archivo no puede importar la app ni instanciar TestClient(...).
+        tree = ast.parse(ep_tests)
+
+        for node in ast.walk(tree):
+            # `from app.main import app`
+            if isinstance(node, ast.ImportFrom) and (node.module or "") == "app.main":
+                for n in node.names:
+                    if (n.name or "") == "app":
+                        raise ValueError(
+                            "Guardrail: test_endpoint_contracts.py no puede importar app (usar fixture client)"
+                        )
+
+            # `TestClient(...)`
+            if isinstance(node, ast.Call):
+                fn = node.func
+                if isinstance(fn, ast.Name) and fn.id == "TestClient":
+                    raise ValueError(
+                        "Guardrail: test_endpoint_contracts.py no puede instanciar TestClient (usar fixture client)"
+                    )
+
         if has_invocable:
-            # cada test contractual debe recibir el fixture `client`
+            # Guardrail 2: cada test contractual debe recibir el fixture `client`
             if "def test_contract_" in ep_tests and "(client" not in ep_tests:
                 raise ValueError("Guardrail: tests contractuales deben recibir parámetro client (fixture)")
-            # número de tests contractuales debe igualar endpoints invocables en el plan
+
+            # Guardrail 3: número de tests contractuales debe igualar endpoints invocables en el plan
             expected = sum(
                 1
                 for ep in eps
@@ -271,9 +311,7 @@ def render_tests_from_test_plan(
             )
             actual = ep_tests.count("def test_contract_")
             if actual != expected:
-                raise ValueError(
-                    f"Guardrail: mismatch tests contractuales: expected={expected} actual={actual}"
-                )
+                raise ValueError(f"Guardrail: mismatch tests contractuales: expected={expected} actual={actual}")
     except Exception:
         # Si falla un guardrail, degradamos a contract-lite (smoke+openapi) para no ejecutar endpoints sin overrides.
         patch.pop("tests/test_endpoint_contracts.py", None)
