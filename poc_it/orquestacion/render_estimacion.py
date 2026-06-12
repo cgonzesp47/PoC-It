@@ -34,7 +34,7 @@ def generar_bloque_estimacion_markdown(estimacion: "EstimacionEsfuerzo") -> str:
     horas_pocit = max(0.0, float(horas))
     horas_pocit = round(horas_pocit, 2)
 
-    tiempo_pocit = f"{duracion} ({horas_pocit} h, medido)"
+    tiempo_pocit = f"{duracion} ({horas_pocit} horas)"
 
     return f"""
 ## Estimación comparativa de esfuerzo

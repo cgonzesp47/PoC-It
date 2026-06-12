@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import logging
 from typing import Any, Mapping, Optional
 
 from poc_it.llm_client import chat_completion_json
@@ -92,6 +93,12 @@ class ParametrosEstimacion:
     # Guardrails / ajustes
     factor_escenario_simple: float = 0.9
 
+    # Descuento por modo PARCIAL: el repo generado puede contener placeholders y pasos manuales.
+    factor_modo_parcial: float = 0.6
+
+    # Descuento adicional si el flujo terminó degradado a "contract-lite" (suite mínima).
+    factor_degrade_contract_lite: float = 0.4
+
     # Fallbacks (si el LLM falla o devuelve valores no válidos)
     fallback_junior_horas: float = 24.0
     fallback_senior_horas: float = 12.0
@@ -120,6 +127,8 @@ class ParametrosEstimacion:
 
 
 PARAMETROS_ESTIMACION = ParametrosEstimacion()
+
+logger = logging.getLogger(__name__)
 
 
 _ESTIMACION_JSON_FALLBACK: dict[str, Any] = {
@@ -184,8 +193,11 @@ def _modo_a_instruccion(modo: str | None) -> str:
         )
     if modo_upper == "PARCIAL":
         return (
-            "Modo: PARCIAL. Puede haber alcance parcial. Estima el esfuerzo humano para implementar el SPEC "
-            "y completar los elementos típicamente necesarios para una PoC funcional (sin suposiciones enterprise)."
+            "Modo: PARCIAL. IMPORTANTE: el sistema puede no tener acceso a integraciones externas reales "
+            "(p.ej., DB, APIs, cloud). Estima el esfuerzo humano para implementar SOLO lo descrito en el SPEC "
+            "como PoC base ejecutable, permitiendo stubs/mocks/placeholders para integraciones externas y "
+            "dejando pasos manuales para completar la integración real. NO incluyas configurar la integración "
+            "real fuera del repo (infra, credenciales, cuentas cloud) salvo un setup local mínimo."
         )
     if modo_upper == "COMPLETO":
         return (
@@ -437,19 +449,52 @@ def calcular_estimacion_esfuerzo(
     requiere_auth = False
     requiere_persistencia = False
 
+    degraded = False
+    degrade_type = None
+    spec_modo = None
+
     if spec and isinstance(spec, Mapping):
+        spec_modo = spec.get("modo")
         m = _metricas_desde_spec(spec)
         num_endpoints = int(m.get("num_endpoints", 0) or 0)
         num_dependencies = int(m.get("num_dependencies", 0) or 0)
         num_env_vars = int(m.get("num_env_vars", 0) or 0)
         num_contract_rules = int(m.get("num_contract_rules", 0) or 0)
 
-        # Proxy estructural de integraciones para clamps: dependencias + env vars.
+        # Nota importante:
+        # - NO usamos dependencies/env como proxy directo de "integraciones externas".
+        # - Aun así, lo mantenemos como una señal débil para clamps mínimos si el LLM devuelve 0.
         num_integraciones = max(0, num_dependencies + num_env_vars)
 
         # Ajuste adicional determinista: si hay muchos endpoints/reglas, sube ligeramente el senior/junior.
         senior += max(0.0, (num_endpoints - 3) * 0.75) + max(0.0, (num_contract_rules - 3) * 0.25)
         junior += max(0.0, (num_endpoints - 3) * 1.0) + max(0.0, (num_contract_rules - 3) * 0.35)
+
+        # Señales opcionales (si existen en el SPEC): degradación de alcance real.
+        pocit_meta = spec.get("pocit")
+        if isinstance(pocit_meta, Mapping):
+            degraded = bool(pocit_meta.get("degraded", False))
+            degrade_type = pocit_meta.get("degrade_type")
+
+    # Calibración pragmática por modo (scope realmente generado)
+    modo_eff = (modo or spec_modo or "").upper()
+    if modo_eff == "PARCIAL":
+        junior *= PARAMETROS_ESTIMACION.factor_modo_parcial
+        senior *= PARAMETROS_ESTIMACION.factor_modo_parcial
+
+    if degraded and str(degrade_type).lower() == "contract-lite":
+        junior *= PARAMETROS_ESTIMACION.factor_degrade_contract_lite
+        senior *= PARAMETROS_ESTIMACION.factor_degrade_contract_lite
+
+    logger.info(
+        "[ESTIMACION] modo=%s spec_modo=%s degraded=%s degrade_type=%s junior_llm=%s senior_llm=%s",
+        str(modo),
+        str(spec_modo),
+        str(degraded),
+        str(degrade_type),
+        str(junior),
+        str(senior),
+    )
 
     junior_min, junior_max, senior_min, senior_max = _aplicar_limites_y_margen(
         junior=junior,
