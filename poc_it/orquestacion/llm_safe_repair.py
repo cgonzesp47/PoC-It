@@ -226,7 +226,7 @@ Contexto:
 {json.dumps(list(allowlist), ensure_ascii=False, indent=2)}
 
 - diag (plan aprobado):
-{json.dumps(diag or {{}}, ensure_ascii=False, indent=2)[:6000]}
+{json.dumps(diag or {}, ensure_ascii=False, indent=2)[:6000]}
 
 - spec:
 {json.dumps(spec or {}, ensure_ascii=False, indent=2)[:6000]}
@@ -235,7 +235,7 @@ Contexto:
 {json.dumps(files_subset, ensure_ascii=False, indent=2)[:14000]}
 
 - patch rechazado previo (si existe):
-{json.dumps(previous_rejected_patch or {{}}, ensure_ascii=False, indent=2)[:6000]}
+{json.dumps(previous_rejected_patch or {}, ensure_ascii=False, indent=2)[:6000]}
 
 - errores de gates (si existe):
 {json.dumps(gate_errors or [], ensure_ascii=False, indent=2)}
