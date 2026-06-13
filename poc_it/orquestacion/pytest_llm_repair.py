@@ -24,6 +24,8 @@ import subprocess
 import inspect
 import hashlib
 from dataclasses import dataclass, field
+from pathlib import Path
+from fnmatch import fnmatch
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from poc_it.generador.json_utils import extraer_json_tolerante
@@ -43,6 +45,83 @@ from poc_it.orquestacion.test_repair_context import TEST_REPAIR_CONTEXT_PATH, bu
 from poc_it.orquestacion.override_repair_llm import generate_or_repair_conftest_overrides_with_llm
 
 logger = logging.getLogger(__name__)
+
+# ==========================================================
+# PIPELINE C GUARDS: nunca modificar código de producción
+# ==========================================================
+
+_ALLOWED_PATCH_GLOBS_C = (
+    "tests/*.py",
+    "tests/**/*.py",
+    "pytest.ini",
+    "requirements-dev.txt",
+    ".poc_it/*",
+    ".poc_it/**",
+)
+
+_FORBIDDEN_PATCH_GLOBS_C = (
+    "app/*",
+    "app/**",
+    "requirements.txt",
+    "README*.md",
+    "spec.json",
+    ".poc_it/spec.json",
+)
+
+
+def _is_allowed_patch_path_c(path: str) -> bool:
+    p = (path or "").replace("\\", "/").lstrip("./")
+    if not p:
+        return False
+    for g in _FORBIDDEN_PATCH_GLOBS_C:
+        if fnmatch(p, g):
+            return False
+    for g in _ALLOWED_PATCH_GLOBS_C:
+        if fnmatch(p, g):
+            return True
+    return False
+
+
+def _guard_filter_patch_pipeline_c(patch: Dict[str, str]) -> Tuple[Dict[str, str], List[str]]:
+    if not patch:
+        return {}, []
+    out: Dict[str, str] = {}
+    rejected: List[str] = []
+    for p, c in patch.items():
+        pp = (p or "").replace("\\", "/").strip()
+        if not _is_allowed_patch_path_c(pp):
+            rejected.append(pp)
+            continue
+        out[pp] = c
+    return out, rejected
+
+
+def _snapshot_production_fingerprint(project_dir: str) -> Dict[str, str]:
+    base = Path(project_dir)
+    fp: Dict[str, str] = {}
+
+    def add_file(rel: str) -> None:
+        try:
+            p = base / rel
+            if not p.exists() or not p.is_file():
+                return
+            data = p.read_bytes()
+            fp[rel.replace("\\", "/")] = hashlib.sha256(data).hexdigest()
+        except Exception:
+            return
+
+    add_file("requirements.txt")
+
+    app_dir = base / "app"
+    if app_dir.exists() and app_dir.is_dir():
+        for f in app_dir.rglob("*.py"):
+            try:
+                rel = f.relative_to(base).as_posix()
+            except Exception:
+                continue
+            add_file(rel)
+
+    return fp
 
 _PYTEST_SUMMARY_RE = re.compile(
     r"(?:(?P<passed>\d+)\s+passed[,\s]*)?"
@@ -1226,6 +1305,36 @@ _DEFAULT_ARTIFACTS = {
 }
 
 
+def _persist_test_validation_report(
+    project_dir: str,
+    *,
+    ok: bool,
+    degraded: bool,
+    degrade_type: Optional[str],
+    production_code_modified_by_test_repair: bool,
+    rejected_patch_paths: List[str],
+    harness_strategy: str,
+    extra: Optional[dict] = None,
+) -> None:
+    try:
+        payload = {
+            "ok": ok,
+            "degraded": degraded,
+            "degrade_type": degrade_type,
+            "production_code_modified_by_test_repair": production_code_modified_by_test_repair,
+            "rejected_patch_paths": rejected_patch_paths,
+            "harness_strategy": harness_strategy,
+        }
+        if isinstance(extra, dict) and extra:
+            payload.update(extra)
+
+        os.makedirs(os.path.join(project_dir, ".poc_it"), exist_ok=True)
+        with open(os.path.join(project_dir, ".poc_it", "test_validation_report.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        return
+
+
 def _mk_result(
     *,
     ok: bool,
@@ -1255,6 +1364,12 @@ def repair_tests_until_pytest_passes(
     runtime_contracts: Optional[dict] = None,
     runtime_facts: Optional[dict] = None,
 ) -> PytestRepairResult:
+    # Snapshot de integridad del código de producción (Pipeline C)
+    prod_snapshot = _snapshot_production_fingerprint(project_dir)
+    rejected_patch_paths: List[str] = []
+    production_code_modified_by_test_repair = False
+    harness_strategy = "dependency_overrides+monkeypatch"
+
     # Asegurar harness base
     _ensure_base_conftest(
         nombre_proyecto=nombre_proyecto,
@@ -1463,14 +1578,22 @@ def repair_tests_until_pytest_passes(
         )
 
         if ok:
+            _persist_test_validation_report(
+                project_dir,
+                ok=True,
+                degraded=False,
+                degrade_type=None,
+                production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+                rejected_patch_paths=rejected_patch_paths,
+                harness_strategy=harness_strategy,
+            )
             return _mk_result(ok=True, attempts=attempt, last_output=out, patched_files=patched_total)
 
         # --- Fixers deterministas (C0) ----------------------------------------------------
-        # Estrategia híbrida:
-        # - Para patrones de alta confianza y muy frecuentes (TestClient.get(json=...), dict-as-db, async mismatch...)
-        #   aplicamos 1 fixer determinista ANTES de gastar tokens del LLM.
-        # - Mantiene el loop LLM para casos "long tail", pero reduce flakiness y coste.
-        if apply_first_matching_fixer is not None:
+        # CRÍTICO: Pipeline C (reparación de tests) NO puede modificar código de producción.
+        # Los fixers deterministas legacy pueden tocar `app/**` (p.ej. response_model), así que aquí se desactivan.
+        # Los fixers sobre `app/**` deben ejecutarse SOLO en Pipeline A (runtime/import/wiring).
+        if False and apply_first_matching_fixer is not None:
             try:
                 fx = apply_first_matching_fixer(out or "", estructura or {})
             except Exception:
@@ -1656,6 +1779,23 @@ def repair_tests_until_pytest_passes(
             allow_harness_files=[harness_file] if harness_file else None,
             allow_escape_hatch_harness_in_c2=allow_escape_hatch_harness_in_c2,
         )
+
+        # Guard allowlist estricta: Pipeline C solo puede tocar tests/**, pytest.ini, requirements-dev.txt, .poc_it/**
+        patch, rejected = _guard_filter_patch_pipeline_c(patch)
+        if rejected:
+            rejected_patch_paths.extend(rejected)
+            logger.info("[PYTEST-REPAIR][GUARD] Patch rechazado fuera de tests: %s", rejected[:10])
+            append_trace_event(
+                project_dir,
+                TraceEvent(
+                    ts=now_ts(),
+                    phase=subphase,
+                    attempt=attempt,
+                    action="guard_reject_out_of_tests",
+                    files_changed=rejected[:20],
+                ),
+            )
+
         if not patch:
             logger.info("[PYTEST-REPAIR] LLM no devolvió patch aplicable para fase=%s; continuando.", subphase)
             append_trace_event(project_dir, TraceEvent(ts=now_ts(), phase=subphase, attempt=attempt, action="llm_no_patch_applicable"))
@@ -1820,6 +1960,50 @@ def repair_tests_until_pytest_passes(
         current_tests.update(patch)
         patched_total.update(patch)
 
+        # Guard post-aplicación: si cambió código de producción, rollback inmediato y abort.
+        prod_after = _snapshot_production_fingerprint(project_dir)
+        if prod_after != prod_snapshot:
+            production_code_modified_by_test_repair = True
+            logger.info(
+                "[PYTEST-REPAIR][ROLLBACK] Restaurado código de producción tras intento de modificación en Pipeline C"
+            )
+            # rollback in-memory (vuelve a contenido previo de app/** incluido en estructura)
+            estructura.clear()
+            estructura.update(snapshot_estructura)
+            current_tests.clear()
+            current_tests.update(snapshot_tests)
+
+            # rollback on-disk: re-materializar archivos de producción desde snapshot_estructura
+            rollback_prod_patch: Dict[str, str] = {}
+            for p, c in (snapshot_estructura or {}).items():
+                if not isinstance(p, str) or not isinstance(c, str):
+                    continue
+                pp = p.replace("\\", "/")
+                if pp == "requirements.txt" or (pp.startswith("app/") and pp.endswith(".py")):
+                    rollback_prod_patch[pp] = c
+            if rollback_prod_patch:
+                try:
+                    materializar_proyecto(
+                        nombre_proyecto=nombre_proyecto,
+                        estructura=rollback_prod_patch,
+                        limpiar_directorio=False,
+                    )
+                except Exception:
+                    pass
+
+            _persist_test_validation_report(
+                project_dir,
+                ok=False,
+                degraded=False,
+                degrade_type=None,
+                production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+                rejected_patch_paths=rejected_patch_paths,
+                harness_strategy=harness_strategy,
+                extra={"aborted_reason": "production_code_modified_in_pipeline_c"},
+            )
+
+            return _mk_result(ok=False, attempts=attempt, last_output=out, patched_files=patched_total)
+
         # Acceptance gate: re-run pytest inmediatamente y aceptar SOLO si mejora vs baseline o vs prev
         ok_after, out_after, _ = _run_pytest(project_dir)
         last_out = out_after
@@ -1938,6 +2122,15 @@ markers =
             # - Si pasa => OK_DEGRADED (publicable).
             # - Si no pasa => ERROR (no publicable).
             if ok2:
+                _persist_test_validation_report(
+                    project_dir,
+                    ok=True,
+                    degraded=True,
+                    degrade_type="contract-lite",
+                    production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+                    rejected_patch_paths=rejected_patch_paths,
+                    harness_strategy=harness_strategy,
+                )
                 return _mk_result(
                     ok=True,
                     attempts=attempt,
@@ -1947,6 +2140,15 @@ markers =
                     degrade_type="contract-lite",
                 )
 
+            _persist_test_validation_report(
+                project_dir,
+                ok=False,
+                degraded=True,
+                degrade_type="contract-lite",
+                production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+                rejected_patch_paths=rejected_patch_paths,
+                harness_strategy=harness_strategy,
+            )
             return _mk_result(
                 ok=False,
                 attempts=attempt,
@@ -1972,6 +2174,15 @@ markers =
         _degrade_to_contract_lite(nombre_proyecto=nombre_proyecto, estructura=estructura)
         ok2, out2, _ = _run_pytest(project_dir)
         if ok2:
+            _persist_test_validation_report(
+                project_dir,
+                ok=True,
+                degraded=True,
+                degrade_type="contract-lite",
+                production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+                rejected_patch_paths=rejected_patch_paths,
+                harness_strategy=harness_strategy,
+            )
             return _mk_result(
                 ok=True,
                 attempts=attempt,
@@ -1980,6 +2191,16 @@ markers =
                 degraded=True,
                 degrade_type="contract-lite",
             )
+
+        _persist_test_validation_report(
+            project_dir,
+            ok=False,
+            degraded=True,
+            degrade_type="contract-lite",
+            production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+            rejected_patch_paths=rejected_patch_paths,
+            harness_strategy=harness_strategy,
+        )
         return _mk_result(
             ok=False,
             attempts=attempt,

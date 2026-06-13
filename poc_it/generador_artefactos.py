@@ -307,10 +307,27 @@ def _generar_archivos_por_lotes(
                 )
 
         if not lote_files:
+            # Logging de diagnóstico: necesitamos saber POR QUÉ falla el lote.
+            # Importante:
+            # - En demo_mode evitamos prints ruidosos.
+            # - En modo normal imprimimos datos accionables: lote, errores y un preview del raw.
             if not is_demo_mode():
                 print("[DEBUG] No se pudo generar un lote válido.")
+                print("[DEBUG] Lote:", list(lote))
                 if errores_lote:
                     print("[DEBUG] Errores lote:", errores_lote)
+
+                # Preview del último RAW para ver si el modelo:
+                # - no devuelve JSON
+                # - trunca la respuesta
+                # - devuelve `files` vacío
+                try:
+                    raw_preview = (ultimo_raw or "").strip()
+                    if len(raw_preview) > 1200:
+                        raw_preview = raw_preview[:1200] + "\n...[truncated]..."
+                    print("[DEBUG] Última respuesta RAW (preview):\n", raw_preview)
+                except Exception:
+                    pass
             return None
 
         # Merge estable (centralizado): no sobreescribir contenido no vacío con contenido vacío.

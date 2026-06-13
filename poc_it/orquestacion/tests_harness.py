@@ -231,8 +231,8 @@ def render_conftest_py(runtime_contracts: dict, runtime_facts: Optional[dict] = 
                     continue
                 if receiver == "crud":
                     crud_calls.append(m)
-                elif m.startswith("crud."):
-                    crud_calls.append(m.split(".", 1)[1])
+                elif receiver in ("crud_mod", "crud_module") or m.startswith("crud."):
+                    crud_calls.append(m.split(".", 1)[-1])
     except Exception:
         crud_calls = []
 
@@ -415,7 +415,9 @@ def render_conftest_py(runtime_contracts: dict, runtime_facts: Optional[dict] = 
             lines.append("        yield FakeAsyncSession()")
             lines.append("    app.dependency_overrides[dep_callable] = _override_get_db")
             lines.append("")
-        # Monkeypatch de app.crud.* si detectamos llamadas directas (receiver_param='crud')")
+        # Monkeypatch de app.crud.* si detectamos llamadas directas (receiver_param='crud')
+        # Esto evita el antipatrón: overridear get_db con dict/session fake incompatible.
+        # Preferimos sustituir funciones crud a respuestas herméticas.
         lines.append(f"    _crud_calls = {crud_calls!r}")
         lines.append("    if _crud_calls:")
         lines.append("        try:")
@@ -429,14 +431,20 @@ def render_conftest_py(runtime_contracts: dict, runtime_facts: Optional[dict] = 
         lines.append("                        return _product_dict(**data, id=1)")
         lines.append("                elif name.startswith('get_'):")
         lines.append("                    async def _fn(db, id, _name=name):")
-        lines.append("                        return _product_dict(id=int(id))")
+        lines.append("                        # simula no-encontrado si id != 1")
+        lines.append("                        return _product_dict(id=int(id)) if int(id) == 1 else None")
+        lines.append("                elif name.startswith('list_') or name.startswith('get_all_'):")
+        lines.append("                    async def _fn(db, *args, **kwargs):")
+        lines.append("                        return [_product_dict(id=1)]")
         lines.append("                elif name.startswith('update_'):")
         lines.append("                    async def _fn(db, id, obj, _name=name):")
+        lines.append("                        if int(id) != 1:")
+        lines.append("                            return None")
         lines.append("                        data = _model_to_dict(obj)")
         lines.append("                        return _product_dict(**data, id=int(id))")
         lines.append("                elif name.startswith('delete_'):")
         lines.append("                    async def _fn(db, id, _name=name):")
-        lines.append("                        return True")
+        lines.append("                        return bool(int(id) == 1)")
         lines.append("                else:")
         lines.append("                    async def _fn(*args, **kwargs):")
         lines.append("                        return _product_dict()")

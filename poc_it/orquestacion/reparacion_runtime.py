@@ -608,6 +608,28 @@ SALIDA
                 runtime_facts=rf,
             )
 
+            if is_demo_mode():
+                # Resumen compacto para demo: solo OK/FAIL + conteo desde junit xml.
+                try:
+                    demo_progress.info(f"Pytest: {'OK' if rep.ok else 'FAIL'}")
+                except Exception:
+                    pass
+                try:
+                    from poc_it.orquestacion.pytest_llm_repair import (
+                        _extract_counts_from_junit_xml,
+                        _read_pytest_junit_xml,
+                    )
+
+                    xml = _read_pytest_junit_xml(project_dir)
+                    counts = _extract_counts_from_junit_xml(xml)
+                    if counts:
+                        errors, failures, passed, skipped, total = counts
+                        demo_progress.info(
+                            f"Resumen tests: total={total} pasados={passed} fallidos={failures} errores={errors} omitidos={skipped}"
+                        )
+                except Exception:
+                    pass
+
             # Propagar resultado estructurado de pytest a `resultado` (fuente de verdad para publicación)
             try:
                 if isinstance(resultado, dict):

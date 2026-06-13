@@ -48,6 +48,10 @@ PROHIBIDO
 - Modificar app/**.
 - Cambiar lógica de negocio de tests (asserts detallados) salvo si es necesario para evitar errores de ejecución.
 
+REGLA ABSOLUTA (PIPELINE C)
+- PROHIBIDO modificar archivos de producción: app/**, requirements.txt, README*.md, spec.json.
+- Si necesitas cambiar comportamiento de la app para que los tests pasen, debes hacerlo con dependency_overrides/monkeypatch en tests.
+
 HERMETICIDAD (OBLIGATORIO)
 - No red, no DB real, no credenciales, no os.getenv requerido.
 - Si app intenta integraciones externas, aislar con dependency_overrides.

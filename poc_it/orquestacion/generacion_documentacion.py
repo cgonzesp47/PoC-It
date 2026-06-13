@@ -145,16 +145,14 @@ def generar_documentacion(
 
     if is_demo_mode():
         demo_progress.step(8, 8, "Documentación generada")
-        demo_progress.info("README.md: OK")
-        if modo_generacion.upper() == ModoGeneracion.PARCIAL:
-            demo_progress.info("README_MANUAL.md: OK")
-        demo_progress.info("README_ANALISIS.md: OK")
 
     materializar_proyecto(
         nombre_proyecto=nombre_proyecto,
         estructura={README_FINAL_FILENAME: readme_final},
         limpiar_directorio=False,
     )
+    if is_demo_mode():
+        demo_progress.ok(f"{README_FINAL_FILENAME}: OK")
 
     if readme_analisis:
         materializar_proyecto(
@@ -162,6 +160,8 @@ def generar_documentacion(
             estructura={README_ANALISIS_FILENAME: readme_analisis},
             limpiar_directorio=False,
         )
+        if is_demo_mode():
+            demo_progress.ok(f"{README_ANALISIS_FILENAME}: OK")
 
     if readme_manual:
         materializar_proyecto(
@@ -169,6 +169,8 @@ def generar_documentacion(
             estructura={README_MANUAL_FILENAME: readme_manual},
             limpiar_directorio=False,
         )
+        if is_demo_mode():
+            demo_progress.ok(f"{README_MANUAL_FILENAME}: OK")
 
     t_documentacion_fin = time.perf_counter()
 
