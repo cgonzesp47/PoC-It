@@ -24,11 +24,13 @@ import subprocess
 import inspect
 import hashlib
 from dataclasses import dataclass, field
+from pathlib import Path
+from fnmatch import fnmatch
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from poc_it.generador.json_utils import extraer_json_tolerante
-from poc_it.llm_client import chat_completion_json
-from poc_it.materializador_archivos import materializar_proyecto
+from poc_it.infraestructura.llm_client import chat_completion_json
+from poc_it.materializacion.materializador_archivos import materializar_proyecto
 from poc_it.orquestacion.pytest_failure_classifier import classify_pytest_failure
 # Nota: fixers deterministas desactivados por estrategia.
 # La fase C debe ser principalmente LLM-guided repair sobre tests; los fixers deterministas
@@ -43,6 +45,83 @@ from poc_it.orquestacion.test_repair_context import TEST_REPAIR_CONTEXT_PATH, bu
 from poc_it.orquestacion.override_repair_llm import generate_or_repair_conftest_overrides_with_llm
 
 logger = logging.getLogger(__name__)
+
+# ==========================================================
+# PIPELINE C GUARDS: nunca modificar código de producción
+# ==========================================================
+
+_ALLOWED_PATCH_GLOBS_C = (
+    "tests/*.py",
+    "tests/**/*.py",
+    "pytest.ini",
+    "requirements-dev.txt",
+    ".poc_it/*",
+    ".poc_it/**",
+)
+
+_FORBIDDEN_PATCH_GLOBS_C = (
+    "app/*",
+    "app/**",
+    "requirements.txt",
+    "README*.md",
+    "spec.json",
+    ".poc_it/spec.json",
+)
+
+
+def _is_allowed_patch_path_c(path: str) -> bool:
+    p = (path or "").replace("\\", "/").lstrip("./")
+    if not p:
+        return False
+    for g in _FORBIDDEN_PATCH_GLOBS_C:
+        if fnmatch(p, g):
+            return False
+    for g in _ALLOWED_PATCH_GLOBS_C:
+        if fnmatch(p, g):
+            return True
+    return False
+
+
+def _guard_filter_patch_pipeline_c(patch: Dict[str, str]) -> Tuple[Dict[str, str], List[str]]:
+    if not patch:
+        return {}, []
+    out: Dict[str, str] = {}
+    rejected: List[str] = []
+    for p, c in patch.items():
+        pp = (p or "").replace("\\", "/").strip()
+        if not _is_allowed_patch_path_c(pp):
+            rejected.append(pp)
+            continue
+        out[pp] = c
+    return out, rejected
+
+
+def _snapshot_production_fingerprint(project_dir: str) -> Dict[str, str]:
+    base = Path(project_dir)
+    fp: Dict[str, str] = {}
+
+    def add_file(rel: str) -> None:
+        try:
+            p = base / rel
+            if not p.exists() or not p.is_file():
+                return
+            data = p.read_bytes()
+            fp[rel.replace("\\", "/")] = hashlib.sha256(data).hexdigest()
+        except Exception:
+            return
+
+    add_file("requirements.txt")
+
+    app_dir = base / "app"
+    if app_dir.exists() and app_dir.is_dir():
+        for f in app_dir.rglob("*.py"):
+            try:
+                rel = f.relative_to(base).as_posix()
+            except Exception:
+                continue
+            add_file(rel)
+
+    return fp
 
 _PYTEST_SUMMARY_RE = re.compile(
     r"(?:(?P<passed>\d+)\s+passed[,\s]*)?"
@@ -143,7 +222,27 @@ def _extract_pytest_counts(pytest_output: str) -> Tuple[int, int]:
 
 
 def _degrade_to_contract_lite(*, nombre_proyecto: str, estructura: Dict[str, str]) -> Dict[str, str]:
-    """Degrada a suite mínima que debe pasar siempre: smoke import + OpenAPI."""
+    """Degrada a suite mínima que debe pasar siempre: smoke import + OpenAPI.
+
+    Política:
+    - Usar exactamente el mismo "contract-lite" para cualquier modo cuando se decide degradar.
+    - Eliminar tests potencialmente frágiles (spec/hermetic) para evitar contaminación del run.
+    """
+    import os
+
+    # Limpieza dura: eliminar todos los tests existentes (evita que pytest recoja residuales).
+    try:
+        tests_dir = os.path.join("output", nombre_proyecto, "tests")
+        if os.path.isdir(tests_dir):
+            for fn in os.listdir(tests_dir):
+                if fn.endswith(".py") or fn.endswith(".pyc"):
+                    try:
+                        os.remove(os.path.join(tests_dir, fn))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
     pytest_ini = """[pytest]
 addopts = -q
 testpaths = tests
@@ -193,7 +292,7 @@ class PytestRepairResult:
 
 def _run_pytest(project_dir: str) -> Tuple[bool, str, str]:
     """
-    Ejecuta pytest y genera un reporte estructurado mediante JUnit XML (built-in).
+    Ejecuta pytest y genera un reporte estructurado mediante JUnit XML (built-in) + JSON report (pytest-json-report).
 
     Importante (Windows):
     - Hemos observado fallos en `pytest_sessionfinish` (plugin junitxml) cuando el path del XML
@@ -207,9 +306,18 @@ def _run_pytest(project_dir: str) -> Tuple[bool, str, str]:
     report_dir = os.path.abspath(os.path.join(project_dir, ".poc_it"))
     os.makedirs(report_dir, exist_ok=True)
     junit_path = os.path.normpath(os.path.join(report_dir, "pytest_junit.xml"))
+    json_path = os.path.normpath(os.path.join(report_dir, "pytest_report.json"))
 
-    # Intento 1: con junitxml (preferido)
-    base_cmd = ["python", "-m", "pytest", "-q", f"--junitxml={junit_path}"]
+    # Intento 1: con junitxml + json-report (preferido)
+    base_cmd = [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        f"--junitxml={junit_path}",
+        "--json-report",
+        f"--json-report-file={json_path}",
+    ]
     p = subprocess.run(
         base_cmd,
         cwd=project_dir,
@@ -225,7 +333,7 @@ def _run_pytest(project_dir: str) -> Tuple[bool, str, str]:
     out_low = (out or "").lower()
     if ("junitxml.py" in out_low or "pytest_sessionfinish" in out_low) and ("filenotfounderror" in out_low or "winerror 3" in out_low):
         p2 = subprocess.run(
-            ["python", "-m", "pytest", "-q"],
+            ["python", "-m", "pytest", "-q", "--json-report", f"--json-report-file={json_path}"],
             cwd=project_dir,
             capture_output=True,
             text=True,
@@ -1193,7 +1301,38 @@ def _gate_patch_tests_endpoints_exist_in_openapi(
 _DEFAULT_ARTIFACTS = {
     "pytest_last_output": ".poc_it/pytest_last_output.txt",
     "pytest_junit": ".poc_it/pytest_junit.xml",
+    "pytest_report": ".poc_it/pytest_report.json",
 }
+
+
+def _persist_test_validation_report(
+    project_dir: str,
+    *,
+    ok: bool,
+    degraded: bool,
+    degrade_type: Optional[str],
+    production_code_modified_by_test_repair: bool,
+    rejected_patch_paths: List[str],
+    harness_strategy: str,
+    extra: Optional[dict] = None,
+) -> None:
+    try:
+        payload = {
+            "ok": ok,
+            "degraded": degraded,
+            "degrade_type": degrade_type,
+            "production_code_modified_by_test_repair": production_code_modified_by_test_repair,
+            "rejected_patch_paths": rejected_patch_paths,
+            "harness_strategy": harness_strategy,
+        }
+        if isinstance(extra, dict) and extra:
+            payload.update(extra)
+
+        os.makedirs(os.path.join(project_dir, ".poc_it"), exist_ok=True)
+        with open(os.path.join(project_dir, ".poc_it", "test_validation_report.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        return
 
 
 def _mk_result(
@@ -1225,6 +1364,12 @@ def repair_tests_until_pytest_passes(
     runtime_contracts: Optional[dict] = None,
     runtime_facts: Optional[dict] = None,
 ) -> PytestRepairResult:
+    # Snapshot de integridad del código de producción (Pipeline C)
+    prod_snapshot = _snapshot_production_fingerprint(project_dir)
+    rejected_patch_paths: List[str] = []
+    production_code_modified_by_test_repair = False
+    harness_strategy = "dependency_overrides+monkeypatch"
+
     # Asegurar harness base
     _ensure_base_conftest(
         nombre_proyecto=nombre_proyecto,
@@ -1265,6 +1410,14 @@ def repair_tests_until_pytest_passes(
     # Presupuesto adaptativo (harness suele necesitar más iteraciones)
     hard_budget = max(3, int(max_repairs or 3))
     max_allowed = max(hard_budget, 10)
+
+    # Acceptance gate: nunca aceptar un patch que empeore (errors+fails) o que no mejore en absoluto.
+    # - Si empeora vs baseline => rollback del patch aplicado en esa iteración.
+    # - Si no mejora durante NO_IMPROVE_LIMIT => degradar (ya existe).
+    baseline_total = None
+    baseline_fp = None
+    last_accepted_total = None
+    last_accepted_fp = None
 
     attempt = 0
     while attempt <= max_allowed:
@@ -1354,6 +1507,15 @@ def repair_tests_until_pytest_passes(
             except Exception:
                 pass
 
+            # Persistir json-report si existe (pytest-json-report)
+            try:
+                jr_path = os.path.join(project_dir, ".poc_it", "pytest_report.json")
+                if os.path.exists(jr_path):
+                    with open(jr_path, "r", encoding="utf-8") as f:
+                        estructura[".poc_it/pytest_report.json"] = f.read()
+            except Exception:
+                pass
+
             head = (out or "").strip()[:800]
             tail = "\n".join((out or "").splitlines()[-120:])  # tail humano (últimas ~120 líneas)
             logger.info("[PYTEST-REPAIR] pytest output (head 800): %s", head)
@@ -1387,6 +1549,13 @@ def repair_tests_until_pytest_passes(
 
         improved = (total_n < total_prev) or (fp and fp != prev_fp)
 
+        # baseline: primera ejecución antes de aplicar patches
+        if baseline_total is None:
+            baseline_total = total_n
+            baseline_fp = fp
+            last_accepted_total = total_n
+            last_accepted_fp = fp
+
         if fp and fp == prev_fp:
             stuck_fp_streak += 1
         else:
@@ -1409,14 +1578,22 @@ def repair_tests_until_pytest_passes(
         )
 
         if ok:
+            _persist_test_validation_report(
+                project_dir,
+                ok=True,
+                degraded=False,
+                degrade_type=None,
+                production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+                rejected_patch_paths=rejected_patch_paths,
+                harness_strategy=harness_strategy,
+            )
             return _mk_result(ok=True, attempts=attempt, last_output=out, patched_files=patched_total)
 
         # --- Fixers deterministas (C0) ----------------------------------------------------
-        # Estrategia híbrida:
-        # - Para patrones de alta confianza y muy frecuentes (TestClient.get(json=...), dict-as-db, async mismatch...)
-        #   aplicamos 1 fixer determinista ANTES de gastar tokens del LLM.
-        # - Mantiene el loop LLM para casos "long tail", pero reduce flakiness y coste.
-        if apply_first_matching_fixer is not None:
+        # CRÍTICO: Pipeline C (reparación de tests) NO puede modificar código de producción.
+        # Los fixers deterministas legacy pueden tocar `app/**` (p.ej. response_model), así que aquí se desactivan.
+        # Los fixers sobre `app/**` deben ejecutarse SOLO en Pipeline A (runtime/import/wiring).
+        if False and apply_first_matching_fixer is not None:
             try:
                 fx = apply_first_matching_fixer(out or "", estructura or {})
             except Exception:
@@ -1507,12 +1684,20 @@ def repair_tests_until_pytest_passes(
             except Exception:
                 stub_signatures = None
 
+            pytest_json_report_obj = None
+            try:
+                jr_raw = estructura.get(".poc_it/pytest_report.json") or ""
+                pytest_json_report_obj = json.loads(jr_raw) if isinstance(jr_raw, str) and jr_raw.strip() else None
+            except Exception:
+                pytest_json_report_obj = None
+
             prompt = build_prompt_c2_asserts_repair(
                 pytest_output=out,
                 current_tests=current_tests,
                 test_repair_context=test_ctx,
                 runtime_contracts=runtime_contracts,
                 stub_signatures=stub_signatures,
+                pytest_json_report=pytest_json_report_obj,
             )
             subphase = "C2"
         else:
@@ -1541,6 +1726,13 @@ def repair_tests_until_pytest_passes(
             except Exception:
                 endpoint_code = None
 
+            pytest_json_report_obj = None
+            try:
+                jr_raw = estructura.get(".poc_it/pytest_report.json") or ""
+                pytest_json_report_obj = json.loads(jr_raw) if isinstance(jr_raw, str) and jr_raw.strip() else None
+            except Exception:
+                pytest_json_report_obj = None
+
             prompt = build_prompt_c1_harness_repair(
                 pytest_output=out,
                 current_tests=current_tests,
@@ -1549,6 +1741,7 @@ def repair_tests_until_pytest_passes(
                 runtime_facts=runtime_facts,
                 stub_signatures=stub_signatures,
                 endpoint_code=endpoint_code,
+                pytest_json_report=pytest_json_report_obj,
             )
             subphase = "C1"
 
@@ -1586,6 +1779,23 @@ def repair_tests_until_pytest_passes(
             allow_harness_files=[harness_file] if harness_file else None,
             allow_escape_hatch_harness_in_c2=allow_escape_hatch_harness_in_c2,
         )
+
+        # Guard allowlist estricta: Pipeline C solo puede tocar tests/**, pytest.ini, requirements-dev.txt, .poc_it/**
+        patch, rejected = _guard_filter_patch_pipeline_c(patch)
+        if rejected:
+            rejected_patch_paths.extend(rejected)
+            logger.info("[PYTEST-REPAIR][GUARD] Patch rechazado fuera de tests: %s", rejected[:10])
+            append_trace_event(
+                project_dir,
+                TraceEvent(
+                    ts=now_ts(),
+                    phase=subphase,
+                    attempt=attempt,
+                    action="guard_reject_out_of_tests",
+                    files_changed=rejected[:20],
+                ),
+            )
+
         if not patch:
             logger.info("[PYTEST-REPAIR] LLM no devolvió patch aplicable para fase=%s; continuando.", subphase)
             append_trace_event(project_dir, TraceEvent(ts=now_ts(), phase=subphase, attempt=attempt, action="llm_no_patch_applicable"))
@@ -1737,7 +1947,10 @@ def repair_tests_until_pytest_passes(
 
                 patch = patch2
 
-        # Aplicar patch a disco + estructura in-memory
+        # Aplicar patch a disco + estructura in-memory (con snapshot para rollback)
+        snapshot_tests = dict(current_tests)
+        snapshot_estructura = dict(estructura)
+
         materializar_proyecto(
             nombre_proyecto=nombre_proyecto,
             estructura=patch,
@@ -1746,6 +1959,123 @@ def repair_tests_until_pytest_passes(
         estructura.update(patch)
         current_tests.update(patch)
         patched_total.update(patch)
+
+        # Guard post-aplicación: si cambió código de producción, rollback inmediato y abort.
+        prod_after = _snapshot_production_fingerprint(project_dir)
+        if prod_after != prod_snapshot:
+            production_code_modified_by_test_repair = True
+            logger.info(
+                "[PYTEST-REPAIR][ROLLBACK] Restaurado código de producción tras intento de modificación en Pipeline C"
+            )
+            # rollback in-memory (vuelve a contenido previo de app/** incluido en estructura)
+            estructura.clear()
+            estructura.update(snapshot_estructura)
+            current_tests.clear()
+            current_tests.update(snapshot_tests)
+
+            # rollback on-disk: re-materializar archivos de producción desde snapshot_estructura
+            rollback_prod_patch: Dict[str, str] = {}
+            for p, c in (snapshot_estructura or {}).items():
+                if not isinstance(p, str) or not isinstance(c, str):
+                    continue
+                pp = p.replace("\\", "/")
+                if pp == "requirements.txt" or (pp.startswith("app/") and pp.endswith(".py")):
+                    rollback_prod_patch[pp] = c
+            if rollback_prod_patch:
+                try:
+                    materializar_proyecto(
+                        nombre_proyecto=nombre_proyecto,
+                        estructura=rollback_prod_patch,
+                        limpiar_directorio=False,
+                    )
+                except Exception:
+                    pass
+
+            _persist_test_validation_report(
+                project_dir,
+                ok=False,
+                degraded=False,
+                degrade_type=None,
+                production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+                rejected_patch_paths=rejected_patch_paths,
+                harness_strategy=harness_strategy,
+                extra={"aborted_reason": "production_code_modified_in_pipeline_c"},
+            )
+
+            return _mk_result(ok=False, attempts=attempt, last_output=out, patched_files=patched_total)
+
+        # Acceptance gate: re-run pytest inmediatamente y aceptar SOLO si mejora vs baseline o vs prev
+        ok_after, out_after, _ = _run_pytest(project_dir)
+        last_out = out_after
+
+        junit_xml_after = _read_pytest_junit_xml(project_dir)
+        counts_after = _extract_counts_from_junit_xml(junit_xml_after)
+        if counts_after:
+            err_a, fail_a, *_rest = counts_after
+            total_after = err_a + fail_a
+        else:
+            err_a, fail_a = _extract_pytest_counts(out_after)
+            total_after = err_a + fail_a
+
+        fp_after = _fingerprint_from_pytest_output(out_after)
+
+        # aceptación:
+        # - pasa => aceptar
+        # - o mejora total failures/errors vs último aceptado
+        # - o cambia fingerprint vs último aceptado (indicando progreso real)
+        #
+        # Nota: NO comparamos contra `total_n` porque pertenece al run pre-patch de ESTA iteración;
+        # lo correcto es comparar contra el último estado aceptado (evita aceptar "flapping" o regresiones).
+        accept = bool(ok_after) or bool(
+            (last_accepted_total is not None and total_after < last_accepted_total)
+        ) or bool(fp_after and last_accepted_fp and fp_after != last_accepted_fp)
+
+        if not accept:
+            logger.info(
+                "[PYTEST-REPAIR][GATE] Patch rechazado (no mejora). before(total=%s fp=%s) after(total=%s fp=%s). Rollback.",
+                total_n,
+                (fp or "")[:8],
+                total_after,
+                (fp_after or "")[:8],
+            )
+            # rollback in-memory
+            estructura.clear()
+            estructura.update(snapshot_estructura)
+            current_tests.clear()
+            current_tests.update(snapshot_tests)
+
+            # rollback on-disk: re-materializar snapshot (solo tests/ + pytest.ini)
+            rollback_patch = {p: c for p, c in snapshot_tests.items()}
+            try:
+                materializar_proyecto(
+                    nombre_proyecto=nombre_proyecto,
+                    estructura=rollback_patch,
+                    limpiar_directorio=False,
+                )
+            except Exception:
+                pass
+
+            append_trace_event(
+                project_dir,
+                TraceEvent(
+                    ts=now_ts(),
+                    phase=subphase,
+                    attempt=attempt,
+                    action="gate_reject_no_improve",
+                    files_changed=list(patch.keys()),
+                ),
+            )
+
+            attempt += 1
+            continue
+
+        # Patch aceptado => actualizar estado aceptado.
+        last_accepted_total = total_after
+        last_accepted_fp = fp_after or last_accepted_fp
+
+        # Si ya pasa tras el patch, devolver OK inmediatamente
+        if ok_after:
+            return _mk_result(ok=True, attempts=attempt, last_output=out_after, patched_files=patched_total)
 
         # 🔒 Reinyectar configuración base de pytest.ini tras cada patch (anti-LLM override)
         try:
@@ -1775,22 +2105,32 @@ markers =
         if subphase == "C1":
             c1_no_patch_streak = 0
 
-        if improved:
-            no_improve_streak = 0
-        else:
-            no_improve_streak += 1
+        # En esta iteración, si llegamos aquí el patch ha sido aceptado (mejoró).
+        no_improve_streak = 0
 
         # Si no mejora en varias iteraciones, degradamos para garantizar tests passing.
         if no_improve_streak >= NO_IMPROVE_LIMIT:
-            logger.info("[PYTEST-REPAIR] Sin mejora en %s iteraciones CON patch aplicado; degradando a contract-lite.", no_improve_streak)
+            logger.info(
+                "[PYTEST-REPAIR] Sin mejora en %s iteraciones CON patch aplicado; degradando a contract-lite.",
+                no_improve_streak,
+            )
             _degrade_to_contract_lite(nombre_proyecto=nombre_proyecto, estructura=estructura)
             ok2, out2, _ = _run_pytest(project_dir)
 
-            # Política acordada:
+            # Política:
             # - Degradamos a contract-lite y re-ejecutamos pytest (suite mínima smoke+openapi).
-            # - SOLO si pasa => OK_DEGRADED (publicable).
-            # - Si NO pasa => ERROR (no publicable).
+            # - Si pasa => OK_DEGRADED (publicable).
+            # - Si no pasa => ERROR (no publicable).
             if ok2:
+                _persist_test_validation_report(
+                    project_dir,
+                    ok=True,
+                    degraded=True,
+                    degrade_type="contract-lite",
+                    production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+                    rejected_patch_paths=rejected_patch_paths,
+                    harness_strategy=harness_strategy,
+                )
                 return _mk_result(
                     ok=True,
                     attempts=attempt,
@@ -1800,6 +2140,15 @@ markers =
                     degrade_type="contract-lite",
                 )
 
+            _persist_test_validation_report(
+                project_dir,
+                ok=False,
+                degraded=True,
+                degrade_type="contract-lite",
+                production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+                rejected_patch_paths=rejected_patch_paths,
+                harness_strategy=harness_strategy,
+            )
             return _mk_result(
                 ok=False,
                 attempts=attempt,
@@ -1817,4 +2166,48 @@ markers =
 
         attempt += 1
 
-    return _mk_result(ok=False, attempts=attempt, last_output=last_out, patched_files=patched_total)
+    # Último recurso: si se agota presupuesto sin converger, degradar a contract-lite.
+    # Esto unifica el comportamiento con PARCIAL: preferimos devolver una PoC ejecutable y verificable
+    # (smoke+openapi) antes que abortar.
+    try:
+        logger.info("[PYTEST-REPAIR] Presupuesto agotado; degradando a contract-lite (último recurso).")
+        _degrade_to_contract_lite(nombre_proyecto=nombre_proyecto, estructura=estructura)
+        ok2, out2, _ = _run_pytest(project_dir)
+        if ok2:
+            _persist_test_validation_report(
+                project_dir,
+                ok=True,
+                degraded=True,
+                degrade_type="contract-lite",
+                production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+                rejected_patch_paths=rejected_patch_paths,
+                harness_strategy=harness_strategy,
+            )
+            return _mk_result(
+                ok=True,
+                attempts=attempt,
+                last_output=out2,
+                patched_files=patched_total,
+                degraded=True,
+                degrade_type="contract-lite",
+            )
+
+        _persist_test_validation_report(
+            project_dir,
+            ok=False,
+            degraded=True,
+            degrade_type="contract-lite",
+            production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+            rejected_patch_paths=rejected_patch_paths,
+            harness_strategy=harness_strategy,
+        )
+        return _mk_result(
+            ok=False,
+            attempts=attempt,
+            last_output=out2,
+            patched_files=patched_total,
+            degraded=True,
+            degrade_type="contract-lite",
+        )
+    except Exception:
+        return _mk_result(ok=False, attempts=attempt, last_output=last_out, patched_files=patched_total)

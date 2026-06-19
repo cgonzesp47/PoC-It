@@ -20,8 +20,9 @@ import json
 import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+import os
 
-from poc_it.runtime_contracts import RUNTIME_CONTRACTS_PATH
+from poc_it.runtime.runtime_contracts import RUNTIME_CONTRACTS_PATH
 
 
 @dataclass(frozen=True)
@@ -547,8 +548,15 @@ if __name__ == "__main__":
     main()
 """.replace("__ENDPOINTS_JSON__", payload.replace("\\", "\\\\").replace("'", "\\'"))
 
+    # Importante: ejecutar el probe con el Python del venv del proyecto generado si existe,
+    # para evitar falsos negativos en máquinas donde PoC-it no tiene instaladas las deps del proyecto.
+    venv_py = os.path.join(project_dir, ".poc_it", "venv", "Scripts", "python.exe")
+    if not os.path.exists(venv_py):
+        venv_py = os.path.join(project_dir, ".poc_it", "venv", "bin", "python")
+    py = venv_py if os.path.exists(venv_py) else "python"
+
     p = subprocess.run(
-        ["python", "-c", code],
+        [py, "-c", code],
         cwd=project_dir,
         capture_output=True,
         text=True,

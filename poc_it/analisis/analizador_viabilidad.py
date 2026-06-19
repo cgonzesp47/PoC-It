@@ -16,16 +16,19 @@ Diseñado específicamente para LLM local 7B.
 
 from __future__ import annotations
 
-from poc_it.models import (
-    PlantillaUsuario,
-    ResultadoViabilidad,
-    ProjectContext,
+from poc_it.analisis.clasificador import clasificar_viabilidad
+from poc_it.analisis.normalizador_contexto import normalizar_plantilla
+from poc_it.modulos.arquitectura import generar_arquitectura
+from poc_it.modulos.fases import FaseProyecto, detectar_fase
+from poc_it.modulos.models import (
+    ContextoNormalizado,
     ModoGeneracion,
+    PlantillaUsuario,
+    ProjectContext,
+    ResultadoViabilidad,
 )
-from poc_it.clasificador import clasificar_viabilidad
-from poc_it.arquitectura import generar_arquitectura
-from poc_it.opciones import generar_opciones
-from poc_it.fases import detectar_fase, FaseProyecto
+from poc_it.modulos.opciones import generar_opciones
+import time
 
 
 # ==========================================================
@@ -53,9 +56,15 @@ async def analizar_viabilidad(datos: PlantillaUsuario) -> ResultadoViabilidad:
     # ==========================================================
     # 1) Construcción de ProjectContext a partir de PlantillaUsuario
     # ==========================================================
+    #Cambio para que cuadre con diagrama (comprobar si funciona)
     context = ProjectContext(plantilla=datos)
 
+    contexto_dict = normalizar_plantilla(datos)
+    context.contexto_normalizado = ContextoNormalizado(**contexto_dict)
+
+    t_clasificacion_inicio = time.perf_counter()
     context = clasificar_viabilidad(context)
+    t_clasificacion_fin = time.perf_counter()
 
     # Convertimos la clasificación almacenada en el contexto
     # al Enum ModoGeneracion esperado por el flujo antiguo.
@@ -91,4 +100,7 @@ async def analizar_viabilidad(datos: PlantillaUsuario) -> ResultadoViabilidad:
         modo=modo,
         arquitectura=arquitectura,
         opciones=opciones,
+        contexto_proyecto=context,
+        t_clasificacion_inicio=t_clasificacion_inicio,
+        t_clasificacion_fin=t_clasificacion_fin,
     )

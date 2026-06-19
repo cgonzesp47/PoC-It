@@ -6,18 +6,26 @@ import os
 import re
 from typing import Any, Dict, Optional
 
-from poc_it.generador_artefactos import generar_proyecto_desde_spec
-from poc_it.materializador_archivos import materializar_proyecto
-from poc_it.models import ProjectContext
+from poc_it.materializacion.generador_artefactos import generar_proyecto_desde_spec
+from poc_it.materializacion.materializador_archivos import materializar_proyecto
+from poc_it.modulos.models import ProjectContext
 from poc_it.orquestacion.llm_safe_repair import SafeRepairConfig, run_llm_safe_repair
 from poc_it.orquestacion.verificador_runtime import runtime_verify_fastapi_project
+from poc_it.orquestacion.venv_manager import ensure_project_venv_ready
 from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
 from poc_it.orquestacion.pytest_llm_repair import repair_tests_until_pytest_passes
+from poc_it.orquestacion.test_plan import TEST_PLAN_PATH, build_test_plan, persist_test_plan
 from poc_it.orquestacion.tests_coverage_llm_repair import repair_tests_coverage_until_ok
 from poc_it.orquestacion.wiring_verifier import verify_wiring_against_runtime_contracts
 from poc_it.orquestacion.runtime_probe import run_runtime_probe
+from poc_it.entrada.demo_progress import demo_progress, is_demo_mode
 
 logger = logging.getLogger(__name__)
+
+
+def _is_demo_mode() -> bool:
+    # compat con lógica antigua en este módulo
+    return is_demo_mode()
 
 _MISSING_MODULE_RE = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
 _REQUIREMENTS_PKG_RE = re.compile(r"^([a-zA-Z0-9_.-]+)")
@@ -84,10 +92,34 @@ def ejecutar_reparacion_runtime(
     last_missing_module: Optional[str] = None
     llm_attempted_for_missing: bool = False
 
-    logger.info(
-        "[PIPELINE][A] Code correctness loop (max=%s): import-time + wiring(OpenAPI) + request-time probe",
-        max_runtime_repairs,
-    )
+    if is_demo_mode():
+        demo_progress.step(6, 8, "Verificación y reparación automática")
+        demo_progress.info("Ejecutando verificación de runtime e intentando autoreparación...")
+    else:
+        logger.info(
+            "[PIPELINE][A] Code correctness loop (max=%s): import-time + wiring(OpenAPI) + request-time probe",
+            max_runtime_repairs,
+        )
+
+    # Asegurar entorno hermético para runtime verify/probe:
+    # - En máquinas limpias, sin esto fallará con ModuleNotFoundError (p.ej. fastapi).
+    #
+    # IMPORTANTE: si no se puede crear/preparar el venv, lo registramos de forma visible.
+    # Si se silencia este fallo, el pipeline acaba fallando más tarde en el OpenAPI probe con
+    # un ModuleNotFoundError que parece "misterioso".
+    try:
+        # Guardrail: normalizar `project_dir` para evitar paths corruptos (observado: duplicación
+        # .../output/<name>/output/<name>), que rompe venv/ensurepip y runtime probes.
+        project_dir = os.path.normpath(project_dir)
+
+        vr = ensure_project_venv_ready(project_dir=project_dir, estructura=estructura, spec=resultado.get("spec"))
+        if not getattr(vr, "ok", True):
+            logger.warning(
+                "[VENV] No se pudo preparar venv del proyecto (%s): %s", project_dir, getattr(vr, "detail", "")
+            )
+    except Exception as exc:
+        # best-effort: no romper pipeline si no se puede crear venv por política del entorno
+        logger.warning("[VENV] Excepción preparando venv del proyecto (%s): %s", project_dir, exc)
 
     for attempt in range(max_runtime_repairs + 1):
         ok_runtime, detail = runtime_verify_fastapi_project(project_dir, resultado.get("spec"))
@@ -124,7 +156,7 @@ def ejecutar_reparacion_runtime(
             # un runtime_contracts "viejo" y fallar en reparar 422 (json vs params).
             try:
                 patch_probe = {}
-                if " .poc_it/runtime_contracts.json".strip() in (estructura or {}):
+                if ".poc_it/runtime_contracts.json" in (estructura or {}):
                     patch_probe[".poc_it/runtime_contracts.json"] = estructura[".poc_it/runtime_contracts.json"]
 
                 if ".poc_it/stub_signatures.json" in (estructura or {}):
@@ -139,7 +171,9 @@ def ejecutar_reparacion_runtime(
                     for rel in patch_probe.keys():
                         archivos_creados.append(os.path.join(project_dir, rel.replace("/", os.sep)))
             except Exception:
-                pass
+                logger.exception(
+                    "[PIPELINE][A] Error auxiliar persistiendo artefactos de runtime/probe; se continúa sin esos artefactos"
+                )
 
             if not probe.ok:
                 gen_mode = ""
@@ -177,7 +211,10 @@ def ejecutar_reparacion_runtime(
         #
         # Nota: NO usa fixers deterministas. Solo LLM + gates + rollback.
         # ------------------------------------------------------------
-        safe_enabled = str(os.getenv("POC_IT_SAFE_LLM_REPAIR", "")).strip() in ("1", "true", "True", "yes", "YES")
+        # Safe repair es el camino principal (feature-flag solo para desactivar).
+        # Objetivo: evitar el repair legacy sin gates/rollback cuando hay fallos import-time típicos.
+        safe_disabled = str(os.getenv("POC_IT_SAFE_LLM_REPAIR", "")).strip() in ("0", "false", "False", "no", "NO")
+        safe_enabled = not safe_disabled
         safe_max = int(os.getenv("POC_IT_SAFE_LLM_REPAIR_MAX", "2") or "2")
         require_probe_ok = str(os.getenv("POC_IT_SAFE_LLM_REPAIR_REQUIRE_PROBE_OK", "")).strip() in (
             "1",
@@ -299,7 +336,12 @@ def ejecutar_reparacion_runtime(
                 + "Sugerencia: evita validar configuración/credenciales en import-time; "
                 + "haz lazy init y valida en runtime (en el endpoint que lo necesite)."
             )
-            logger.error("[RUNTIME_REPAIR] %s", msg)
+            if _is_demo_mode():
+                # En demo, no imprimir detalle/traceback crudo (ruido).
+                # El detalle completo se persistirá en RUNTIME_VERIFY_ERROR.txt dentro del proyecto generado.
+                logger.warning("[PIPELINE] Reparación automática en curso.")
+            else:
+                logger.error("[RUNTIME_REPAIR] %s", msg)
 
             # Persistimos un artefacto de error dentro del proyecto para que el usuario lo vea
             # incluso si la ejecución continúa y se devuelven los archivos generados.
@@ -310,6 +352,35 @@ def ejecutar_reparacion_runtime(
                 archivos_creados.extend([os.path.join(project_dir, "RUNTIME_VERIFY_ERROR.txt")])
             except Exception as exc:
                 logger.info("[RUNTIME_REPAIR] No se pudo materializar RUNTIME_VERIFY_ERROR.txt: %s", exc)
+
+            # IMPORTANTE:
+            # Aunque el código NO sea importable (code_ok=False), seguimos con la ejecución global
+            # y necesitamos que el pipeline pueda "degradar" a contract-lite más adelante.
+            #
+            # Para que esa degradación sea posible, intentamos dejar un suite mínimo de tests
+            # (smoke_import + openapi) materializado en el proyecto. Esto sirve para:
+            # - permitir un pytest mínimo (si el entorno tiene dependencias instaladas)
+            # - y, aunque no pase, dejar una base coherente para el usuario.
+            try:
+                from poc_it.orquestacion.pytest_llm_repair import _degrade_to_contract_lite
+
+                patch_min = _degrade_to_contract_lite(nombre_proyecto=nombre_proyecto, estructura=estructura)
+                materializar_proyecto(
+                    nombre_proyecto=nombre_proyecto,
+                    estructura=patch_min,
+                    limpiar_directorio=False,
+                )
+                estructura.update(patch_min)
+                archivos_creados.extend([os.path.join(project_dir, p.replace("/", os.sep)) for p in patch_min.keys()])
+            except Exception:
+                pass
+
+            # Marcar explícitamente que no se pudo completar runtime_verify (ayuda a la política del orquestador)
+            try:
+                if isinstance(resultado, dict):
+                    resultado["runtime_ok"] = False
+            except Exception:
+                pass
 
             return
 
@@ -397,6 +468,11 @@ SALIDA
   {{ "files": [{{"path":"...", "content":"..."}}] }}
 """
 
+        # Si safe repair está habilitado, evitamos el repair legacy (sin gates) salvo que esté explícitamente desactivado.
+        # Motivo: el repair legacy suele empeorar la convergencia y no tiene rollback.
+        if safe.enabled:
+            continue
+
         spec = resultado.get("spec")
         files_iniciales = [{"path": p, "content": c} for p, c in (estructura or {}).items()]
 
@@ -433,7 +509,11 @@ SALIDA
     # Fase B: generación de tests (LLM) sobre código ya validado (import + wiring).
     # Nota: aquí NO se repara código. Solo se generan tests.
     if regenerar_tests and code_ok:
-        logger.info("[PIPELINE][B] Generación de tests herméticos (LLM)")
+        if is_demo_mode():
+            demo_progress.step(7, 8, "Generación de tests y ejecución local")
+            demo_progress.info("Generando tests unitarios y ejecutando pytest...")
+        else:
+            logger.info("[PIPELINE][B] Generación de tests herméticos (LLM)")
         try:
             # FIX: Propagar modo de generación real (sin hardcodear).
             #
@@ -490,7 +570,16 @@ SALIDA
         #     logger.info("[TESTS] Aviso: coverage repair loop no ejecutable: %s", exc)
 
         # Fase C: loop de pytest SOLO sobre tests (prohibido tocar app/**).
-        logger.info("[PIPELINE][C] Pytest loop (solo tests/ + pytest.ini)")
+        #
+        # Política nueva (contract-first):
+        # - El renderer determinista ya genera una suite "conservadora".
+        # - El repair loop debe centrarse en:
+        #   (1) arreglar harness (conftest) si está roto
+        #   (2) si aún así hay 5xx recurrentes por integraciones externas, DEGRADAR endpoints
+        #       en `.poc_it/test_plan.json` a OPENAPI_CONTRACT y re-renderizar tests.
+        #
+        if not is_demo_mode():
+            logger.info("[PIPELINE][C] Pytest loop (solo tests/ + pytest.ini)")
         try:
             import json as _json
             import os as _os
@@ -519,6 +608,28 @@ SALIDA
                 runtime_facts=rf,
             )
 
+            if is_demo_mode():
+                # Resumen compacto para demo: solo OK/FAIL + conteo desde junit xml.
+                try:
+                    demo_progress.info(f"Pytest: {'OK' if rep.ok else 'FAIL'}")
+                except Exception:
+                    pass
+                try:
+                    from poc_it.orquestacion.pytest_llm_repair import (
+                        _extract_counts_from_junit_xml,
+                        _read_pytest_junit_xml,
+                    )
+
+                    xml = _read_pytest_junit_xml(project_dir)
+                    counts = _extract_counts_from_junit_xml(xml)
+                    if counts:
+                        errors, failures, passed, skipped, total = counts
+                        demo_progress.info(
+                            f"Resumen tests: total={total} pasados={passed} fallidos={failures} errores={errors} omitidos={skipped}"
+                        )
+                except Exception:
+                    pass
+
             # Propagar resultado estructurado de pytest a `resultado` (fuente de verdad para publicación)
             try:
                 if isinstance(resultado, dict):
@@ -534,6 +645,69 @@ SALIDA
 
             if not rep.ok:
                 logger.info("[TESTS] Pytest repair loop agotado; pytest sigue fallando.")
+
+                # Intento determinista adicional: degradar plan y re-renderizar tests.
+                # Esto evita que el sistema quede en estado "pytest rojo" por un endpoint no hermetizable.
+                try:
+                    # reconstruir plan a partir del runtime_contracts actual
+                    modo = None
+                    try:
+                        modo = str((resultado or {}).get("clasificacion") or (resultado or {}).get("modo") or "").strip() or None
+                    except Exception:
+                        modo = None
+                    if not modo and isinstance((resultado or {}).get("spec"), dict):
+                        modo = str((resultado.get("spec") or {}).get("modo") or (resultado.get("spec") or {}).get("mode") or "").strip() or None
+
+                    plan2 = build_test_plan(
+                        structure=estructura,
+                        spec=(resultado.get("spec") if isinstance(resultado.get("spec"), dict) else None),
+                        mode=str(modo or "PARCIAL"),
+                    )
+
+                    # Si el plan2 no cambia nada, no insistimos.
+                    # Aun así lo persistimos para que el usuario vea la decisión.
+                    estructura2 = persist_test_plan(structure=estructura, plan=plan2)
+                    patch_plan = {TEST_PLAN_PATH: estructura2.get(TEST_PLAN_PATH, "")}
+
+                    materializar_proyecto(
+                        nombre_proyecto=nombre_proyecto,
+                        estructura=patch_plan,
+                        limpiar_directorio=False,
+                    )
+                    estructura.update(patch_plan)
+
+                    # Re-render tests desde plan2 (via generacion_tests ya usado en fase B).
+                    # Nota: este "re-render" es local al proyecto y no usa LLM.
+                    try:
+                        from poc_it.orquestacion.contract_test_renderer import render_tests_from_test_plan
+
+                        tests_patch = render_tests_from_test_plan(
+                            structure=estructura2,
+                            runtime_contracts=rc if isinstance(rc, dict) else None,
+                            runtime_facts=rf if isinstance(rf, dict) else None,
+                        )
+                        if tests_patch:
+                            materializar_proyecto(
+                                nombre_proyecto=nombre_proyecto,
+                                estructura=tests_patch,
+                                limpiar_directorio=False,
+                            )
+                            estructura.update(tests_patch)
+
+                            rep3 = repair_tests_until_pytest_passes(
+                                nombre_proyecto=nombre_proyecto,
+                                project_dir=project_dir,
+                                estructura=estructura,
+                                max_repairs=max_repairs,
+                                runtime_contracts=rc,
+                                runtime_facts=rf,
+                            )
+                            if rep3.ok:
+                                rep = rep3
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
                 # ------------------------------------------------------------
                 # Escalado pragmático (LLM-driven): si pytest no converge,

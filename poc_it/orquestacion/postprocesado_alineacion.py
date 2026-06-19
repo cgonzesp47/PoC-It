@@ -9,11 +9,11 @@ import subprocess
 from datetime import datetime
 from typing import Any, Dict
 
-from poc_it.materializador_archivos import materializar_proyecto
+from poc_it.materializacion.materializador_archivos import materializar_proyecto
 from poc_it.orquestacion.pytest_fixers import apply_first_matching_fixer
 from poc_it.orquestacion.tests_sanitizer import sanitize_tests
-from poc_it.postprocesador_alineacion import AlignmentIssue, postprocesar_alineacion_llm
-from poc_it.runtime_contracts import load_runtime_contracts_from_structure
+from poc_it.materializacion.postprocesador_alineacion import AlignmentIssue, postprocesar_alineacion_llm
+from poc_it.runtime.runtime_contracts import load_runtime_contracts_from_structure
 
 logger = logging.getLogger(__name__)
 
@@ -168,8 +168,35 @@ def postprocesar_alineacion_por_pytest(
     - Nunca rompe el flujo: ante excepción, loggea y continúa.
     """
     try:
-        # En modo PARCIAL/hermético queremos ser más insistentes con la reparación de tests,
-        # porque es común que el primer patch arregle wiring/código y quede un ajuste fino de asserts.
+        # Política: en modo PARCIAL el "canonical loop" es pytest_llm_repair (solo tests, gates+rollback).
+        # Este post-procesado (legacy) tiende a duplicar estrategias y empeorar la convergencia.
+        #
+        # Para PARCIAL:
+        # - no ejecutamos este loop salvo que se fuerce explícitamente por env var.
+        forced = str(os.getenv("POC_IT_ENABLE_LEGACY_POSTPROCESS_PYTEST", "")).strip() in (
+            "1",
+            "true",
+            "True",
+            "yes",
+            "YES",
+        )
+
+        try:
+            contracts0 = load_runtime_contracts_from_structure(estructura)
+            gen_mode = str((contracts0 or {}).get("generation_mode") or "").upper() if isinstance(contracts0, dict) else ""
+        except Exception:
+            try:
+                gen_mode = str(getattr(load_runtime_contracts_from_structure(estructura), "generation_mode", "") or "").upper()
+            except Exception:
+                gen_mode = ""
+
+        if gen_mode == "PARCIAL" and not forced:
+            logger.info(
+                "[POST] Skip postprocesado_alineacion_por_pytest en PARCIAL (canonical: pytest_llm_repair). "
+                "Set POC_IT_ENABLE_LEGACY_POSTPROCESS_PYTEST=1 para forzar."
+            )
+            return
+
         # Default: 4 intentos (antes 2). Se puede overridear por env var.
         max_repairs = int(os.getenv("POSTPROCESADO_MAX_REPAIRS", "4"))
 

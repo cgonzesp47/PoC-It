@@ -25,6 +25,8 @@ import requests
 from pathlib import Path
 from typing import Optional
 
+from poc_it.entrada.demo_progress import is_demo_mode
+
 
 def _slugify_path(name: str, max_len: int = 60) -> str:
     """
@@ -300,6 +302,8 @@ class GitLabPublisher:
             return web_url
 
         except Exception as e:
-            print("\n[GitLabPublisher] Error durante publicación:")
-            print(str(e))
+            # En demo, main.py se encarga de mostrar un resumen final limpio.
+            if not is_demo_mode():
+                print("\n[GitLabPublisher] Error durante publicación:")
+                print(str(e))
             return None

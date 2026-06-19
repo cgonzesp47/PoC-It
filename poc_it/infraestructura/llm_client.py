@@ -14,17 +14,22 @@ Uso esperado en otros módulos:
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
-from poc_it.rate_limiter import (
+
+from poc_it.entrada.demo_progress import is_demo_mode
+from poc_it.infraestructura.rate_limiter import (
     GLOBAL_BUCKET,
     exponential_backoff_sleep,
     handle_rate_limit_headers,
     MAX_RETRIES,
 )
+
+logger = logging.getLogger(__name__)
 
 # Carga automática del .env de la raíz del proyecto
 load_dotenv()
@@ -45,11 +50,16 @@ LITELLM_PROXY_KEY = os.getenv("LITELLM_PROXY_KEY")  # opcional (si proteges el p
 # Si quieres forzar que NUNCA se hagan llamadas directas a proveedores (solo proxy), activa:
 #   LITELLM_PROXY_ONLY=1
 #
-# A petición del proyecto: por defecto SIEMPRE usamos el proxy (API Park / LiteLLM Proxy).
-# Esto garantiza que el routing/fallback centralizado se aplique y evita llamadas directas a proveedores.
-# Por defecto: permitimos fallback manual como último recurso (tras fallo del proxy).
-# Si quremos que NUNCA se hagan llamadas directas, exporta LITELLM_PROXY_ONLY=1.
+# Si quieres hacer justo lo contrario (saltarte el proxy SIEMPRE y usar solo llamadas directas),
+# activa:
+#   LLM_DIRECT_ONLY=1
+#
+# Orden de precedencia:
+# - LLM_DIRECT_ONLY=1  => fuerza llamadas directas y desactiva proxy aunque LITELLM_PROXY_ONLY=1
+# - LITELLM_PROXY_ONLY=1 => fuerza proxy (sin fallbacks directos)
+# - Ninguno => proxy + fallbacks directos como último recurso
 LITELLM_PROXY_ONLY = os.getenv("LITELLM_PROXY_ONLY", "0").strip() in ("1", "true", "True", "yes", "YES")
+LLM_DIRECT_ONLY = os.getenv("LLM_DIRECT_ONLY", "0").strip() in ("1", "true", "True", "yes", "YES")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -146,6 +156,15 @@ SESSION_PROVIDER_DISABLED: Dict[str, bool] = {}
 # HELPERS PARA CADA PROVEEDOR
 # ==========================================================
 
+POCIT_INSECURE_SSL = os.getenv("POCIT_INSECURE_SSL", "0").strip() in ("1", "true", "True", "yes", "YES")
+
+
+def _requests_verify() -> bool:
+    # Solo para diagnóstico / entornos controlados.
+    # NO recomendable para producción: desactiva la verificación TLS.
+    return not POCIT_INSECURE_SSL
+
+
 def _call_groq(
     messages: List[Dict[str, str]],
     model: Optional[str] = None,
@@ -171,14 +190,14 @@ def _call_groq(
 
     for attempt in range(MAX_RETRIES):
         GLOBAL_BUCKET.consume(payload.get("max_tokens", 1000))
-        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
+        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60, verify=_requests_verify())
 
         if resp.status_code == 429:
             # Política: 429 => no reintentar en este provider, saltar al fallback
-            print("[RATE LIMIT] Groq 429 detected.")
+            logger.debug("[RATE LIMIT] Groq 429 detected.")
             if NO_RETRY_ON_429:
                 raise LLMError("Groq 429 rate limit")
-            print("[RATE LIMIT] Applying backoff...")
+            logger.debug("[RATE LIMIT] Applying backoff...")
             exponential_backoff_sleep(attempt)
             continue
 
@@ -224,7 +243,7 @@ def _call_gemini(
         },
     }
 
-    resp = requests.post(url, json=payload, timeout=60)
+    resp = requests.post(url, json=payload, timeout=60, verify=_requests_verify())
 
     if resp.status_code == 429:
         raise LLMError("Gemini 429 rate limit")
@@ -262,7 +281,7 @@ def _call_mistral(
         "Content-Type": "application/json",
     }
 
-    resp = requests.post(MISTRAL_URL, headers=headers, json=payload, timeout=60)
+    resp = requests.post(MISTRAL_URL, headers=headers, json=payload, timeout=60, verify=_requests_verify())
 
     if resp.status_code == 429:
         raise LLMError("Mistral 429 rate limit")
@@ -304,7 +323,7 @@ def _call_cerebras(
         "Content-Type": "application/json",
     }
 
-    resp = requests.post(CEREBRAS_URL, headers=headers, json=payload, timeout=60)
+    resp = requests.post(CEREBRAS_URL, headers=headers, json=payload, timeout=60, verify=_requests_verify())
 
     if resp.status_code == 429:
         raise LLMError("Cerebras 429 rate limit")
@@ -344,13 +363,13 @@ def _call_openrouter(
 
     for attempt in range(MAX_RETRIES):
         GLOBAL_BUCKET.consume(payload.get("max_tokens", 1000))
-        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60, verify=_requests_verify())
 
         if resp.status_code == 429:
-            print("[RATE LIMIT] OpenRouter 429 detected.")
+            logger.debug("[RATE LIMIT] OpenRouter 429 detected.")
             if NO_RETRY_ON_429:
                 raise LLMError("OpenRouter 429 rate limit")
-            print("[RATE LIMIT] Applying backoff...")
+            logger.debug("[RATE LIMIT] Applying backoff...")
             exponential_backoff_sleep(attempt)
             continue
 
@@ -411,36 +430,43 @@ def _call_litellm_proxy(
                 headers=headers,
                 json=payload,
                 timeout=timeout,
+                verify=_requests_verify(),
             )
         except requests.exceptions.ReadTimeout as exc:
             # Timeout hablando con el PROXY (no con el upstream directamente).
             # Para diagnosticar qué upstream está atascado, activa logs del proxy (ver README).
             alias = model or FALLBACK_PROVIDER
-            print(
-                f"[TIMEOUT] LiteLLM Proxy ReadTimeout (alias={alias}, timeout={timeout}s, url={LITELLM_CHAT_URL}). "
-                f"Esto suele indicar que el proxy está esperando respuesta de un upstream lento/bloqueado."
+            logger.debug(
+                "[TIMEOUT] LiteLLM Proxy ReadTimeout (alias=%s, timeout=%ss, url=%s). "
+                "Esto suele indicar que el proxy está esperando respuesta de un upstream lento/bloqueado.",
+                alias,
+                timeout,
+                LITELLM_CHAT_URL,
             )
             raise LLMError(f"LiteLLM Proxy timeout (alias={alias})") from exc
         except requests.exceptions.ConnectTimeout as exc:
             alias = model or FALLBACK_PROVIDER
-            print(
-                f"[TIMEOUT] LiteLLM Proxy ConnectTimeout (alias={alias}, timeout={timeout}s, url={LITELLM_CHAT_URL}). "
-                f"Esto suele indicar problema de red/host/puerto o saturación."
+            logger.debug(
+                "[TIMEOUT] LiteLLM Proxy ConnectTimeout (alias=%s, timeout=%ss, url=%s). "
+                "Esto suele indicar problema de red/host/puerto o saturación.",
+                alias,
+                timeout,
+                LITELLM_CHAT_URL,
             )
             raise LLMError(f"LiteLLM Proxy connect-timeout (alias={alias})") from exc
 
         if resp.status_code == 429:
-            print("[RATE LIMIT] LiteLLM Proxy 429 detected.")
+            logger.debug("[RATE LIMIT] LiteLLM Proxy 429 detected.")
             # El body suele incluir el upstream/provider real que rate-limitó.
             try:
                 body = (resp.text or "")[:500]
             except Exception:
                 body = ""
             if body:
-                print(f"[RATE LIMIT] LiteLLM Proxy 429 body (trunc): {body}")
+                logger.debug("[RATE LIMIT] LiteLLM Proxy 429 body (trunc): %s", body)
             if NO_RETRY_ON_429:
                 raise LLMError("LiteLLM Proxy 429 rate limit")
-            print("[RATE LIMIT] Applying backoff...")
+            logger.debug("[RATE LIMIT] Applying backoff...")
             exponential_backoff_sleep(attempt)
             continue
 
@@ -523,7 +549,7 @@ def _build_messages(user_prompt: str, system_prompt: Optional[str]) -> List[Dict
     return messages
 
 
-def chat_completion_text(
+def solicitarRespuestaTextual(
     prompt: str,
     system: Optional[str] = None,
     temperature: float = 0.0,
@@ -611,13 +637,44 @@ def chat_completion_text(
     #   activamos un fallback manual de ÚLTIMO RECURSO a proveedores directos.
     default_chain = ["litellm_proxy"]
 
+    # En modo directo replicamos 1:1 el orden del proxy (litellm_config.yaml):
+    # - Alias primario por fase: LLM_POLICY (ctx-json/cls-json/code-gen/docs/estimate)
+    # - Fallbacks por alias: router_settings.fallbacks
+    #
+    # Traducción alias -> provider directo:
+    # - *-groq => groq
+    # - *-gemini => gemini
+    # - *-openrouter => openrouter
+    # - *-mistral => mistral
+    # - *-cerebras / code-gen-fallback => cerebras
+    DIRECT_CHAIN_BY_ALIAS: Dict[str, List[str]] = {
+        # ctx-json primary: mistral/codestral
+        "ctx-json": ["mistral", "groq", "gemini", "openrouter"],
+        # cls-json primary: mistral/codestral
+        "cls-json": ["mistral", "groq", "gemini", "openrouter"],
+        # code-gen primary: mistral/codestral; fallback: cerebras
+        "code-gen": ["mistral", "cerebras"],
+        # docs primary: openrouter; fallbacks listados en YAML (en el orden configurado allí)
+        "docs": ["openrouter", "gemini", "groq", "cerebras", "mistral"],
+        # estimate primary: cerebras; fallbacks listados en YAML
+        "estimate": ["cerebras", "gemini", "groq", "openrouter"],
+    }
+
+    # Cadena directa por defecto si no hay fase/alias resoluble.
+    DEFAULT_DIRECT_CHAIN = ["groq", "gemini", "mistral", "cerebras", "openrouter", "ollama"]
+
     # IMPORTANTE:
-    # - Fallback manual SOLO tras fallo del proxy.
+    # - Fallback manual SOLO tras fallo del proxy (salvo LLM_DIRECT_ONLY).
     # - Si quieres desactivar completamente llamadas directas, exporta LITELLM_PROXY_ONLY=1.
-    if LITELLM_PROXY_ONLY:
+    # - Si quieres saltarte el proxy y usar SOLO llamadas directas, exporta LLM_DIRECT_ONLY=1.
+    if LLM_DIRECT_ONLY:
+        # Resolver alias del “proxy” para esta fase (misma policy), pero ejecutando directo.
+        alias = provider_hint or (LLM_POLICY.get(fase) if fase else None) or None
+        providers = DIRECT_CHAIN_BY_ALIAS.get(alias or "", DEFAULT_DIRECT_CHAIN)
+    elif LITELLM_PROXY_ONLY:
         providers = default_chain
     else:
-        providers = default_chain + ["groq", "gemini", "mistral", "cerebras", "openrouter", "ollama"]
+        providers = default_chain + DEFAULT_DIRECT_CHAIN
 
     LLM_METRICS["total_calls"] += 1
 
@@ -628,12 +685,12 @@ def chat_completion_text(
         # -------------------------------
         now = _time.time()
         if SESSION_PROVIDER_DISABLED.get(provider):
-            print(f"[LLM] {provider.upper()} deshabilitado en esta ejecución. Saltando proveedor.")
+            logger.debug("[LLM] %s deshabilitado en esta ejecución. Saltando proveedor.", provider.upper())
             continue
 
         cooldown_until = PROVIDER_COOLDOWN.get(provider, 0)
         if now < cooldown_until:
-            print(f"[LLM] {provider.upper()} en cooldown. Saltando proveedor.")
+            logger.debug("[LLM] %s en cooldown. Saltando proveedor.", provider.upper())
             continue
 
         try:
@@ -667,7 +724,8 @@ def chat_completion_text(
                 proxy_last_exc: Optional[Exception] = None
                 effective_timeout = timeout if isinstance(timeout, int) and timeout > 0 else 70
                 for alias in aliases_to_try:
-                    print(f"[LLM] Provider: LITELLM_PROXY (model={alias or FALLBACK_PROVIDER})")
+                    if not is_demo_mode():
+                        logger.debug("[LLM] Provider: LITELLM_PROXY (model=%s)", alias or FALLBACK_PROVIDER)
                     try:
                         return _call_litellm_proxy(
                             messages,
@@ -679,49 +737,60 @@ def chat_completion_text(
                     except Exception as exc:
                         proxy_last_exc = exc
                         # Si es rate limit/fallo, probamos el siguiente alias
-                        print(f"[LLM] ERROR en LITELLM_PROXY (model={alias or FALLBACK_PROVIDER}): {exc}")
+                        if not is_demo_mode():
+                            logger.debug(
+                                "[LLM] ERROR en LITELLM_PROXY (model=%s): %s",
+                                alias or FALLBACK_PROVIDER,
+                                exc,
+                            )
                         continue
 
                 # Si todos los aliases fallan (p.ej. timeouts en docs), saltamos al siguiente proveedor
                 # del chain (groq/cerebras/mistral/gemini/openrouter/ollama).
                 raise proxy_last_exc or LLMError("LiteLLM Proxy failed for all aliases.")
             elif provider == "groq":
-                print("[LLM] Provider: GROQ")
+                if not is_demo_mode():
+                    logger.debug("[LLM] Provider: GROQ")
                 return _call_groq(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
             elif provider == "cerebras":
-                print("[LLM] Provider: CEREBRAS")
+                if not is_demo_mode():
+                    logger.debug("[LLM] Provider: CEREBRAS")
                 return _call_cerebras(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
             elif provider == "mistral":
-                print("[LLM] Provider: MISTRAL")
+                if not is_demo_mode():
+                    logger.debug("[LLM] Provider: MISTRAL")
                 return _call_mistral(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
             elif provider == "gemini":
-                print("[LLM] Provider: GEMINI")
+                if not is_demo_mode():
+                    logger.debug("[LLM] Provider: GEMINI")
                 return _call_gemini(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
             elif provider == "openrouter":
-                print("[LLM] Provider: OPENROUTER")
+                if not is_demo_mode():
+                    logger.debug("[LLM] Provider: OPENROUTER")
                 return _call_openrouter(
                     messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
             else:
-                print("[LLM] Provider: OLLAMA (local)")
+                if not is_demo_mode():
+                    logger.debug("[LLM] Provider: OLLAMA (local)")
                 return _call_ollama(
                     messages,
                     temperature=temperature,
@@ -729,15 +798,17 @@ def chat_completion_text(
                 )
 
         except Exception as exc:
-            print(f"[LLM] ERROR en {provider.upper()}: {exc}")
+            if not is_demo_mode():
+                logger.debug("[LLM] ERROR en %s: %s", provider.upper(), exc)
 
             # Si es error fuerte de rate limit, activar cooldown
             if "rate limit" in str(exc).lower() or "429" in str(exc):
                 PROVIDER_COOLDOWN[provider] = _time.time() + COOLDOWN_SECONDS
                 SESSION_PROVIDER_DISABLED[provider] = True
-                print(
-                    f"[LLM] {provider.upper()} desactivado durante {COOLDOWN_SECONDS}s por rate limit "
-                    f"y deshabilitado para el resto de esta ejecución."
+                logger.debug(
+                    "[LLM] %s desactivado durante %ss por rate limit y deshabilitado para el resto de esta ejecución.",
+                    provider.upper(),
+                    COOLDOWN_SECONDS,
                 )
 
             # Métricas de fallo por proveedor
@@ -769,7 +840,8 @@ def chat_completion_text(
             # Si no es el último proveedor, cuenta como fallback
             if idx < len(providers) - 1:
                 LLM_METRICS["fallbacks"] += 1
-                print("[LLM] → Activando fallback al siguiente proveedor...")
+                if not is_demo_mode():
+                    logger.debug("[LLM] → Activando fallback al siguiente proveedor...")
 
             continue
 
@@ -781,14 +853,13 @@ def chat_completion_text(
     if ollama_error:
         error_msg += f"- Ollama error: {ollama_error}\n"
 
-    print("\n[LLM METRICS]")
-    for k, v in LLM_METRICS.items():
-        print(f"  - {k}: {v}")
+    if not is_demo_mode():
+        logger.debug("[LLM METRICS]\n%s", "\n".join([f"  - {k}: {v}" for k, v in LLM_METRICS.items()]))
 
     raise LLMError(error_msg)
 
 
-def chat_completion_json(
+def solicitarJSONEstructurado(
     prompt: str,
     system: Optional[str] = None,
     temperature: float = 0.0,
@@ -807,7 +878,7 @@ def chat_completion_json(
     # Refuerza instrucción de JSON en el system prompt
     system_prompt = (system or "") + "\nResponde exclusivamente con JSON válido."
 
-    raw = chat_completion_text(
+    raw = solicitarRespuestaTextual(
         prompt=prompt,
         system=system_prompt.strip(),
         temperature=temperature,
@@ -834,3 +905,11 @@ def chat_completion_json(
         return candidate
     except Exception:
         return raw
+
+
+# ==========================================================
+# COMPATIBILIDAD (nombres antiguos)
+# ==========================================================
+# Mantener estos aliases evita tener que tocar imports existentes en el repo.
+chat_completion_text = solicitarRespuestaTextual
+chat_completion_json = solicitarJSONEstructurado

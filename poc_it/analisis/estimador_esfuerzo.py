@@ -12,9 +12,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import logging
 from typing import Any, Mapping, Optional
 
-from poc_it.llm_client import chat_completion_json
+from poc_it.infraestructura.llm_client import chat_completion_json
 
 
 # ==========================================================
@@ -43,7 +44,8 @@ Actúa como un arquitecto software senior pragmático.
 Debes estimar el tiempo TOTAL necesario para implementar una **PoC mínima funcional (MVP)**.
 
 Fuente de verdad:
-- Si se proporciona un SPEC o un CONTEXTO_NORMALIZADO, debes basarte principalmente en esos datos estructurados.
+- Si se proporciona un SPEC, debes basarte principalmente en el SPEC.
+- Si NO hay SPEC (p.ej. modo ASESOR), debes basarte en el CONTEXTO_NORMALIZADO.
 - Si faltan datos, utiliza la descripción textual solo como apoyo (sin inventar requisitos).
 
 Principios obligatorios:
@@ -91,6 +93,12 @@ class ParametrosEstimacion:
     # Guardrails / ajustes
     factor_escenario_simple: float = 0.9
 
+    # Descuento por modo PARCIAL: el repo generado puede contener placeholders y pasos manuales.
+    factor_modo_parcial: float = 0.6
+
+    # Descuento adicional si el flujo terminó degradado a "contract-lite" (suite mínima).
+    factor_degrade_contract_lite: float = 0.4
+
     # Fallbacks (si el LLM falla o devuelve valores no válidos)
     fallback_junior_horas: float = 24.0
     fallback_senior_horas: float = 12.0
@@ -119,6 +127,8 @@ class ParametrosEstimacion:
 
 
 PARAMETROS_ESTIMACION = ParametrosEstimacion()
+
+logger = logging.getLogger(__name__)
 
 
 _ESTIMACION_JSON_FALLBACK: dict[str, Any] = {
@@ -183,8 +193,11 @@ def _modo_a_instruccion(modo: str | None) -> str:
         )
     if modo_upper == "PARCIAL":
         return (
-            "Modo: PARCIAL. Puede haber alcance parcial. Estima el esfuerzo humano para implementar el SPEC "
-            "y completar los elementos típicamente necesarios para una PoC funcional (sin suposiciones enterprise)."
+            "Modo: PARCIAL. IMPORTANTE: el sistema puede no tener acceso a integraciones externas reales "
+            "(p.ej., DB, APIs, cloud). Estima el esfuerzo humano para implementar SOLO lo descrito en el SPEC "
+            "como PoC base ejecutable, permitiendo stubs/mocks/placeholders para integraciones externas y "
+            "dejando pasos manuales para completar la integración real. NO incluyas configurar la integración "
+            "real fuera del repo (infra, credenciales, cuentas cloud) salvo un setup local mínimo."
         )
     if modo_upper == "COMPLETO":
         return (
@@ -205,6 +218,48 @@ def _to_json_block(label: str, data: Optional[Mapping[str, Any]]) -> str:
     return f"{label}:\n{payload}\n"
 
 
+def _metricas_desde_spec(spec: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+    """
+    Deriva métricas estrictamente a partir del SPEC (sin heurísticas por keywords).
+
+    Nota: No asumimos semántica “DB/persistencia/auth” por strings.
+    Solo contamos elementos estructurados presentes en el spec.
+    """
+    if not spec or not isinstance(spec, Mapping):
+        return {
+            "num_endpoints": 0,
+            "num_files": 0,
+            "num_dependencies": 0,
+            "num_env_vars": 0,
+            "num_contract_rules": 0,
+            "num_restrictions": 0,
+        }
+
+    endpoints = spec.get("endpoints") or []
+    files = spec.get("files") or []
+    deps = spec.get("dependencies") or []
+    env = spec.get("env") or []
+    contracts = spec.get("contracts") or []
+    restrictions = spec.get("restrictions") or []
+
+    num_contract_rules = 0
+    if isinstance(contracts, list):
+        for c in contracts:
+            if isinstance(c, Mapping):
+                rules = c.get("rules") or []
+                if isinstance(rules, list):
+                    num_contract_rules += len(rules)
+
+    return {
+        "num_endpoints": len(endpoints) if isinstance(endpoints, list) else 0,
+        "num_files": len(files) if isinstance(files, list) else 0,
+        "num_dependencies": len(deps) if isinstance(deps, list) else 0,
+        "num_env_vars": len(env) if isinstance(env, list) else 0,
+        "num_contract_rules": num_contract_rules,
+        "num_restrictions": len(restrictions) if isinstance(restrictions, list) else 0,
+    }
+
+
 def _build_prompt_estimacion(
     *,
     descripcion_proyecto: str,
@@ -213,20 +268,34 @@ def _build_prompt_estimacion(
     spec: Optional[Mapping[str, Any]],
     contexto_normalizado: Optional[Mapping[str, Any]],
 ) -> str:
-    metricas_block = ""
-    if metricas:
-        metricas_block = _to_json_block("MÉTRICAS ESTRUCTURALES (resumen, si están presentes)", metricas)
+    # Política:
+    # - Si hay SPEC: estimar basado SOLO en SPEC + métricas derivadas del SPEC.
+    # - Si NO hay SPEC (modo ASESOR): estimar basado SOLO en CONTEXTO_NORMALIZADO.
+    if spec and isinstance(spec, Mapping):
+        metricas_spec = _metricas_desde_spec(spec)
+        metricas_block = _to_json_block("MÉTRICAS ESTRUCTURALES DERIVADAS DEL SPEC", metricas_spec)
 
+        return f"""
+{PROMPT_ESTIMACION_ESTRUCTURADA}
+
+INSTRUCCIÓN OPERATIVA:
+{_modo_a_instruccion(modo)}
+
+{_to_json_block("SPEC (FUENTE DE VERDAD)", spec)}
+{metricas_block}
+DESCRIPCIÓN (solo apoyo si el SPEC está incompleto o vacío):
+{descripcion_proyecto}
+""".strip()
+
+    # Fallback estructurado para ASESOR: contexto_normalizado
     return f"""
 {PROMPT_ESTIMACION_ESTRUCTURADA}
 
 INSTRUCCIÓN OPERATIVA:
 {_modo_a_instruccion(modo)}
 
-{_to_json_block("SPEC (FUENTE DE VERDAD, si está presente)", spec)}
-{_to_json_block("CONTEXTO_NORMALIZADO (FUENTE DE VERDAD, si está presente)", contexto_normalizado)}
-{metricas_block}
-DESCRIPCIÓN (solo apoyo si falta detalle en spec/contexto):
+{_to_json_block("CONTEXTO_NORMALIZADO (FUENTE DE VERDAD)", contexto_normalizado)}
+DESCRIPCIÓN (solo apoyo si el CONTEXTO_NORMALIZADO está incompleto o vacío):
 {descripcion_proyecto}
 """.strip()
 
@@ -240,14 +309,16 @@ def _estimar_horas_desde_inputs(
     contexto_normalizado: Optional[Mapping[str, Any]] = None,
 ) -> tuple[float, float, str]:
     """
-    Estima horas con UNA llamada LLM, usando inputs estructurados cuando existan.
-    - Si hay spec/contexto_normalizado, se priorizan como fuente de verdad.
-    - `metricas` se usa como fallback estructurado si se aporta.
+    Estima horas con UNA llamada LLM.
+
+    Política:
+    - Si hay SPEC: basar estimación en SPEC (fuente de verdad) + métricas derivadas del SPEC.
+    - Si NO hay SPEC (modo ASESOR): basar estimación en CONTEXTO_NORMALIZADO.
     """
     prompt_estimacion = _build_prompt_estimacion(
         descripcion_proyecto=descripcion_proyecto,
         modo=modo,
-        metricas=metricas,
+        metricas=None,
         spec=spec,
         contexto_normalizado=contexto_normalizado,
     )
@@ -371,11 +442,59 @@ def calcular_estimacion_esfuerzo(
         contexto_normalizado=contexto_normalizado,
     )
 
-    # Guardrails: sin métricas estructurales legacy, aplicamos valores conservadores.
-    # (Se mantiene el comportamiento de clamps/márgenes sin dependencia de extracción previa).
-    num_integraciones = 1
+    # Guardrails sin heurísticas por keywords:
+    # - Si hay SPEC: calibrar por tamaño del SPEC (endpoints/archivos/deps/env/contracts/restrictions).
+    # - Si NO hay SPEC (ASESOR): no inventar métricas; dejar integraciones=0 y no aplicar ajustes extra.
+    num_integraciones = 0
     requiere_auth = False
     requiere_persistencia = False
+
+    degraded = False
+    degrade_type = None
+    spec_modo = None
+
+    if spec and isinstance(spec, Mapping):
+        spec_modo = spec.get("modo")
+        m = _metricas_desde_spec(spec)
+        num_endpoints = int(m.get("num_endpoints", 0) or 0)
+        num_dependencies = int(m.get("num_dependencies", 0) or 0)
+        num_env_vars = int(m.get("num_env_vars", 0) or 0)
+        num_contract_rules = int(m.get("num_contract_rules", 0) or 0)
+
+        # Nota importante:
+        # - NO usamos dependencies/env como proxy directo de "integraciones externas".
+        # - Aun así, lo mantenemos como una señal débil para clamps mínimos si el LLM devuelve 0.
+        num_integraciones = max(0, num_dependencies + num_env_vars)
+
+        # Ajuste adicional determinista: si hay muchos endpoints/reglas, sube ligeramente el senior/junior.
+        senior += max(0.0, (num_endpoints - 3) * 0.75) + max(0.0, (num_contract_rules - 3) * 0.25)
+        junior += max(0.0, (num_endpoints - 3) * 1.0) + max(0.0, (num_contract_rules - 3) * 0.35)
+
+        # Señales opcionales (si existen en el SPEC): degradación de alcance real.
+        pocit_meta = spec.get("pocit")
+        if isinstance(pocit_meta, Mapping):
+            degraded = bool(pocit_meta.get("degraded", False))
+            degrade_type = pocit_meta.get("degrade_type")
+
+    # Calibración pragmática por modo (scope realmente generado)
+    modo_eff = (modo or spec_modo or "").upper()
+    if modo_eff == "PARCIAL":
+        junior *= PARAMETROS_ESTIMACION.factor_modo_parcial
+        senior *= PARAMETROS_ESTIMACION.factor_modo_parcial
+
+    if degraded and str(degrade_type).lower() == "contract-lite":
+        junior *= PARAMETROS_ESTIMACION.factor_degrade_contract_lite
+        senior *= PARAMETROS_ESTIMACION.factor_degrade_contract_lite
+
+    logger.info(
+        "[ESTIMACION] modo=%s spec_modo=%s degraded=%s degrade_type=%s junior_llm=%s senior_llm=%s",
+        str(modo),
+        str(spec_modo),
+        str(degraded),
+        str(degrade_type),
+        str(junior),
+        str(senior),
+    )
 
     junior_min, junior_max, senior_min, senior_max = _aplicar_limites_y_margen(
         junior=junior,

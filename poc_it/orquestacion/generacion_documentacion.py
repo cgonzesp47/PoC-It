@@ -5,10 +5,14 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
-from poc_it.generador_informes import generar_readme_asesor, generar_readme_final, generar_readme_manual
-from poc_it.materializador_archivos import materializar_proyecto
-from poc_it.models import ModoGeneracion, ProjectContext
-from poc_it.opciones import generar_opciones
+from poc_it.materializacion.generador_informes import (
+    generar_readme_asesor,
+    generar_readme_final,
+    generar_readme_manual,
+)
+from poc_it.materializacion.materializador_archivos import materializar_proyecto
+from poc_it.modulos.models import ModoGeneracion, ProjectContext
+from poc_it.modulos.opciones import generar_opciones
 from poc_it.orquestacion.constantes import (
     ARQUITECTURA_LLM_DEFAULT,
     OUTPUT_DIRNAME,
@@ -17,6 +21,7 @@ from poc_it.orquestacion.constantes import (
     README_MANUAL_FILENAME,
 )
 from poc_it.orquestacion.verificador_runtime import runtime_verify_fastapi_project
+from poc_it.entrada.demo_progress import demo_progress, is_demo_mode
 
 logger = logging.getLogger(__name__)
 
@@ -110,19 +115,21 @@ def generar_documentacion(
             spec=spec_dict,
         )
 
-        future_analisis = executor.submit(
-            generar_readme_asesor,
-            nombre_proyecto,
-            context.plantilla.problema,
-            usuarios_reales,
-            funcionalidades_reales,
-            limites_reales,
-            tecnologias_reales,
-            arquitectura_real,
-            opciones_estrategicas,
-            estimacion_manual,
-            spec_dict,
-        )
+        future_analisis = None
+        if modo_generacion.upper() == ModoGeneracion.ASESOR:
+            future_analisis = executor.submit(
+                generar_readme_asesor,
+                nombre_proyecto,
+                context.plantilla.problema,
+                usuarios_reales,
+                funcionalidades_reales,
+                limites_reales,
+                tecnologias_reales,
+                arquitectura_real,
+                opciones_estrategicas,
+                estimacion_manual,
+                spec_dict,
+            )
 
         future_manual = None
         if modo_generacion.upper() == ModoGeneracion.PARCIAL:
@@ -137,20 +144,28 @@ def generar_documentacion(
             )
 
         readme_final = future_final.result()
-        readme_analisis = future_analisis.result()
+        readme_analisis = future_analisis.result() if future_analisis else None
         readme_manual = future_manual.result() if future_manual else None
+
+    if is_demo_mode():
+        demo_progress.step(8, 8, "Documentación generada")
 
     materializar_proyecto(
         nombre_proyecto=nombre_proyecto,
         estructura={README_FINAL_FILENAME: readme_final},
         limpiar_directorio=False,
     )
+    if is_demo_mode():
+        demo_progress.ok(f"{README_FINAL_FILENAME}: OK")
 
-    materializar_proyecto(
-        nombre_proyecto=nombre_proyecto,
-        estructura={README_ANALISIS_FILENAME: readme_analisis},
-        limpiar_directorio=False,
-    )
+    if readme_analisis:
+        materializar_proyecto(
+            nombre_proyecto=nombre_proyecto,
+            estructura={README_ANALISIS_FILENAME: readme_analisis},
+            limpiar_directorio=False,
+        )
+        if is_demo_mode():
+            demo_progress.ok(f"{README_ANALISIS_FILENAME}: OK")
 
     if readme_manual:
         materializar_proyecto(
@@ -158,10 +173,13 @@ def generar_documentacion(
             estructura={README_MANUAL_FILENAME: readme_manual},
             limpiar_directorio=False,
         )
+        if is_demo_mode():
+            demo_progress.ok(f"{README_MANUAL_FILENAME}: OK")
 
     t_documentacion_fin = time.perf_counter()
 
-    logger.info("\n[PERFORMANCE]")
-    logger.info("- Clasificación: %.2fs", t_clasificacion_fin - t_clasificacion_inicio)
-    logger.info("- Generación libre: %.2fs", t_generacion_fin - t_generacion_inicio)
-    logger.info("- Documentación: %.2fs\n", t_documentacion_fin - t_documentacion_inicio)
+    if not is_demo_mode():
+        logger.info("\n[PERFORMANCE]")
+        logger.info("- Clasificación: %.2fs", t_clasificacion_fin - t_clasificacion_inicio)
+        logger.info("- Generación libre: %.2fs", t_generacion_fin - t_generacion_inicio)
+        logger.info("- Documentación: %.2fs\n", t_documentacion_fin - t_documentacion_inicio)

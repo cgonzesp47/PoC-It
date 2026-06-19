@@ -1,28 +1,93 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Final
 
-PYTHON_EXECUTABLE: Final[str] = "python"
-IMPORT_MAIN_CMD: Final[list[str]] = [PYTHON_EXECUTABLE, "-c", "import app.main; print('IMPORT_MAIN_OK')"]
+# IMPORTANTE:
+# No podemos depender del intérprete que ejecuta PoC-it, porque el proyecto generado debe
+# verificarse en un entorno hermético (otra máquina / runner limpio).
+#
+# Política:
+# - Si existe un venv del proyecto generado en `.poc_it/venv`, usamos SU python.
+# - Si no existe, hacemos fallback a sys.executable (comportamiento previo).
+PYTHON_EXECUTABLE: Final[str] = sys.executable
 
-# Smoke básico: importa app.main y ejecuta un request mínimo a /openapi.json.
-# Esto captura bugs típicos de wiring que NO aparecen en import-time (p.ej. usar métodos de instancia como estáticos,
-# Depends mal cableados, etc.).
-SMOKE_OPENAPI_CMD: Final[list[str]] = [
-    PYTHON_EXECUTABLE,
-    "-c",
-    "from fastapi.testclient import TestClient; import app.main; c=TestClient(app.main.app); r=c.get('/openapi.json'); print('SMOKE_OPENAPI_OK', r.status_code); assert r.status_code < 500",
-]
+
+def _venv_python(project_dir: str) -> str:
+    """Devuelve el python a usar para verificar el proyecto generado.
+
+    Preferimos el venv local del proyecto (si existe) para asegurar que están instaladas
+    las dependencias declaradas en requirements.txt, evitando falsos negativos como:
+    `ModuleNotFoundError: No module named 'fastapi'`.
+    """
+    try:
+        venv_py = Path(project_dir) / ".poc_it" / "venv" / "Scripts" / "python.exe"  # Windows
+        if venv_py.exists():
+            return str(venv_py)
+        venv_py2 = Path(project_dir) / ".poc_it" / "venv" / "bin" / "python"  # Linux/macOS
+        if venv_py2.exists():
+            return str(venv_py2)
+    except Exception:
+        pass
+    return PYTHON_EXECUTABLE
+
+
+def _cmd_import_main(project_dir: str) -> list[str]:
+    # IMPORTANTE: el script se ejecuta con cwd=project_dir, así que la ruta debe ser RELATIVA.
+    # Si usamos absoluta aquí, en Windows se ha observado duplicación de segmentos al invocar python.
+    return [_venv_python(project_dir), r".poc_it\_poc_it_runtime_import_main.py"]
+
+
+def _cmd_smoke_openapi(project_dir: str) -> list[str]:
+    # Igual que arriba: ruta relativa al cwd del subprocess.
+    return [_venv_python(project_dir), r".poc_it\_poc_it_runtime_smoke_openapi.py"]
 
 _MISSING_MODULE_RE: Final[re.Pattern[str]] = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
 _REQUIREMENTS_PKG_RE: Final[re.Pattern[str]] = re.compile(r"^([a-zA-Z0-9_.-]+)")
 
 
 def _run_cmd(cmd: list[str], *, cwd: str) -> tuple[bool, str]:
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    # Al ejecutar scripts desde `.poc_it/`, Python pone ese directorio en sys.path[0].
+    # Si no forzamos PYTHONPATH, `import app.main` puede fallar con:
+    #   ModuleNotFoundError: No module named 'app'
+    # porque el root del proyecto (cwd) no siempre se inyecta en sys.path.
+    #
+    # Solución: inyectar el project root como PYTHONPATH de forma explícita.
+    env = dict(os.environ)
+    current_pp = env.get("PYTHONPATH", "")
+    # En Windows, PYTHONPATH necesita rutas absolutas para que el import sea robusto.
+    # Usar cwd tal cual (relativo) no funciona cuando el proceso se lanza desde otro directorio.
+    abs_cwd = str(Path(cwd).resolve())
+    env["PYTHONPATH"] = (abs_cwd + (os.pathsep + current_pp if current_pp else "")).strip()
+
+    # IMPORTANT: pasar solo el basename del script cuando ya usamos cwd=project_dir.
+    # Si pasamos un path absoluto o relativo con prefijo project_dir, Python puede intentar
+    # resolverlo como <cwd>/<path>, duplicando segmentos (observado en Windows):
+    #   ...\\output\\<poc>\\output\\<poc>\\.poc_it\\_poc_it_runtime_import_main.py
+    normalized_cmd = list(cmd)
+    try:
+        if len(normalized_cmd) >= 2 and isinstance(normalized_cmd[1], str):
+            script = normalized_cmd[1]
+            # si es un path y está dentro del cwd, reducimos a ruta relativa POSIX-safe
+            try:
+                script_path = Path(script)
+                cwd_path = Path(cwd)
+                if script_path.is_absolute():
+                    try:
+                        script_rel = script_path.relative_to(cwd_path)
+                        normalized_cmd[1] = str(script_rel)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        normalized_cmd = cmd
+
+    p = subprocess.run(normalized_cmd, cwd=cwd, capture_output=True, text=True, env=env)
     if p.returncode == 0:
         return True, (p.stdout or "").strip() or "OK"
 
@@ -103,6 +168,38 @@ def _extract_endpoint_modules_from_spec(spec: dict | None) -> list[str]:
     return out
 
 
+def _ensure_probe_scripts(project_dir: str) -> None:
+    """
+    Crea/actualiza scripts de probe runtime dentro del proyecto generado.
+
+    Importante:
+    - Evitamos `python -c` porque el quoting puede romperse (especialmente en Windows + PowerShell/VSCode wrappers),
+      causando falsos negativos.
+    - Estos scripts se ejecutan con el python del venv del proyecto generado (si existe).
+    - Se escriben bajo `.poc_it/` para no contaminar el proyecto publicado.
+    """
+    p = Path(project_dir)
+    probe_dir = p / ".poc_it"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+
+    (probe_dir / "_poc_it_runtime_import_main.py").write_text(
+        "import app.main\nprint('IMPORT_MAIN_OK')\n",
+        encoding="utf-8",
+        errors="ignore",
+    )
+
+    (probe_dir / "_poc_it_runtime_smoke_openapi.py").write_text(
+        "from fastapi.testclient import TestClient\n"
+        "import app.main\n"
+        "c = TestClient(app.main.app)\n"
+        "r = c.get('/openapi.json')\n"
+        "print('SMOKE_OPENAPI_OK', r.status_code)\n"
+        "assert r.status_code < 500\n",
+        encoding="utf-8",
+        errors="ignore",
+    )
+
+
 def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -> tuple[bool, str]:
     """
     Verificación runtime mínima (genérica) para proyectos FastAPI generados.
@@ -117,7 +214,9 @@ def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -
     - No valida integraciones externas (Drive, DB, etc.). Solo valida "arranque/import-time".
     - Devuelve detalles ricos (stdout/stderr + hints) para repair loop.
     """
-    ok_main, out_main = _run_cmd(IMPORT_MAIN_CMD, cwd=project_dir)
+    _ensure_probe_scripts(project_dir)
+
+    ok_main, out_main = _run_cmd(_cmd_import_main(project_dir), cwd=project_dir)
     if not ok_main:
         missing = _extract_missing_module(out_main)
         if missing:
@@ -149,7 +248,16 @@ def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -
     if endpoint_modules:
         # importamos todos en un solo intérprete para obtener un único traceback accionable
         imports = "; ".join(f"import {m}" for m in endpoint_modules)
-        cmd = [PYTHON_EXECUTABLE, "-c", f"import app.main; {imports}; print('IMPORT_ENDPOINTS_OK')"]
+        # Igual que arriba: evitamos -c, generando un script temporal.
+        p = Path(project_dir) / ".poc_it" / "_poc_it_runtime_import_endpoints.py"
+        p.write_text(
+            "import app.main\n"
+            + "\n".join(f"import {m}" for m in endpoint_modules)
+            + "\nprint('IMPORT_ENDPOINTS_OK')\n",
+            encoding="utf-8",
+            errors="ignore",
+        )
+        cmd = [_venv_python(project_dir), r".poc_it\_poc_it_runtime_import_endpoints.py"]
         ok_eps, out_eps = _run_cmd(cmd, cwd=project_dir)
         if not ok_eps:
             missing = _extract_missing_module(out_eps)
@@ -175,7 +283,7 @@ def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -
             return False, f"[runtime_verify] endpoints modules import failed:\nModules={endpoint_modules}\n{out_eps}\n{hint}"
 
     # Smoke runtime adicional: /openapi.json con TestClient.
-    ok_smoke, out_smoke = _run_cmd(SMOKE_OPENAPI_CMD, cwd=project_dir)
+    ok_smoke, out_smoke = _run_cmd(_cmd_smoke_openapi(project_dir), cwd=project_dir)
     if not ok_smoke:
         hint = (
             "HINTS:\n"

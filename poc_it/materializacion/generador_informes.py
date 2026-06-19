@@ -14,9 +14,9 @@ from __future__ import annotations
 from typing import List, Dict, Any, Optional
 import re
 
-from poc_it.llm_client import chat_completion_text
+from poc_it.infraestructura.llm_client import chat_completion_text
 from poc_it.orquestacion.render_estimacion import generar_bloque_estimacion_markdown
-from poc_it.poc_facts_extractor import extract_poc_facts_from_structure
+from poc_it.materializacion.poc_facts_extractor import extract_poc_facts_from_structure
 
 
 # Modelo gestionado centralmente por llm_client

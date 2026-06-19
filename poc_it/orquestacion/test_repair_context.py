@@ -27,7 +27,7 @@ import json
 import re
 from typing import Dict, List, Optional, Set
 
-from poc_it.runtime_contracts import RUNTIME_CONTRACTS_PATH
+from poc_it.runtime.runtime_contracts import RUNTIME_CONTRACTS_PATH
 
 TEST_REPAIR_CONTEXT_PATH = ".poc_it/test_repair_context.json"
 
