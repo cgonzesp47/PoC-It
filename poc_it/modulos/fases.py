@@ -6,8 +6,8 @@ Delegar en el modelo la clasificación del estado real del usuario.
 """
 
 from enum import Enum
-from poc_it.models import PlantillaUsuario
-from poc_it.llm_client import chat_completion_json
+from poc_it.modulos.models import PlantillaUsuario
+from poc_it.infraestructura.llm_client import chat_completion_json
 
 
 class FaseProyecto(str, Enum):

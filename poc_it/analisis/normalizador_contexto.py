@@ -18,8 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any
 
-from poc_it.llm_client import chat_completion_json
-from poc_it.models import PlantillaUsuario
+from poc_it.infraestructura.llm_client import chat_completion_json
+from poc_it.modulos.models import PlantillaUsuario
 
 
 PROMPT_NORMALIZACION = """

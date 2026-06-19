@@ -26,7 +26,9 @@ class ContratoAPIRequest(BaseModel):
 
 
 class ContratoAPIResponse(BaseModel):
-    json_example: Dict[str, Any] = Field(default_factory=dict)
+    # En algunos endpoints (p.ej. listados) el ejemplo de respuesta es un array JSON.
+    # Debemos aceptarlo para que la normalización sea robusta ante PoCs arbitrarias.
+    json_example: Dict[str, Any] | List[Any] = Field(default_factory=dict)
     evidence: str = ""
 
 
@@ -69,6 +71,9 @@ class ResultadoViabilidad:
     modo: ModoGeneracion
     arquitectura: str
     opciones: list[str]
+    contexto_proyecto: "ProjectContext"
+    t_clasificacion_inicio: float | None = None
+    t_clasificacion_fin: float | None = None
 
 
 class Decision(BaseModel):

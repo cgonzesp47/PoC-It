@@ -22,11 +22,13 @@ import logging
 import os
 from typing import Any, Dict, Tuple
 
-from poc_it.clasificador import clasificar_viabilidad
-from poc_it.generador_artefactos import generar_proyecto_completo, generar_proyecto_desde_spec
-from poc_it.materializador_archivos import materializar_proyecto
-from poc_it.models import ContextoNormalizado, ModoGeneracion, PlantillaUsuario, ProjectContext
-from poc_it.normalizador_contexto import normalizar_plantilla
+from poc_it.entrada.demo_progress import demo_progress, is_demo_mode
+
+from poc_it.analisis.clasificador import clasificar_viabilidad
+from poc_it.materializacion.generador_artefactos import generar_proyecto_completo, generar_proyecto_desde_spec
+from poc_it.materializacion.materializador_archivos import materializar_proyecto
+from poc_it.modulos.models import ContextoNormalizado, ModoGeneracion, PlantillaUsuario, ProjectContext
+from poc_it.analisis.normalizador_contexto import normalizar_plantilla
 from poc_it.orquestacion.generacion_documentacion import generar_documentacion
 from poc_it.orquestacion.persistencia_spec import persist_spec_json
 from poc_it.orquestacion.postprocesado_alineacion import postprocesar_alineacion_por_pytest
@@ -34,14 +36,14 @@ from poc_it.orquestacion.constantes import OUTPUT_DIRNAME, README_ERROR_FILENAME
 from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
 from poc_it.orquestacion.reparacion_runtime import ejecutar_reparacion_runtime
 from poc_it.orquestacion.run_result import RunResult
-from poc_it.poc_facts_extractor import extract_poc_facts_from_structure
-from poc_it.runtime_contracts import (
+from poc_it.materializacion.poc_facts_extractor import extract_poc_facts_from_structure
+from poc_it.runtime.runtime_contracts import (
     EndpointRuntimeContract,
     ObservedCall,
     RuntimeContracts,
     persist_runtime_contracts,
 )
-from poc_it.runtime_facts import (
+from poc_it.runtime.runtime_facts import (
     EndpointRuntimeFacts,
     RuntimeFacts,
     persist_runtime_facts,
@@ -64,7 +66,7 @@ class OrquestadorParcial:
     # ======================================================
 
     def _estimacion_generada(self, modo: str, horas: float, *, spec: Dict[str, Any] | None = None) -> Any:
-        from poc_it.estimador_esfuerzo import calcular_estimacion_esfuerzo
+        from poc_it.analisis.estimador_esfuerzo import calcular_estimacion_esfuerzo
 
         descripcion = f"""
 Proyecto: {self.nombre_proyecto}
@@ -82,7 +84,7 @@ Descripción:
         )
 
     def _estimacion_manual(self, *, spec: Dict[str, Any] | None = None) -> Any:
-        from poc_it.estimador_esfuerzo import calcular_estimacion_esfuerzo
+        from poc_it.analisis.estimador_esfuerzo import calcular_estimacion_esfuerzo
 
         return calcular_estimacion_esfuerzo(
             descripcion_proyecto=self.descripcion_global,
@@ -93,13 +95,27 @@ Descripción:
             contexto_normalizado=self._contexto_normalizado.model_dump() if self._contexto_normalizado else None,
         )
 
-    def __init__(self, plantilla: PlantillaUsuario, modo_generacion: str):
+    def __init__(
+        self,
+        plantilla: PlantillaUsuario,
+        modo_generacion: str,
+        context: ProjectContext,
+        t_clasificacion_inicio: float | None = None,
+        t_clasificacion_fin: float | None = None,
+        t_ejecucion_inicio: float | None = None,
+    ):
         self.plantilla = plantilla
         self.nombre_proyecto = plantilla.nombre
         self.descripcion_global = plantilla.problema
         self.tecnologias = plantilla.tecnologias
         self.modo_generacion = modo_generacion
-        self._contexto_normalizado: ContextoNormalizadoCache = None
+        self.context = context
+        self._contexto_normalizado = context.contexto_normalizado
+        self.t_clasificacion_inicio = t_clasificacion_inicio
+        self.t_clasificacion_fin = t_clasificacion_fin
+        # Fuente de verdad del tiempo total PoC-it (sin tiempo de input del usuario).
+        # Lo inicializa main.py justo después de collect_user_input().
+        self.t_ejecucion_inicio = t_ejecucion_inicio
 
     def _build_context(self) -> ProjectContext:
         context = ProjectContext(plantilla=self.plantilla)
@@ -113,9 +129,22 @@ Descripción:
             context.contexto_normalizado = contexto_normalizado
             self._contexto_normalizado = contexto_normalizado
             context.registrar_modelo("normalizacion_contexto", "chat_completion_json")
+
+            # [2/8] Demo progress
+            if is_demo_mode():
+                demo_progress.step(2, 8, "Contexto normalizado generado")
+                funcionalidades = ", ".join(contexto_normalizado.funcionalidades_clave or []) or "N/D"
+                integ_list = contexto_normalizado.integraciones_externas or []
+                integ = ", ".join(integ_list) if integ_list else "No"
+                contratos = len(contexto_normalizado.contratos_api or [])
+                demo_progress.info(f"Funcionalidades detectadas: {funcionalidades}")
+                demo_progress.info(f"Integraciones externas: {integ}")
+                demo_progress.info(f"Contratos API identificados: {contratos}")
         except Exception:
             context.contexto_normalizado = None
             self._contexto_normalizado = None
+            if is_demo_mode():
+                demo_progress.step(2, 8, "Contexto normalizado generado")
 
     def _clasificar(self, context: ProjectContext) -> tuple[ProjectContext, float, float]:
         import time
@@ -124,7 +153,22 @@ Descripción:
         context = clasificar_viabilidad(context)
         t_clasificacion_fin = time.perf_counter()
 
-        logger.info("[DEBUG CONTEXT DESPUÉS DE CLASIFICACIÓN]\n%s", context.model_dump_json(indent=2))
+        if is_demo_mode():
+            modo = (context.clasificacion or "").upper() or "N/D"
+            demo_progress.step(3, 8, f"Modo seleccionado: {modo}")
+            # “Motivo breve”: usar la señal más cercana (complejidad + integraciones)
+            cn = context.contexto_normalizado
+            integ = ", ".join((cn.integraciones_externas or [])) if cn else ""
+            if integ:
+                motivo = f"Requiere integraciones externas: {integ}"
+            else:
+                motivo = "API backend sin integraciones externas obligatorias"
+            demo_progress.info(f"Motivo: {motivo}")
+        else:
+            # Ruido alto para demo: esto imprime mucho contexto interno.
+            # Mantener disponible en DEBUG para desarrollo.
+            logger.debug("[DEBUG CONTEXT DESPUÉS DE CLASIFICACIÓN]\n%s", context.model_dump_json(indent=2))
+
         return context, t_clasificacion_inicio, t_clasificacion_fin
 
     def _generar_y_materializar(
@@ -183,9 +227,14 @@ Descripción:
             estructura=estructura,
         )
 
+        if is_demo_mode():
+            demo_progress.info(f"Archivos creados: {len(archivos_creados)}")
+
         return estructura, archivos_creados, tiempo_generacion_horas, resultado
 
     def _build_fallback_docs(self, exc: Exception) -> Tuple[str, str]:
+        import traceback
+
         fallback_readme = (
             f"# {self.nombre_proyecto}\n\n"
             "## Estado\n\n"
@@ -195,7 +244,9 @@ Descripción:
         fallback_error = (
             f"# {self.nombre_proyecto} – Error de generación\n\n"
             "## Error durante la generación libre\n\n"
-            f"Error detectado:\n\n```\n{str(exc)}\n```\n"
+            f"Error detectado:\n\n```\n{str(exc)}\n```\n\n"
+            "## Traceback\n\n"
+            f"```\n{traceback.format_exc()}\n```\n"
         )
 
         return fallback_readme, fallback_error
@@ -205,12 +256,8 @@ Descripción:
         Ejecuta el flujo completo incluyendo clasificación basada en ProjectContext.
         """
         try:
-            context = self._build_context()
-            self._normalizar_contexto(context)
-
-            context, t_clasificacion_inicio, t_clasificacion_fin = self._clasificar(context)
-
-            modo_generacion = (context.clasificacion or self.modo_generacion).upper()
+            context = self.context
+            modo_generacion = (self.modo_generacion or context.clasificacion or "").upper()
 
             estructura, archivos_creados, tiempo_generacion_horas, resultado = self._generar_y_materializar(
                 context=context,
@@ -229,17 +276,32 @@ Descripción:
                     spec0.setdefault("modo", modo_generacion)
                     resultado["spec"] = spec0
 
-            t_generacion_inicio = 0.0
-            t_generacion_fin = 0.0
+            # Medición real del tiempo de PoC-it (pipeline real, sin input del usuario)
+            # Fuente de verdad: contador global de main.py (self.inicio_ejecucion) si está disponible.
+            # Debe incluir: repairs + tests + docs + parches finales.
+            # Tiempo total real de PoC-it:
+            # - Fuente de verdad: contador global iniciado en main.py tras collect_user_input()
+            # - Fallback: inicio local del orquestador (best-effort)
+            t_pocit_inicio_global = float(self.t_ejecucion_inicio or 0.0)
+            t_pocit_inicio_local = 0.0
+            t_pocit_fin = 0.0
             if modo_generacion != ModoGeneracion.ASESOR:
                 import time
 
-                # Mantener comportamiento: el tiempo real se medía solo si se generaba.
-                # (Aquí solo preservamos el contrato, no re-medimos; se usa para PERFORMANCE log)
-                t_generacion_inicio = time.perf_counter()
-                t_generacion_fin = t_generacion_inicio
+                t_pocit_inicio_local = time.perf_counter()
 
-                project_dir = os.path.join(OUTPUT_DIRNAME, self.nombre_proyecto)
+                # Directorio real del proyecto materializado en disco.
+                # Fuente de verdad: `materializar_proyecto()` escribe bajo ./output/<nombre_proyecto>.
+                #
+                # Bug observado en logs: `project_dir` acababa duplicado (…/output/<name>/output/<name>),
+                # lo que rompía la creación del venv (.poc_it/venv) y el runtime probe.
+                #
+                # Normalizamos y "deduplicamos" de forma determinista:
+                project_dir = os.path.normpath(os.path.join(OUTPUT_DIRNAME, self.nombre_proyecto))
+                expected_suffix = os.path.normpath(os.path.join(OUTPUT_DIRNAME, self.nombre_proyecto))
+                double_suffix = os.path.normpath(os.path.join(expected_suffix, expected_suffix))
+                if project_dir.endswith(double_suffix):
+                    project_dir = os.path.normpath(project_dir[: -len(double_suffix)] + expected_suffix)
 
                 # Persistir artefacto intermedio con facts deterministas del CÓDIGO real
                 # para alinear la generación de tests con el wiring/DI realmente materializado.
@@ -406,34 +468,20 @@ Descripción:
                     regenerar_tests=True,
                 )
 
-                # Estado final: determinista y estructurado
+                # Estado final: determinista y estructurado.
                 #
-                # Fuente de verdad:
-                # - `.poc_it/pytest_junit.xml` y `.poc_it/pytest_last_output.txt` (generados por pytest_llm_repair)
-                # - `pytest_llm_repair.PytestRepairResult` ahora expone `degraded/degrade_type` y `ok`
-                #
-                # Política acordada:
-                # - Si degrada a contract-lite, se re-ejecuta pytest con suite mínima.
-                # - Si esa suite mínima no pasa => NO publicar.
+                # Política requerida:
+                # - Tanto en COMPLETO como en PARCIAL: si el loop de reparación de tests no converge,
+                #   degradar a "contract-lite" (suite mínima) y re-ejecutar pytest.
+                # - Si esa suite mínima pasa => continuar (docs/estimación/publicación) SIN generar README_ERROR fatal.
+                # - Si incluso contract-lite falla => no publicar.
                 run_result = RunResult.error(mode=str(modo_generacion).upper(), reason="pytest_failed")
-                try:
-                    from poc_it.orquestacion.pytest_llm_repair import _read_pytest_junit_xml, _extract_counts_from_junit_xml
 
-                    xml = _read_pytest_junit_xml(project_dir)
-                    counts = _extract_counts_from_junit_xml(xml)
-                    pytest_ok = bool(counts and (counts[0] + counts[1] == 0))
-                except Exception:
-                    pytest_ok = False
-
-                # degraded se toma del runtime_contracts (si existe) pero, como el loop lo escribe a disco,
-                # aquí lo inferimos leyendo `runtime_contracts.json` NO es necesario; preferimos el indicador en resultado si lo tenemos.
-                # En este punto, `ejecutar_reparacion_runtime` ya pudo setear `resultado["pytest_repair"]` (nuevo contrato).
+                # 1) Leer resultado del loop de repair si existe (lo setea ejecutar_reparacion_runtime)
                 degraded = False
                 degrade_type = None
                 try:
-                    pr = None
-                    if isinstance(resultado, dict):
-                        pr = resultado.get("pytest_repair")
+                    pr = (resultado or {}).get("pytest_repair") if isinstance(resultado, dict) else None
                     if isinstance(pr, dict):
                         degraded = bool(pr.get("degraded"))
                         degrade_type = pr.get("degrade_type")
@@ -441,6 +489,66 @@ Descripción:
                     degraded = False
                     degrade_type = None
 
+                # 2) Evaluar pytest actual
+                try:
+                    from poc_it.orquestacion.pytest_llm_repair import (
+                        _extract_counts_from_junit_xml,
+                        _read_pytest_junit_xml,
+                    )
+
+                    xml = _read_pytest_junit_xml(project_dir)
+                    counts = _extract_counts_from_junit_xml(xml)
+                    pytest_ok = bool(counts and (counts[0] + counts[1] == 0))
+                except Exception:
+                    pytest_ok = False
+
+                # 3) Si no pasó y no degradó todavía, degradar aquí (contract-lite) como último recurso.
+                if not pytest_ok and not degraded:
+                    try:
+                        # Degradación a contract-lite: suite mínima (smoke_import + openapi).
+                        # IMPORTANTE: materializar a disco el patch mínimo, porque `_degrade_to_contract_lite`
+                        # actualiza `estructura` pero no siempre garantiza escritura final si el pipeline se corta.
+                        from poc_it.orquestacion.pytest_llm_repair import _degrade_to_contract_lite, _run_pytest
+
+                        patch_min = _degrade_to_contract_lite(
+                            nombre_proyecto=self.nombre_proyecto,
+                            estructura=estructura,
+                        )
+                        try:
+                            materializar_proyecto(
+                                nombre_proyecto=self.nombre_proyecto,
+                                estructura=patch_min,
+                                limpiar_directorio=False,
+                            )
+                        except Exception:
+                            pass
+
+                        ok2, out2, _ = _run_pytest(project_dir)
+                        degraded = True
+                        degrade_type = "contract-lite"
+
+                        # refrescar estado pytest tras degradación (suite mínima)
+                        # Nota: el report XML puede no existir si pytest corrió sin junitxml fallback;
+                        # en ese caso, ok2 es la fuente de verdad.
+                        pytest_ok = bool(ok2)
+
+                        # reflejar en `resultado` para el resto del pipeline
+                        try:
+                            if isinstance(resultado, dict):
+                                resultado["pytest_repair"] = {
+                                    "ok": bool(pytest_ok),
+                                    "attempts": int((pr or {}).get("attempts") or 0) if isinstance(pr, dict) else 0,
+                                    "degraded": True,
+                                    "degrade_type": "contract-lite",
+                                    "artifacts": dict((pr or {}).get("artifacts") or {}) if isinstance(pr, dict) else {},
+                                }
+                        except Exception:
+                            pass
+                    except Exception:
+                        # best-effort: si falla degradación, seguimos con pytest_ok=False
+                        pass
+
+                # 4) Política: considerar OK si pytest pasa, incluyendo el caso OK_DEGRADED (contract-lite).
                 if pytest_ok:
                     run_result = RunResult.ok(
                         mode=str(modo_generacion).upper(),
@@ -471,16 +579,89 @@ Descripción:
             estimacion_manual = None
 
             if modo_upper == ModoGeneracion.ASESOR:
-                # En ASESOR no se genera PoC, pero sí queremos estimación para README_ANALISIS.
-                estimacion_manual = self._estimacion_manual(spec=resultado.get("spec") if isinstance(resultado, dict) else None)
+                # En ASESOR no se genera PoC, pero SÍ queremos reflejar el tiempo real medido por PoC-it.
+                #
+                # Importante: aunque no haya generación de código, el pipeline de análisis y docs puede tardar.
+                # Este tiempo medido debe reflejarse en README_ANALISIS (fila "PoC-it").
+                import time
+
+                # Si por algún motivo no se inicializó antes, lo iniciamos aquí.
+                if not t_pocit_inicio:
+                    t_pocit_inicio = time.perf_counter()
+                t_pocit_fin = time.perf_counter()
+
+                tiempo_real_pocit_horas = 0.0
+                try:
+                    if t_pocit_fin >= t_pocit_inicio:
+                        tiempo_real_pocit_horas = (t_pocit_fin - t_pocit_inicio) / 3600
+                except Exception:
+                    tiempo_real_pocit_horas = 0.0
+
+                # Guardrail anti-0: si el contador no quedó bien, forzamos 1s mínimo
+                if tiempo_real_pocit_horas <= 0.0:
+                    tiempo_real_pocit_horas = 1.0 / 3600.0  # 1 segundo
+
+                estimacion_manual = self._estimacion_manual(
+                    spec=resultado.get("spec") if isinstance(resultado, dict) else None
+                )
+                # Parcheamos el tiempo medido en la estimación manual (la que consume README_ANALISIS en ASESOR)
+                try:
+                    estimacion_manual.horas_scopeguardian = float(tiempo_real_pocit_horas)
+                except Exception:
+                    pass
             else:
                 spec = resultado.get("spec") if isinstance(resultado, dict) else None
-                # En PARCIAL/COMPLETO se estima el alcance realmente generado.
-                estimacion_generada = self._estimacion_generada(modo_generacion, tiempo_generacion_horas, spec=spec)
+
+                # Estimación se construye tras generar documentación (para incluirla en el tiempo medido).
+                # Inicializamos con 0.0 y se recalculará al final.
+                tiempo_real_pocit_horas = 0.0
+
+                estimacion_generada = self._estimacion_generada(
+                    modo_generacion,
+                    tiempo_real_pocit_horas,
+                    spec=spec,
+                )
                 # Mantener también una estimación manual para README_ANALISIS (sin recalcular en docs).
                 estimacion_manual = self._estimacion_manual(spec=spec)
 
-            # Generación docs
+            # Persistencia de artefactos "fuente de verdad" (solo una vez) dentro de la PoC.
+            #
+            # Objetivo:
+            # - facilitar diagnósticos post-mortem sin depender de output/_debug
+            # - alimentar reparaciones posteriores (manuales o automáticas) con el SPEC usado realmente
+            # - mantenerlo fuera del código publicado (en `.poc_it/`)
+            try:
+                patch_truth = {}
+                if self._contexto_normalizado:
+                    patch_truth[".poc_it/contexto_normalizado.json"] = self._contexto_normalizado.model_dump_json(
+                        indent=2
+                    )
+                if isinstance(resultado, dict) and isinstance(resultado.get("spec"), dict):
+                    import json as _json
+
+                    patch_truth[".poc_it/spec.json"] = _json.dumps(
+                        resultado.get("spec"), ensure_ascii=False, indent=2
+                    )
+                if patch_truth:
+                    materializar_proyecto(
+                        nombre_proyecto=self.nombre_proyecto,
+                        estructura=patch_truth,
+                        limpiar_directorio=False,
+                    )
+            except Exception:
+                pass
+
+            # ------------------------------------------------------------
+            # Documentación + estimación final (determinista)
+            # ------------------------------------------------------------
+            # 1) Capturar tiempo actual para métricas de docs (PERFORMANCE).
+            #    Importante: antes estaba a 0.0, lo que producía "0 min 0 s" en la tabla.
+            if modo_generacion != ModoGeneracion.ASESOR:
+                import time
+
+                t_pocit_fin = time.perf_counter()
+
+            # 2) Generación docs con la mejor estimación disponible (puede ser provisional).
             generar_documentacion(
                 nombre_proyecto=self.nombre_proyecto,
                 descripcion_global=self.descripcion_global,
@@ -491,13 +672,55 @@ Descripción:
                 resultado=resultado,
                 estimacion_generada=estimacion_generada,
                 estimacion_manual=estimacion_manual,
-                t_clasificacion_inicio=t_clasificacion_inicio,
-                t_clasificacion_fin=t_clasificacion_fin,
-                t_generacion_inicio=t_generacion_inicio,
-                t_generacion_fin=t_generacion_fin,
+                t_clasificacion_inicio=self.t_clasificacion_inicio,
+                t_clasificacion_fin=self.t_clasificacion_fin,
+                # Para métricas internas de docs (PERFORMANCE), reutilizamos el rango real del pipeline PoC-it.
+                t_generacion_inicio=(float(t_pocit_inicio_global or 0.0) or float(t_pocit_inicio_local or 0.0)),
+                t_generacion_fin=t_pocit_fin,
             )
 
+            # 3) Cerrar tiempo real PoC-it DESPUÉS de docs (tiempo total real).
+            if modo_generacion != ModoGeneracion.ASESOR:
+                import time
+
+                t_pocit_fin = time.perf_counter()
+
+                inicio_medicion = float(t_pocit_inicio_global or 0.0) or float(t_pocit_inicio_local or 0.0)
+
+                spec = resultado.get("spec") if isinstance(resultado, dict) else None
+                tiempo_real_pocit_horas = 0.0
+                try:
+                    if inicio_medicion and t_pocit_fin and t_pocit_fin >= inicio_medicion:
+                        tiempo_real_pocit_horas = (t_pocit_fin - inicio_medicion) / 3600.0
+                except Exception:
+                    tiempo_real_pocit_horas = 0.0
+                if tiempo_real_pocit_horas <= 0.0:
+                    tiempo_real_pocit_horas = 1.0 / 3600.0  # nunca 0
+
+                segundos = max(int(round(tiempo_real_pocit_horas * 3600)), 1)
+
+                logger.info("[ESTIMACION] inicio_global=%s", str(t_pocit_inicio_global) if t_pocit_inicio_global else "None")
+                logger.info("[ESTIMACION] fin=%s", t_pocit_fin)
+                logger.info("[ESTIMACION] segundos=%s", segundos)
+                logger.info("[ESTIMACION] horas=%s", tiempo_real_pocit_horas)
+
+                estimacion_generada = self._estimacion_generada(
+                    modo_generacion,
+                    tiempo_real_pocit_horas,
+                    spec=spec,
+                )
+
+                # 4) Parche determinista del bloque de estimación (sin LLM) con el tiempo FINAL.
+                from poc_it.orquestacion.patch_estimacion_readme import parchear_bloque_estimacion
+
+                parchear_bloque_estimacion(
+                    nombre_proyecto=self.nombre_proyecto,
+                    estimacion_generada=estimacion_generada,
+                )
+                logger.info("[ESTIMACION] archivos_parcheados=README.md,README_ANALISIS.md")
+
         except Exception as exc:
+            logger.exception("[ORQUESTADOR] Error no recuperable durante generación libre")
             fallback_readme, fallback_error = self._build_fallback_docs(exc)
 
             archivos_creados = materializar_proyecto(

@@ -24,8 +24,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from poc_it.llm_client import chat_completion_json
-from poc_it.poc_facts_extractor import extract_poc_facts_from_structure
+from poc_it.infraestructura.llm_client import chat_completion_json
+from poc_it.materializacion.poc_facts_extractor import extract_poc_facts_from_structure
 
 
 # ----------------------------

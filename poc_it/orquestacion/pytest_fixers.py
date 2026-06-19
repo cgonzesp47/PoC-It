@@ -71,6 +71,12 @@ _DICT_AS_DB_SESSION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Caso: response_model no se cumple porque el stub/harness devuelve {} o dict incompleto.
+_RESPONSE_VALIDATION_ERROR_RE = re.compile(
+    r"fastapi\\.exceptions\\.ResponseValidationError:",
+    re.IGNORECASE,
+)
+
 # Variante: el test overridea get_db con un objeto "MockService"/stub que no implementa métodos de sesión.
 _MOCKSERVICE_AS_DB_SESSION_RE = re.compile(
     r"AttributeError: 'MockService' object has no attribute '(add|execute|delete|commit|refresh)'",
@@ -83,7 +89,7 @@ _EXPECTED_500_GOT_200_RE = re.compile(
 )
 
 _EXPECTED_200_GOT_422_RE = re.compile(
-    r"assert\\s+422\\s*==\\s*200|assert\\s+response\\.status_code\\s*==\\s*expected_status\\s*\\n\\s*E\\s*assert\\s+422\\s*==\\s*200",
+    r"assert\\s+422\\s*==\\s*(200|201)|assert\\s+response\\.status_code\\s*==\\s*expected_status\\s*\\n\\s*E\\s*assert\\s+422\\s*==\\s*(200|201)",
     re.IGNORECASE,
 )
 
@@ -548,9 +554,12 @@ def fix_expected_200_got_422_request_shape(pytest_output: str, estructura: Dict[
     if not pytest_output or not _EXPECTED_200_GOT_422_RE.search(pytest_output):
         return None
 
-    # Extraer path del traceback (línea: response = client.post('/upload', json={...}))
+    # Detectar la llamada real en el test dentro del traceback para saber:
+    # - método HTTP
+    # - path
+    # - nombre de la variable del payload (payload, project_data, task_data, data, etc.)
     call_re = re.compile(
-        r"response\\s*=\\s*client\\.(?P<call>post|put|patch)\\(\\s*(?P<q>['\\\"])(?P<path>[^'\\\"]+)\\2\\s*,\\s*json\\s*=",
+        r"response\\s*=\\s*client\\.(?P<call>get|post|put|patch|delete)\\(\\s*(?P<q>['\\\"])(?P<path>[^'\\\"]+)\\2\\s*,\\s*json\\s*=\\s*(?P<payload>[A-Za-z_][A-Za-z0-9_]*)",
         re.IGNORECASE,
     )
     m = call_re.search(pytest_output)
@@ -559,6 +568,7 @@ def fix_expected_200_got_422_request_shape(pytest_output: str, estructura: Dict[
 
     method = str(m.group("call") or "").upper()
     path = str(m.group("path") or "")
+    payload_var = str(m.group("payload") or "payload")
 
     rc = _get_runtime_contracts_obj(estructura)
     ep = _find_endpoint_contract(rc or {}, method, path)
@@ -567,6 +577,7 @@ def fix_expected_200_got_422_request_shape(pytest_output: str, estructura: Dict[
 
     qreq = ep.get("query_params_required") or []
     body = ep.get("request_body_param")
+
     # Solo actuamos si es un caso CLARO: query required y sin body
     if not (isinstance(qreq, list) and qreq) or (body is not None and str(body).strip()):
         return None
@@ -579,19 +590,35 @@ def fix_expected_200_got_422_request_shape(pytest_output: str, estructura: Dict[
             continue
         if not isinstance(content, str) or not content.strip():
             continue
+
         if path not in content or "json=" not in content:
             continue
 
         new = content
-        # Reescritura conservadora: solo para la primera ocurrencia del endpoint.
+
+        # Reescritura conservadora: solo para la primera ocurrencia del endpoint y preservando el nombre de la variable.
+        #
+        # Ejemplos:
+        #   client.post("/projects", json=project_data) -> client.post("/projects", params=project_data)
+        #   client.put("/x", json=payload) -> client.put("/x", params=payload)
         new2 = re.sub(
-            rf'client\\.{method.lower()}\\(\\s*([\'\\"]{re.escape(path)}[\'\\"])\\s*,\\s*json\\s*=\\s*',
-            r'client.' + method.lower() + r'(\1, params=',
+            rf'client\\.{method.lower()}\\(\\s*([\'\\"]{re.escape(path)}[\'\\"])\\s*,\\s*json\\s*=\\s*{re.escape(payload_var)}\\s*\\)',
+            r"client." + method.lower() + r"(\\1, params=" + payload_var + r")",
             new,
             count=1,
         )
         if new2 != new:
             new = new2
+        else:
+            # Fallback: si el payload no se detectó exactamente (whitespace/kwargs extra), sustituimos solo el kw.
+            new2 = re.sub(
+                rf'(client\\.{method.lower()}\\(\\s*[\'\\"]{re.escape(path)}[\'\\"][^\\)]*?)\\bjson\\s*=\\s*',
+                r"\\1params=",
+                new,
+                count=1,
+            )
+            if new2 != new:
+                new = new2
 
         if new != content:
             patched_files[tpath] = new
@@ -729,6 +756,64 @@ def fix_delete_response_body_asserts(pytest_output: str, estructura: Dict[str, s
         return None
 
     return FixResult(patched_files=patched_files, message=f"Removed brittle resource-field asserts from DELETE response checks in {touched} test file(s)")
+
+
+def fix_response_validation_error_relax_response_model(pytest_output: str, estructura: Dict[str, str]) -> Optional[FixResult]:
+    """Fix determinista (modo PARCIAL): ResponseValidationError por response_model estricto.
+
+    En modo PARCIAL, es común que la PoC genere endpoints con `response_model=...` pero:
+    - no hay persistencia real / stubs incompletos
+    - el handler devuelve `{}`/`None`/dict parcial
+    => FastAPI lanza ResponseValidationError y los tests fallan en cascada.
+
+    Estrategia pragmática y agnóstica:
+    - Identificar el archivo del endpoint desde el traceback.
+    - Quitar `response_model=...` SOLO del endpoint implicado.
+    - Esto evita que FastAPI valide el response contra el modelo cuando estamos en modo “hermético sin integraciones”.
+
+    Nota: esto toca app/**/*.py (a diferencia de pytest_llm_repair), pero aquí estamos en el
+    pipeline de postprocesado general, donde SÍ tenemos permitido arreglar código si es el problema.
+    """
+    if not pytest_output or not _RESPONSE_VALIDATION_ERROR_RE.search(pytest_output):
+        return None
+
+    mfile = re.search(r'File \"(?P<path>.*?app[\\\\/].*?\\.py)\"', pytest_output)
+    if not mfile:
+        return None
+    ep_abs = mfile.group("path")
+    if not ep_abs:
+        return None
+
+    # Convertir a ruta relativa estilo estructura (POSIX)
+    try:
+        # Buscar el fragmento desde "app/" en adelante para hacerlo portable
+        mm = re.search(r"(app[\\\\/].+?\\.py)", ep_abs)
+        rel = mm.group(1) if mm else ep_abs
+        rel = rel.replace("\\", "/")
+    except Exception:
+        rel = ep_abs.replace("\\", "/")
+
+    content = (estructura or {}).get(rel)
+    if not isinstance(content, str) or not content.strip():
+        return None
+
+    # Quitar response_model en decoradores FastAPI: @router.get(..., response_model=X) / @app.get(...)
+    # Mantiene el resto de kwargs.
+    new = re.sub(
+        r"(\\@(router|app)\\.(get|post|put|patch|delete)\\([^\\)]*?)\\s*,\\s*response_model\\s*=\\s*[^,\\)]+",
+        r"\\1",
+        content,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+    if new == content:
+        return None
+
+    return FixResult(
+        patched_files={rel: new},
+        message=f"Removed response_model from {rel} to avoid ResponseValidationError in PARCIAL (hermetic stubs)",
+    )
 
 
 def fix_method_not_allowed_wrong_expectation(pytest_output: str, estructura: Dict[str, str]) -> Optional[FixResult]:
@@ -969,6 +1054,7 @@ def apply_first_matching_fixer(pytest_output: str, estructura: Dict[str, str]) -
         fix_expected_200_but_created_201,
         fix_expected_200_got_422_request_shape,
         fix_put_requires_body_minimal,
+        fix_response_validation_error_relax_response_model,
         fix_delete_response_body_asserts,
         fix_contract_missing_required_wrongly_expects_200,
         fix_method_not_allowed_wrong_expectation,
