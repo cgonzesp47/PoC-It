@@ -75,8 +75,8 @@ from poc_it.generador.validators import (
     validar_paths_generados as _validar_paths_generados,
     validar_proyecto as _validar_proyecto,
 )
-from poc_it.demo_progress import demo_progress, is_demo_mode
-from poc_it.llm_client import chat_completion_json, solicitarJSONEstructurado
+from poc_it.entrada.demo_progress import demo_progress, is_demo_mode
+from poc_it.infraestructura.llm_client import chat_completion_json, solicitarJSONEstructurado
 
 
 # ==========================================================

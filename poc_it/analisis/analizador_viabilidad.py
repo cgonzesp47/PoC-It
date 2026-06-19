@@ -16,18 +16,18 @@ Diseñado específicamente para LLM local 7B.
 
 from __future__ import annotations
 
-from poc_it.models import (
-    PlantillaUsuario,
-    ResultadoViabilidad,
-    ProjectContext,
+from poc_it.analisis.clasificador import clasificar_viabilidad
+from poc_it.analisis.normalizador_contexto import normalizar_plantilla
+from poc_it.modulos.arquitectura import generar_arquitectura
+from poc_it.modulos.fases import FaseProyecto, detectar_fase
+from poc_it.modulos.models import (
     ContextoNormalizado,
     ModoGeneracion,
+    PlantillaUsuario,
+    ProjectContext,
+    ResultadoViabilidad,
 )
-from poc_it.normalizador_contexto import normalizar_plantilla
-from poc_it.clasificador import clasificar_viabilidad
-from poc_it.opciones import generar_opciones
-from poc_it.arquitectura import generar_arquitectura
-from poc_it.fases import detectar_fase, FaseProyecto
+from poc_it.modulos.opciones import generar_opciones
 import time
 
 

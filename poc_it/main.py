@@ -16,11 +16,11 @@ import logging
 import os
 import time
 
-from poc_it.analizador_viabilidad import PlantillaUsuario, analizar_viabilidad
-from poc_it.demo_progress import demo_progress, is_demo_mode
-from poc_it.models import ModoGeneracion
-from poc_it.opciones import generar_opciones
-from poc_it.orquestador_parcial import OrquestadorParcial
+from poc_it.analisis.analizador_viabilidad import PlantillaUsuario, analizar_viabilidad
+from poc_it.entrada.demo_progress import demo_progress, is_demo_mode
+from poc_it.modulos.models import ModoGeneracion
+from poc_it.modulos.opciones import generar_opciones
+from poc_it.orquestacion.orquestador_parcial import OrquestadorParcial
 
 
 TEMPLATE_PROMPT = """
@@ -259,9 +259,9 @@ async def main() -> None:
                 tecnologias=user_data.tecnologias,
             )
 
-            from poc_it.generador_informes import generar_readme_asesor
-            from poc_it.materializador_archivos import materializar_proyecto
-            from poc_it.estimador_esfuerzo import calcular_estimacion_esfuerzo
+            from poc_it.materializacion.generador_informes import generar_readme_asesor
+            from poc_it.materializacion.materializador_archivos import materializar_proyecto
+            from poc_it.analisis.estimador_esfuerzo import calcular_estimacion_esfuerzo
 
             # En ASESOR también medimos el tiempo real del pipeline PoC-it (sin incluir input usuario).
             # Este valor debe reflejarse en la fila "PoC-it" de la tabla de estimación.

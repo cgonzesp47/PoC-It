@@ -33,6 +33,11 @@ class DemoProgress:
         self._emit(f"[{idx}/{total}] {title}")
 
     def info(self, msg: str) -> None:
+        # Evitar que se impriman líneas "vacías" que generan saltos de línea fantasma en demo.
+        if msg is None:
+            return
+        if isinstance(msg, str) and not msg.strip():
+            return
         self._emit(f"      {msg}")
 
     def ok(self, msg: str) -> None:

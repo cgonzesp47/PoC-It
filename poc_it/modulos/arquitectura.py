@@ -3,8 +3,8 @@ Módulo de diseño arquitectónico.
 Responsabilidad única: generar diseño estructural (sin código).
 """
 
-from poc_it.llm_client import chat_completion_text
-from poc_it.models import PlantillaUsuario
+from poc_it.infraestructura.llm_client import chat_completion_text
+from poc_it.modulos.models import PlantillaUsuario
 
 
 PROMPT_ARQUITECTURA = """

@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from poc_it.llm_client import chat_completion_json
+from poc_it.infraestructura.llm_client import chat_completion_json
 from poc_it.generador.json_utils import extraer_json_tolerante
 
 

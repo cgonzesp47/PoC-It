@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from poc_it.generador.json_utils import extraer_json_tolerante
-from poc_it.llm_client import chat_completion_json
+from poc_it.infraestructura.llm_client import chat_completion_json
 
 
 @dataclass(frozen=True)

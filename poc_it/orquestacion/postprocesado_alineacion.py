@@ -9,11 +9,11 @@ import subprocess
 from datetime import datetime
 from typing import Any, Dict
 
-from poc_it.materializador_archivos import materializar_proyecto
+from poc_it.materializacion.materializador_archivos import materializar_proyecto
 from poc_it.orquestacion.pytest_fixers import apply_first_matching_fixer
 from poc_it.orquestacion.tests_sanitizer import sanitize_tests
-from poc_it.postprocesador_alineacion import AlignmentIssue, postprocesar_alineacion_llm
-from poc_it.runtime_contracts import load_runtime_contracts_from_structure
+from poc_it.materializacion.postprocesador_alineacion import AlignmentIssue, postprocesar_alineacion_llm
+from poc_it.runtime.runtime_contracts import load_runtime_contracts_from_structure
 
 logger = logging.getLogger(__name__)
 

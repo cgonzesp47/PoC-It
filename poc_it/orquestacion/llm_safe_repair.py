@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from poc_it.generador.json_utils import extraer_json_tolerante
-from poc_it.llm_client import chat_completion_json
+from poc_it.infraestructura.llm_client import chat_completion_json
 
 # ============================================
 # LLM SAFE REPAIR (PIPELINE A - SUBSECTION)

@@ -8,12 +8,12 @@ from poc_it.generador_tests_unitarios_hermetic import (
     generar_tests_spec_no_parcial,
     generar_tests_unitarios_minimos,
 )
-from poc_it.materializador_archivos import materializar_proyecto
+from poc_it.materializacion.materializador_archivos import materializar_proyecto
 from poc_it.orquestacion.contract_test_renderer import render_tests_from_test_plan
 from poc_it.orquestacion.stub_gen_llm import generate_conftest_with_llm
 from poc_it.orquestacion.test_plan import build_test_plan, persist_test_plan
 from poc_it.orquestacion.tests_harness import render_conftest_py
-from poc_it.runtime_contracts import RUNTIME_CONTRACTS_PATH
+from poc_it.runtime.runtime_contracts import RUNTIME_CONTRACTS_PATH
 
 logger = logging.getLogger(__name__)
 

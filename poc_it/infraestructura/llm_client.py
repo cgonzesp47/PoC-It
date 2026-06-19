@@ -21,8 +21,8 @@ from typing import Any, Dict, List, Optional
 import requests
 from dotenv import load_dotenv
 
-from poc_it.demo_progress import is_demo_mode
-from poc_it.rate_limiter import (
+from poc_it.entrada.demo_progress import is_demo_mode
+from poc_it.infraestructura.rate_limiter import (
     GLOBAL_BUCKET,
     exponential_backoff_sleep,
     handle_rate_limit_headers,
@@ -50,11 +50,16 @@ LITELLM_PROXY_KEY = os.getenv("LITELLM_PROXY_KEY")  # opcional (si proteges el p
 # Si quieres forzar que NUNCA se hagan llamadas directas a proveedores (solo proxy), activa:
 #   LITELLM_PROXY_ONLY=1
 #
-# A petición del proyecto: por defecto SIEMPRE usamos el proxy (API Park / LiteLLM Proxy).
-# Esto garantiza que el routing/fallback centralizado se aplique y evita llamadas directas a proveedores.
-# Por defecto: permitimos fallback manual como último recurso (tras fallo del proxy).
-# Si quremos que NUNCA se hagan llamadas directas, exporta LITELLM_PROXY_ONLY=1.
+# Si quieres hacer justo lo contrario (saltarte el proxy SIEMPRE y usar solo llamadas directas),
+# activa:
+#   LLM_DIRECT_ONLY=1
+#
+# Orden de precedencia:
+# - LLM_DIRECT_ONLY=1  => fuerza llamadas directas y desactiva proxy aunque LITELLM_PROXY_ONLY=1
+# - LITELLM_PROXY_ONLY=1 => fuerza proxy (sin fallbacks directos)
+# - Ninguno => proxy + fallbacks directos como último recurso
 LITELLM_PROXY_ONLY = os.getenv("LITELLM_PROXY_ONLY", "0").strip() in ("1", "true", "True", "yes", "YES")
+LLM_DIRECT_ONLY = os.getenv("LLM_DIRECT_ONLY", "0").strip() in ("1", "true", "True", "yes", "YES")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -151,6 +156,15 @@ SESSION_PROVIDER_DISABLED: Dict[str, bool] = {}
 # HELPERS PARA CADA PROVEEDOR
 # ==========================================================
 
+POCIT_INSECURE_SSL = os.getenv("POCIT_INSECURE_SSL", "0").strip() in ("1", "true", "True", "yes", "YES")
+
+
+def _requests_verify() -> bool:
+    # Solo para diagnóstico / entornos controlados.
+    # NO recomendable para producción: desactiva la verificación TLS.
+    return not POCIT_INSECURE_SSL
+
+
 def _call_groq(
     messages: List[Dict[str, str]],
     model: Optional[str] = None,
@@ -176,7 +190,7 @@ def _call_groq(
 
     for attempt in range(MAX_RETRIES):
         GLOBAL_BUCKET.consume(payload.get("max_tokens", 1000))
-        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
+        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60, verify=_requests_verify())
 
         if resp.status_code == 429:
             # Política: 429 => no reintentar en este provider, saltar al fallback
@@ -229,7 +243,7 @@ def _call_gemini(
         },
     }
 
-    resp = requests.post(url, json=payload, timeout=60)
+    resp = requests.post(url, json=payload, timeout=60, verify=_requests_verify())
 
     if resp.status_code == 429:
         raise LLMError("Gemini 429 rate limit")
@@ -267,7 +281,7 @@ def _call_mistral(
         "Content-Type": "application/json",
     }
 
-    resp = requests.post(MISTRAL_URL, headers=headers, json=payload, timeout=60)
+    resp = requests.post(MISTRAL_URL, headers=headers, json=payload, timeout=60, verify=_requests_verify())
 
     if resp.status_code == 429:
         raise LLMError("Mistral 429 rate limit")
@@ -309,7 +323,7 @@ def _call_cerebras(
         "Content-Type": "application/json",
     }
 
-    resp = requests.post(CEREBRAS_URL, headers=headers, json=payload, timeout=60)
+    resp = requests.post(CEREBRAS_URL, headers=headers, json=payload, timeout=60, verify=_requests_verify())
 
     if resp.status_code == 429:
         raise LLMError("Cerebras 429 rate limit")
@@ -349,7 +363,7 @@ def _call_openrouter(
 
     for attempt in range(MAX_RETRIES):
         GLOBAL_BUCKET.consume(payload.get("max_tokens", 1000))
-        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60, verify=_requests_verify())
 
         if resp.status_code == 429:
             logger.debug("[RATE LIMIT] OpenRouter 429 detected.")
@@ -416,6 +430,7 @@ def _call_litellm_proxy(
                 headers=headers,
                 json=payload,
                 timeout=timeout,
+                verify=_requests_verify(),
             )
         except requests.exceptions.ReadTimeout as exc:
             # Timeout hablando con el PROXY (no con el upstream directamente).
@@ -622,13 +637,44 @@ def solicitarRespuestaTextual(
     #   activamos un fallback manual de ÚLTIMO RECURSO a proveedores directos.
     default_chain = ["litellm_proxy"]
 
+    # En modo directo replicamos 1:1 el orden del proxy (litellm_config.yaml):
+    # - Alias primario por fase: LLM_POLICY (ctx-json/cls-json/code-gen/docs/estimate)
+    # - Fallbacks por alias: router_settings.fallbacks
+    #
+    # Traducción alias -> provider directo:
+    # - *-groq => groq
+    # - *-gemini => gemini
+    # - *-openrouter => openrouter
+    # - *-mistral => mistral
+    # - *-cerebras / code-gen-fallback => cerebras
+    DIRECT_CHAIN_BY_ALIAS: Dict[str, List[str]] = {
+        # ctx-json primary: mistral/codestral
+        "ctx-json": ["mistral", "groq", "gemini", "openrouter"],
+        # cls-json primary: mistral/codestral
+        "cls-json": ["mistral", "groq", "gemini", "openrouter"],
+        # code-gen primary: mistral/codestral; fallback: cerebras
+        "code-gen": ["mistral", "cerebras"],
+        # docs primary: openrouter; fallbacks listados en YAML (en el orden configurado allí)
+        "docs": ["openrouter", "gemini", "groq", "cerebras", "mistral"],
+        # estimate primary: cerebras; fallbacks listados en YAML
+        "estimate": ["cerebras", "gemini", "groq", "openrouter"],
+    }
+
+    # Cadena directa por defecto si no hay fase/alias resoluble.
+    DEFAULT_DIRECT_CHAIN = ["groq", "gemini", "mistral", "cerebras", "openrouter", "ollama"]
+
     # IMPORTANTE:
-    # - Fallback manual SOLO tras fallo del proxy.
+    # - Fallback manual SOLO tras fallo del proxy (salvo LLM_DIRECT_ONLY).
     # - Si quieres desactivar completamente llamadas directas, exporta LITELLM_PROXY_ONLY=1.
-    if LITELLM_PROXY_ONLY:
+    # - Si quieres saltarte el proxy y usar SOLO llamadas directas, exporta LLM_DIRECT_ONLY=1.
+    if LLM_DIRECT_ONLY:
+        # Resolver alias del “proxy” para esta fase (misma policy), pero ejecutando directo.
+        alias = provider_hint or (LLM_POLICY.get(fase) if fase else None) or None
+        providers = DIRECT_CHAIN_BY_ALIAS.get(alias or "", DEFAULT_DIRECT_CHAIN)
+    elif LITELLM_PROXY_ONLY:
         providers = default_chain
     else:
-        providers = default_chain + ["groq", "gemini", "mistral", "cerebras", "openrouter", "ollama"]
+        providers = default_chain + DEFAULT_DIRECT_CHAIN
 
     LLM_METRICS["total_calls"] += 1
 

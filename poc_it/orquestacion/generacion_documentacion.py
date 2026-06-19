@@ -5,10 +5,14 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
-from poc_it.generador_informes import generar_readme_asesor, generar_readme_final, generar_readme_manual
-from poc_it.materializador_archivos import materializar_proyecto
-from poc_it.models import ModoGeneracion, ProjectContext
-from poc_it.opciones import generar_opciones
+from poc_it.materializacion.generador_informes import (
+    generar_readme_asesor,
+    generar_readme_final,
+    generar_readme_manual,
+)
+from poc_it.materializacion.materializador_archivos import materializar_proyecto
+from poc_it.modulos.models import ModoGeneracion, ProjectContext
+from poc_it.modulos.opciones import generar_opciones
 from poc_it.orquestacion.constantes import (
     ARQUITECTURA_LLM_DEFAULT,
     OUTPUT_DIRNAME,
@@ -17,7 +21,7 @@ from poc_it.orquestacion.constantes import (
     README_MANUAL_FILENAME,
 )
 from poc_it.orquestacion.verificador_runtime import runtime_verify_fastapi_project
-from poc_it.demo_progress import demo_progress, is_demo_mode
+from poc_it.entrada.demo_progress import demo_progress, is_demo_mode
 
 logger = logging.getLogger(__name__)
 

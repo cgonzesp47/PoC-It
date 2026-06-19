@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 import os
 
-from poc_it.runtime_contracts import RUNTIME_CONTRACTS_PATH
+from poc_it.runtime.runtime_contracts import RUNTIME_CONTRACTS_PATH
 
 
 @dataclass(frozen=True)

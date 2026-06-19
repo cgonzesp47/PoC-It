@@ -25,7 +25,7 @@ import requests
 from pathlib import Path
 from typing import Optional
 
-from poc_it.demo_progress import is_demo_mode
+from poc_it.entrada.demo_progress import is_demo_mode
 
 
 def _slugify_path(name: str, max_len: int = 60) -> str:

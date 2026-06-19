@@ -15,7 +15,7 @@ Por tanto:
 
 import re
 from typing import List
-from poc_it.llm_client import chat_completion_text
+from poc_it.infraestructura.llm_client import chat_completion_text
 
 
 # ==========================================================

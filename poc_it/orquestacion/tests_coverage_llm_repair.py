@@ -24,9 +24,9 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from poc_it.generador.json_utils import extraer_json_tolerante
-from poc_it.llm_client import chat_completion_json
-from poc_it.materializador_archivos import materializar_proyecto
-from poc_it.runtime_contracts import RUNTIME_CONTRACTS_PATH
+from poc_it.infraestructura.llm_client import chat_completion_json
+from poc_it.materializacion.materializador_archivos import materializar_proyecto
+from poc_it.runtime.runtime_contracts import RUNTIME_CONTRACTS_PATH
 
 logger = logging.getLogger(__name__)
 

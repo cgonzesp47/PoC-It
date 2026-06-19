@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
-from poc_it.runtime_contracts import RuntimeContracts, load_runtime_contracts_from_structure
+from poc_it.runtime.runtime_contracts import RuntimeContracts, load_runtime_contracts_from_structure
 
 
 # Permite `app.dependency_overrides[get_db] = ...` y también `app.dependency_overrides[callable] = ...`

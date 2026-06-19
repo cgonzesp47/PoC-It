@@ -29,8 +29,8 @@ from fnmatch import fnmatch
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from poc_it.generador.json_utils import extraer_json_tolerante
-from poc_it.llm_client import chat_completion_json
-from poc_it.materializador_archivos import materializar_proyecto
+from poc_it.infraestructura.llm_client import chat_completion_json
+from poc_it.materializacion.materializador_archivos import materializar_proyecto
 from poc_it.orquestacion.pytest_failure_classifier import classify_pytest_failure
 # Nota: fixers deterministas desactivados por estrategia.
 # La fase C debe ser principalmente LLM-guided repair sobre tests; los fixers deterministas

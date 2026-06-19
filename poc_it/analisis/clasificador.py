@@ -16,8 +16,8 @@ Responsabilidad:
 import json
 from typing import Dict
 
-from poc_it.llm_client import chat_completion_json
-from poc_it.models import (
+from poc_it.infraestructura.llm_client import chat_completion_json
+from poc_it.modulos.models import (
     ProjectContext,
     ModoGeneracion,
 )

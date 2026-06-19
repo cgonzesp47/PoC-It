@@ -15,7 +15,7 @@ import json
 import logging
 from typing import Any, Mapping, Optional
 
-from poc_it.llm_client import chat_completion_json
+from poc_it.infraestructura.llm_client import chat_completion_json
 
 
 # ==========================================================

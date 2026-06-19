@@ -82,7 +82,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from poc_it.runtime_contracts import RUNTIME_CONTRACTS_PATH
+from poc_it.runtime.runtime_contracts import RUNTIME_CONTRACTS_PATH
 
 TEST_PLAN_PATH = ".poc_it/test_plan.json"
 

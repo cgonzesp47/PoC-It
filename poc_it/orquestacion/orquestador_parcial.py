@@ -22,13 +22,13 @@ import logging
 import os
 from typing import Any, Dict, Tuple
 
-from poc_it.demo_progress import demo_progress, is_demo_mode
+from poc_it.entrada.demo_progress import demo_progress, is_demo_mode
 
-from poc_it.clasificador import clasificar_viabilidad
-from poc_it.generador_artefactos import generar_proyecto_completo, generar_proyecto_desde_spec
-from poc_it.materializador_archivos import materializar_proyecto
-from poc_it.models import ContextoNormalizado, ModoGeneracion, PlantillaUsuario, ProjectContext
-from poc_it.normalizador_contexto import normalizar_plantilla
+from poc_it.analisis.clasificador import clasificar_viabilidad
+from poc_it.materializacion.generador_artefactos import generar_proyecto_completo, generar_proyecto_desde_spec
+from poc_it.materializacion.materializador_archivos import materializar_proyecto
+from poc_it.modulos.models import ContextoNormalizado, ModoGeneracion, PlantillaUsuario, ProjectContext
+from poc_it.analisis.normalizador_contexto import normalizar_plantilla
 from poc_it.orquestacion.generacion_documentacion import generar_documentacion
 from poc_it.orquestacion.persistencia_spec import persist_spec_json
 from poc_it.orquestacion.postprocesado_alineacion import postprocesar_alineacion_por_pytest
@@ -36,14 +36,14 @@ from poc_it.orquestacion.constantes import OUTPUT_DIRNAME, README_ERROR_FILENAME
 from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
 from poc_it.orquestacion.reparacion_runtime import ejecutar_reparacion_runtime
 from poc_it.orquestacion.run_result import RunResult
-from poc_it.poc_facts_extractor import extract_poc_facts_from_structure
-from poc_it.runtime_contracts import (
+from poc_it.materializacion.poc_facts_extractor import extract_poc_facts_from_structure
+from poc_it.runtime.runtime_contracts import (
     EndpointRuntimeContract,
     ObservedCall,
     RuntimeContracts,
     persist_runtime_contracts,
 )
-from poc_it.runtime_facts import (
+from poc_it.runtime.runtime_facts import (
     EndpointRuntimeFacts,
     RuntimeFacts,
     persist_runtime_facts,
@@ -66,7 +66,7 @@ class OrquestadorParcial:
     # ======================================================
 
     def _estimacion_generada(self, modo: str, horas: float, *, spec: Dict[str, Any] | None = None) -> Any:
-        from poc_it.estimador_esfuerzo import calcular_estimacion_esfuerzo
+        from poc_it.analisis.estimador_esfuerzo import calcular_estimacion_esfuerzo
 
         descripcion = f"""
 Proyecto: {self.nombre_proyecto}
@@ -84,7 +84,7 @@ Descripción:
         )
 
     def _estimacion_manual(self, *, spec: Dict[str, Any] | None = None) -> Any:
-        from poc_it.estimador_esfuerzo import calcular_estimacion_esfuerzo
+        from poc_it.analisis.estimador_esfuerzo import calcular_estimacion_esfuerzo
 
         return calcular_estimacion_esfuerzo(
             descripcion_proyecto=self.descripcion_global,

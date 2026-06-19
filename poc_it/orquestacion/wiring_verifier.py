@@ -22,7 +22,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from poc_it.runtime_contracts import RUNTIME_CONTRACTS_PATH
+from poc_it.runtime.runtime_contracts import RUNTIME_CONTRACTS_PATH
 
 logger = logging.getLogger(__name__)
 

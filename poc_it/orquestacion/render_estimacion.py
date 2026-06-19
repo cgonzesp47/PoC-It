@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from poc_it.estimador_esfuerzo import EstimacionEsfuerzo
+    from poc_it.analisis.estimador_esfuerzo import EstimacionEsfuerzo
 
 
 def generar_bloque_estimacion_markdown(estimacion: "EstimacionEsfuerzo") -> str:

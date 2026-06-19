@@ -4,7 +4,7 @@ import json
 from typing import Any, List
 
 from poc_it.generador.json_utils import extraer_json_tolerante
-from poc_it.llm_client import chat_completion_json
+from poc_it.infraestructura.llm_client import chat_completion_json
 
 
 def sanitizar_restrictions(restrictions: List[dict]) -> List[dict]:

@@ -6,9 +6,9 @@ import os
 import re
 from typing import Any, Dict, Optional
 
-from poc_it.generador_artefactos import generar_proyecto_desde_spec
-from poc_it.materializador_archivos import materializar_proyecto
-from poc_it.models import ProjectContext
+from poc_it.materializacion.generador_artefactos import generar_proyecto_desde_spec
+from poc_it.materializacion.materializador_archivos import materializar_proyecto
+from poc_it.modulos.models import ProjectContext
 from poc_it.orquestacion.llm_safe_repair import SafeRepairConfig, run_llm_safe_repair
 from poc_it.orquestacion.verificador_runtime import runtime_verify_fastapi_project
 from poc_it.orquestacion.venv_manager import ensure_project_venv_ready
@@ -18,7 +18,7 @@ from poc_it.orquestacion.test_plan import TEST_PLAN_PATH, build_test_plan, persi
 from poc_it.orquestacion.tests_coverage_llm_repair import repair_tests_coverage_until_ok
 from poc_it.orquestacion.wiring_verifier import verify_wiring_against_runtime_contracts
 from poc_it.orquestacion.runtime_probe import run_runtime_probe
-from poc_it.demo_progress import demo_progress, is_demo_mode
+from poc_it.entrada.demo_progress import demo_progress, is_demo_mode
 
 logger = logging.getLogger(__name__)
 
