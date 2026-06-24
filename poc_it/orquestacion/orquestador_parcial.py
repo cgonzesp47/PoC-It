@@ -199,6 +199,13 @@ Descripción:
         files = resultado.get("files", [])
         spec = resultado.get("spec") if isinstance(resultado, dict) else None
 
+        # Gate de SPEC fuerte: si el generador devolvió spec_errors (fatales), no continuar.
+        spec_errors = resultado.get("spec_errors") if isinstance(resultado, dict) else None
+        if spec_errors:
+            raise ValueError(
+                "SPEC inválido tras validación fuerte (fatales). Abortando antes de materialización/generación."
+            )
+
         # Retry: si tenemos SPEC válido pero la generación de código no converge (files vacío),
         # reintentamos una vez reutilizando el SPEC como fuente de verdad.
         if (not files) and isinstance(spec, dict) and spec:

@@ -40,10 +40,53 @@ class ContratoAPI(BaseModel):
     notes: str = ""
 
 
+class PersistenceModel(BaseModel):
+    required: bool = False
+    kind: str | None = None
+    durable_state: bool = False
+    business_entities: List[str] = Field(default_factory=list)
+    evidence: List[str] = Field(default_factory=list)
+    uncertainty: str = ""
+
+
+class TechnologySignalModel(BaseModel):
+    name: str
+    category: str = "unknown"
+    role: str = ""
+    evidence: str = ""
+    confidence: str = "unknown"
+
+
+class DomainEntityModel(BaseModel):
+    name: str
+    singular: str = ""
+    plural: str = ""
+    slug: str = ""
+    evidence: str = ""
+    confidence: str = "unknown"
+
+
+class OperationGroupModel(BaseModel):
+    type: str
+    entity: str
+    evidence: str = ""
+    confidence: str = "unknown"
+
+
+class StateRequirementsModel(BaseModel):
+    durable: bool = False
+    entities: List[str] = Field(default_factory=list)
+    evidence: List[str] = Field(default_factory=list)
+
+
 class ContextoNormalizado(BaseModel):
     """
     Representa el contexto técnico estructurado derivado de la plantilla.
     Es la versión formal y normalizada que utilizará el sistema.
+
+    Importante:
+    - Este modelo DEBE preservar el contrato completo que produce `normalizar_plantilla`.
+    - Evitar que `model_dump()` recorte claves nuevas y provoque degradaciones a flujos legacy.
     """
 
     objetivo_tecnico: str
@@ -56,8 +99,20 @@ class ContextoNormalizado(BaseModel):
     complejidad_inferida: str = "MEDIA"
     modo_recomendado: str = "PARCIAL"
 
-    # Contratos estructurados (fuente de verdad para request/response cuando exista evidencia)
+    contratos_api_explicitos: List[ContratoAPI] = Field(default_factory=list)
+    contratos_api_propuestos: List[ContratoAPI] = Field(default_factory=list)
+
+    # Legacy (deprecated): solo explícitos
     contratos_api: List[ContratoAPI] = Field(default_factory=list)
+
+    persistence: PersistenceModel = Field(default_factory=PersistenceModel)
+    technology_signals: List[TechnologySignalModel] = Field(default_factory=list)
+    domain_entities: List[DomainEntityModel] = Field(default_factory=list)
+    operation_groups: List[OperationGroupModel] = Field(default_factory=list)
+    state_requirements: StateRequirementsModel = Field(default_factory=StateRequirementsModel)
+
+    assumptions: List[str] = Field(default_factory=list)
+    evidence: List[str] = Field(default_factory=list)
 
 
 class ModoGeneracion(str, Enum):

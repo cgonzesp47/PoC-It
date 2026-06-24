@@ -52,9 +52,12 @@ from poc_it.generador.spec_alignment import (
     alinear_spec_con_contexto as _alinear_spec_con_contexto,
 )
 from poc_it.generador.spec_validation import (
+    SpecValidationError as _SpecValidationError,
     completar_inits_en_files as _completar_inits_en_files,
     normalizar_paths as _normalizar_paths,
     persistir_spec_debug as _persistir_spec_debug,
+    repair_spec_deterministic as _repair_spec_deterministic,
+    validate_spec as _validate_spec,
     validar_spec as _validar_spec,
 )
 from poc_it.generador.prompts_lotes import (
@@ -567,105 +570,180 @@ def generar_proyecto_completo(
     """
 
     # -------------------------
-    # FASE 1: SPEC
+    # FASE 1: SPEC (nuevo flujo: determinista desde IR)
     # -------------------------
-    prompt_spec = _build_prompt_spec(
-        descripcion_global=descripcion_global,
-        contexto_normalizado=contexto_normalizado,
-    )
+    # Fuente de verdad:
+    # - contexto_normalizado (si existe, ya viene normalizado)
+    # - builder determinista desde IR
+    #
+    # Política:
+    # - Por defecto: construir SPEC determinista desde IR.
+    # - Fallback: solo si el builder fallase (bug) o si un feature flag fuerza legacy.
+    from poc_it.generador.request_ir import build_request_ir_from_context
+    from poc_it.generador.spec_builder import build_spec_from_request_ir
 
     spec: Optional[dict] = None
     errores_spec: List[str] = []
 
-    # Política:
-    # - Intento 1: generar SPEC desde prompt base
-    # - Si no parsea o no valida: NO reintentamos "desde cero"; pedimos REPARAR
-    prompt_spec_base = prompt_spec
+    force_legacy = os.getenv("POC_IT_SPEC_LEGACY_LLM", "0").strip() in ("1", "true", "True", "yes", "YES")
 
-    for intento_spec in range(max(1, intentos)):
-        resp = chat_completion_json(
-            prompt=prompt_spec,
-            system=None,
-            temperature=0.1,
-            max_tokens=1800,
-            provider_hint="docs",
-            fase="documentacion",
-        )
-        spec = extraer_json_tolerante(resp)
+    def _dump_debug_json(filename: str, payload: Any) -> None:
+        try:
+            debug_dir = Path("output/_debug")
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            (debug_dir / filename).write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
-        if not spec:
-            errores_spec = ["SPEC no parseable (JSON inválido/truncado o texto extra no extraíble)"]
+    def _serialize_validation_errors(errors: List[_SpecValidationError]) -> List[dict]:
+        return [e.__dict__ for e in errors]
 
-            # Guardar RAW del SPEC para diagnóstico (timeouts / truncados / rate-limit)
+    if not force_legacy:
+        try:
+            # DEBUG #1: input EXACTO a RequestIR
+            _dump_debug_json("request_ir_input_context.json", contexto_normalizado)
+
+            req_ir = build_request_ir_from_context(contexto_normalizado, descripcion_global=descripcion_global)
+
+            # DEBUG #2: RequestIR como dict
             try:
-                debug_dir = Path("output/_debug")
-                debug_dir.mkdir(parents=True, exist_ok=True)
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                (debug_dir / f"spec_raw_{ts}.txt").write_text(resp or "", encoding="utf-8")
+                from poc_it.generador.request_ir import request_ir_to_dict
+
+                _dump_debug_json("request_ir.json", request_ir_to_dict(req_ir))
             except Exception:
                 pass
 
-            # En vez de regenerar todo, pedimos reparar la respuesta cruda.
-            prompt_spec = _reparar_spec_prompt(
-                prompt_spec_base=prompt_spec_base,
-                raw_resp=resp,
-                errores=errores_spec,
-            )
-            continue
+            # Checks defensivos: si el contexto traía señal estructurada, no aceptamos degradación silenciosa
+            if isinstance(contexto_normalizado, dict):
+                if (contexto_normalizado.get("contratos_api_propuestos") or []) and not req_ir.proposed_api_contracts:
+                    raise ValueError(
+                        "RequestIR vacío: contexto_normalizado contenía contratos_api_propuestos pero RequestIR.proposed_api_contracts quedó vacío. "
+                        "Esto indica pérdida de contexto o parseo incorrecto. Abortando para evitar fallback silencioso a /health."
+                    )
+                pctx = contexto_normalizado.get("persistence")
+                if isinstance(pctx, dict) and bool(pctx.get("required")) and not req_ir.persistence.required:
+                    raise ValueError(
+                        "RequestIR inconsistente: contexto_normalizado.persistence.required=true pero RequestIR.persistence.required=false. "
+                        "Abortando para evitar degradación a SPEC sin persistencia."
+                    )
 
-        ok, errores = _validar_spec(spec)
-        if not ok:
-            errores_spec = errores
-            prompt_spec = _reparar_spec_prompt(
-                prompt_spec_base=prompt_spec_base,
-                raw_resp=resp,
-                errores=errores_spec,
-            )
+            spec = build_spec_from_request_ir(req_ir)
+
+            # DEBUG #3: SPEC base determinista (antes de LLM/alineación)
+            _dump_debug_json("spec_base.json", spec)
+        except Exception as e:
+            # No cortamos aquí: permitimos fallback a legacy para mantener ejecutabilidad,
+            # pero el objetivo del refactor es que este camino sea raro.
+            errores_spec = [f"spec_determinista_error: {e}"]
             spec = None
-            continue
 
-        # -------------------------
-        # FASE 1.5: alineación SPEC vs ContextoNormalizado (si existe)
-        # -------------------------
-        if isinstance(contexto_normalizado, dict) and contexto_normalizado:
-            patched, audit_errors = _alinear_spec_con_contexto(
-                spec,
-                contexto_normalizado,
-                intentos=1,
-                provider_hint="docs",
-                max_tokens=1400,
+    # ------------------------------------------------------------
+    # Validación fuerte del SPEC (nuevo flujo determinista)
+    # ------------------------------------------------------------
+    if isinstance(spec, dict):
+        # Persistimos siempre el spec inicial del builder para poder comparar repair vs base.
+        _persistir_spec_debug(
+            nombre_archivo=f"spec_base_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            spec=spec,
+            descripcion_global=descripcion_global,
+            contexto_normalizado=contexto_normalizado,
+        )
+
+        errors0 = _validate_spec(spec)
+        fatals0 = [e for e in errors0 if e.severity == "fatal"]
+        warns0 = [e for e in errors0 if e.severity == "warning"]
+
+        if fatals0:
+            # Attempt deterministic repair if there are fatals (repairable by design).
+            spec_repaired, repair_changes = _repair_spec_deterministic(spec)
+
+            _persistir_spec_debug(
+                nombre_archivo=f"spec_repaired_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                spec=spec_repaired,
+                descripcion_global=descripcion_global,
+                contexto_normalizado=contexto_normalizado,
+            )
+            _dump_debug_json(
+                "spec_repair_changes.json",
+                _serialize_validation_errors(repair_changes),
             )
 
-            # Caso clave: el precheck determinista o el auditor en modo compacto pueden devolver:
-            # - patched == spec (dict) + audit_errors (lista MUST)
-            # En ese caso, NO podemos aceptar el SPEC tal cual: debemos repair patch-style y reintentar.
-            if isinstance(patched, dict) and audit_errors:
-                errores_spec = audit_errors
-                prompt_spec = _reparar_spec_desde_spec(
-                    prompt_spec_base=prompt_spec_base,
-                    spec_actual=patched,
-                    errores=errores_spec,
-                    contexto_normalizado=contexto_normalizado,
+            errors1 = _validate_spec(spec_repaired)
+            fatals1 = [e for e in errors1 if e.severity == "fatal"]
+            warns1 = [e for e in errors1 if e.severity == "warning"]
+
+            if fatals1:
+                # Persist fatal errors and stop: do NOT continue to code generation.
+                _dump_debug_json(
+                    "spec_validation_errors.json",
+                    _serialize_validation_errors(errors1),
                 )
-                spec = None
+                spec_repaired["status"] = "degraded"
+                return {"files": [], "spec": spec_repaired, "spec_errors": _serialize_validation_errors(errors1)}
+
+            # no fatals after repair: keep repaired spec
+            spec = spec_repaired
+            if warns1:
+                _dump_debug_json(
+                    "spec_validation_warnings.json",
+                    _serialize_validation_errors(warns1),
+                )
+            spec["status"] = "valid"
+        else:
+            if warns0:
+                _dump_debug_json(
+                    "spec_validation_warnings.json",
+                    _serialize_validation_errors(warns0),
+                )
+            spec["status"] = "valid"
+
+    # ------------------------------------------------------------
+    # LEGACY fallback (LLM) - opcional / desaconsejado
+    # ------------------------------------------------------------
+    if not isinstance(spec, dict) or not spec:
+        prompt_spec = _build_prompt_spec(
+            descripcion_global=descripcion_global,
+            contexto_normalizado=contexto_normalizado,
+        )
+        prompt_spec_base = prompt_spec
+
+        for intento_spec in range(max(1, intentos)):
+            resp = chat_completion_json(
+                prompt=prompt_spec,
+                system=None,
+                temperature=0.1,
+                max_tokens=1800,
+                provider_hint="docs",
+                fase="documentacion",
+            )
+            spec = extraer_json_tolerante(resp)
+
+            if not spec:
+                errores_spec = ["SPEC no parseable (JSON inválido/truncado o texto extra no extraíble)"]
+
+                # Guardar RAW del SPEC para diagnóstico (timeouts / truncados / rate-limit)
+                try:
+                    debug_dir = Path("output/_debug")
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    (debug_dir / f"spec_raw_{ts}.txt").write_text(resp or "", encoding="utf-8")
+                except Exception:
+                    pass
+
+                # En vez de regenerar todo, pedimos reparar la respuesta cruda.
+                prompt_spec = _reparar_spec_prompt(
+                    prompt_spec_base=prompt_spec_base,
+                    raw_resp=resp,
+                    errores=errores_spec,
+                )
                 continue
 
-            if isinstance(patched, dict):
-                spec = patched
-
-                ok2, errores2 = _validar_spec(spec)
-                if ok2:
-                    # Persistimos el SPEC alineado para diagnóstico (en debug).
-                    _persistir_spec_debug(
-                        nombre_archivo=f"spec_ok_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                        spec=spec,
-                        descripcion_global=descripcion_global,
-                        contexto_normalizado=contexto_normalizado,
-                    )
-                    break
-
-                # si el patch rompe invariantes estructurales, pedimos reparación guiada
-                errores_spec = (audit_errors or []) + errores2
+            ok, errores = _validar_spec(spec)
+            if not ok:
+                errores_spec = errores
                 prompt_spec = _reparar_spec_prompt(
                     prompt_spec_base=prompt_spec_base,
                     raw_resp=resp,
@@ -674,24 +752,67 @@ def generar_proyecto_completo(
                 spec = None
                 continue
 
-            # patched no dict => auditor no concluyente
-            errores_spec = audit_errors or ["auditor: no pudo alinear SPEC con contexto"]
-            prompt_spec = _reparar_spec_prompt(
-                prompt_spec_base=prompt_spec_base,
-                raw_resp=resp,
-                errores=errores_spec,
-            )
-            spec = None
-            continue
+            # -------------------------
+            # FASE 1.5: alineación SPEC vs ContextoNormalizado (si existe)
+            # -------------------------
+            if isinstance(contexto_normalizado, dict) and contexto_normalizado:
+                patched, audit_errors = _alinear_spec_con_contexto(
+                    spec,
+                    contexto_normalizado,
+                    intentos=1,
+                    provider_hint="docs",
+                    max_tokens=1400,
+                )
 
-        # si no hay contexto_normalizado, ya es válido estructuralmente
-        _persistir_spec_debug(
-            nombre_archivo=f"spec_ok_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-            spec=spec,
-            descripcion_global=descripcion_global,
-            contexto_normalizado=contexto_normalizado,
-        )
-        break
+                if isinstance(patched, dict) and audit_errors:
+                    errores_spec = audit_errors
+                    prompt_spec = _reparar_spec_desde_spec(
+                        prompt_spec_base=prompt_spec_base,
+                        spec_actual=patched,
+                        errores=errores_spec,
+                        contexto_normalizado=contexto_normalizado,
+                    )
+                    spec = None
+                    continue
+
+                if isinstance(patched, dict):
+                    spec = patched
+
+                    ok2, errores2 = _validar_spec(spec)
+                    if ok2:
+                        _persistir_spec_debug(
+                            nombre_archivo=f"spec_ok_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                            spec=spec,
+                            descripcion_global=descripcion_global,
+                            contexto_normalizado=contexto_normalizado,
+                        )
+                        break
+
+                    errores_spec = (audit_errors or []) + errores2
+                    prompt_spec = _reparar_spec_prompt(
+                        prompt_spec_base=prompt_spec_base,
+                        raw_resp=resp,
+                        errores=errores_spec,
+                    )
+                    spec = None
+                    continue
+
+                errores_spec = audit_errors or ["auditor: no pudo alinear SPEC con contexto"]
+                prompt_spec = _reparar_spec_prompt(
+                    prompt_spec_base=prompt_spec_base,
+                    raw_resp=resp,
+                    errores=errores_spec,
+                )
+                spec = None
+                continue
+
+            _persistir_spec_debug(
+                nombre_archivo=f"spec_ok_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                spec=spec,
+                descripcion_global=descripcion_global,
+                contexto_normalizado=contexto_normalizado,
+            )
+            break
 
     if not spec:
         print("[DEBUG] No se pudo generar un SPEC válido.")
