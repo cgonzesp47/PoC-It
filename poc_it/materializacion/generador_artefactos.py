@@ -65,6 +65,10 @@ from poc_it.generador.prompts_lotes import (
     build_prompt_lote_fix_errors as _build_prompt_lote_fix_errors,
     build_prompt_lote_missing as _build_prompt_lote_missing,
 )
+from poc_it.generador.file_contracts import (
+    build_file_contracts_from_spec as _build_file_contracts_from_spec,
+    file_contracts_to_dict as _file_contracts_to_dict,
+)
 from poc_it.generador.prompts_spec import (
     build_prompt_spec as _build_prompt_spec,
     reparar_spec_desde_spec as _reparar_spec_desde_spec,
@@ -226,6 +230,7 @@ def _generar_archivos_por_lotes(
     spec: dict,
     lotes: List[List[str]],
     intentos: int,
+    file_contracts: Optional[List[dict]] = None,
 ) -> List[Dict[str, str]] | None:
     """
     Genera el contenido por lotes (FASE 2) sin aplicar validación final.
@@ -240,7 +245,12 @@ def _generar_archivos_por_lotes(
     for lote in lotes:
         lote_set = set(lote)
 
-        prompt_lote = _build_prompt_lote(spec=spec, lote=lote)
+        lote_contracts = []
+        if isinstance(file_contracts, list) and file_contracts:
+            lote_set = set(lote)
+            lote_contracts = [c for c in file_contracts if isinstance(c, dict) and c.get("path") in lote_set]
+
+        prompt_lote = _build_prompt_lote(spec=spec, lote=lote, file_contracts=lote_contracts)
 
         lote_files: Optional[List[Dict[str, str]]] = None
         ultimo_raw: str = ""
@@ -447,6 +457,23 @@ def _generar_desde_spec_validado(
     spec["files"] = files_plan
     allowed_paths = set(files_plan)
 
+    # ------------------------------------------------------------
+    # Contract-first: derive explicit FileContracts from SPEC (deterministic)
+    # ------------------------------------------------------------
+    file_contracts = _build_file_contracts_from_spec(spec)
+    file_contracts_dict = _file_contracts_to_dict(file_contracts)
+
+    # Persist debug artifact
+    try:
+        debug_dir = Path("output/_debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / "file_contracts.json").write_text(
+            json.dumps(file_contracts_dict, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
     # mantener la misma compilación/sanitización de restricciones
     spec["restrictions"] = compilar_restricciones(spec, contexto_normalizado, intentos=intentos)
 
@@ -477,7 +504,12 @@ def _generar_desde_spec_validado(
         else 0,
     )
 
-    files_generados = _generar_archivos_por_lotes(spec=spec, lotes=lotes, intentos=intentos)
+    files_generados = _generar_archivos_por_lotes(
+        spec=spec,
+        lotes=lotes,
+        intentos=intentos,
+        file_contracts=file_contracts_dict,
+    )
     if not files_generados:
         return {"files": []}
 
@@ -701,118 +733,14 @@ def generar_proyecto_completo(
             spec["status"] = "valid"
 
     # ------------------------------------------------------------
-    # LEGACY fallback (LLM) - opcional / desaconsejado
+    # DEPRECATED: legacy LLM spec generation, not used by contract-first flow.
     # ------------------------------------------------------------
     if not isinstance(spec, dict) or not spec:
-        prompt_spec = _build_prompt_spec(
-            descripcion_global=descripcion_global,
-            contexto_normalizado=contexto_normalizado,
+        raise RuntimeError(
+            "DEPRECATED legacy SPEC generation path triggered. "
+            "The contract-first flow requires a deterministic SPEC from RequestIR. "
+            "Fix RequestIR/SpecBuilder instead of falling back to LLM."
         )
-        prompt_spec_base = prompt_spec
-
-        for intento_spec in range(max(1, intentos)):
-            resp = chat_completion_json(
-                prompt=prompt_spec,
-                system=None,
-                temperature=0.1,
-                max_tokens=1800,
-                provider_hint="docs",
-                fase="documentacion",
-            )
-            spec = extraer_json_tolerante(resp)
-
-            if not spec:
-                errores_spec = ["SPEC no parseable (JSON inválido/truncado o texto extra no extraíble)"]
-
-                # Guardar RAW del SPEC para diagnóstico (timeouts / truncados / rate-limit)
-                try:
-                    debug_dir = Path("output/_debug")
-                    debug_dir.mkdir(parents=True, exist_ok=True)
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    (debug_dir / f"spec_raw_{ts}.txt").write_text(resp or "", encoding="utf-8")
-                except Exception:
-                    pass
-
-                # En vez de regenerar todo, pedimos reparar la respuesta cruda.
-                prompt_spec = _reparar_spec_prompt(
-                    prompt_spec_base=prompt_spec_base,
-                    raw_resp=resp,
-                    errores=errores_spec,
-                )
-                continue
-
-            ok, errores = _validar_spec(spec)
-            if not ok:
-                errores_spec = errores
-                prompt_spec = _reparar_spec_prompt(
-                    prompt_spec_base=prompt_spec_base,
-                    raw_resp=resp,
-                    errores=errores_spec,
-                )
-                spec = None
-                continue
-
-            # -------------------------
-            # FASE 1.5: alineación SPEC vs ContextoNormalizado (si existe)
-            # -------------------------
-            if isinstance(contexto_normalizado, dict) and contexto_normalizado:
-                patched, audit_errors = _alinear_spec_con_contexto(
-                    spec,
-                    contexto_normalizado,
-                    intentos=1,
-                    provider_hint="docs",
-                    max_tokens=1400,
-                )
-
-                if isinstance(patched, dict) and audit_errors:
-                    errores_spec = audit_errors
-                    prompt_spec = _reparar_spec_desde_spec(
-                        prompt_spec_base=prompt_spec_base,
-                        spec_actual=patched,
-                        errores=errores_spec,
-                        contexto_normalizado=contexto_normalizado,
-                    )
-                    spec = None
-                    continue
-
-                if isinstance(patched, dict):
-                    spec = patched
-
-                    ok2, errores2 = _validar_spec(spec)
-                    if ok2:
-                        _persistir_spec_debug(
-                            nombre_archivo=f"spec_ok_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                            spec=spec,
-                            descripcion_global=descripcion_global,
-                            contexto_normalizado=contexto_normalizado,
-                        )
-                        break
-
-                    errores_spec = (audit_errors or []) + errores2
-                    prompt_spec = _reparar_spec_prompt(
-                        prompt_spec_base=prompt_spec_base,
-                        raw_resp=resp,
-                        errores=errores_spec,
-                    )
-                    spec = None
-                    continue
-
-                errores_spec = audit_errors or ["auditor: no pudo alinear SPEC con contexto"]
-                prompt_spec = _reparar_spec_prompt(
-                    prompt_spec_base=prompt_spec_base,
-                    raw_resp=resp,
-                    errores=errores_spec,
-                )
-                spec = None
-                continue
-
-            _persistir_spec_debug(
-                nombre_archivo=f"spec_ok_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                spec=spec,
-                descripcion_global=descripcion_global,
-                contexto_normalizado=contexto_normalizado,
-            )
-            break
 
     if not spec:
         print("[DEBUG] No se pudo generar un SPEC válido.")
@@ -832,7 +760,8 @@ def generar_proyecto_completo(
                 "descripcion_global": descripcion_global,
                 "contexto_normalizado": contexto_normalizado,
                 "errores_spec": errores_spec,
-                "prompt_spec": prompt_spec,
+                # contract-first: ya no existe prompt_spec (legacy eliminado)
+                "prompt_spec": None,
                 # `resp` y `spec` no están disponibles aquí si falló antes de parsear o si se pisaron;
                 # por eso guardamos lo que tengamos en variables locales si existen.
                 "last_raw_response": locals().get("resp"),

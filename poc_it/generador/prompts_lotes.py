@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-from typing import List
+from typing import List, Optional
 
 
-def build_prompt_lote(*, spec: dict, lote: List[str]) -> str:
+def build_prompt_lote(*, spec: dict, lote: List[str], file_contracts: Optional[List[dict]] = None) -> str:
     """
     Construye el prompt del lote (FASE 2).
 
@@ -17,6 +17,12 @@ def build_prompt_lote(*, spec: dict, lote: List[str]) -> str:
     dependencies = spec.get("dependencies", [])
     dev_dependencies = spec.get("dev_dependencies", [])
     restrictions = spec.get("restrictions", [])
+
+    # New contract-first input: explicit file-level contracts for this lote.
+    # If not provided, legacy behavior remains (but the contract-first flow should always pass it).
+    file_contracts = file_contracts or []
+    if not isinstance(file_contracts, list):
+        file_contracts = []
 
     return f"""
 TAREA
@@ -119,7 +125,16 @@ DECISIONES / CONTRATOS DE ESTA PoC (fuente de verdad)
 - Restricciones ejecutables (NO NEGOCIABLES):
 {json.dumps(restrictions, ensure_ascii=False)}
 
-SPEC COMPLETO (referencia):
+FILE CONTRACTS (fuente de verdad por archivo; CUMPLIR ESTRICTAMENTE):
+{json.dumps(file_contracts, ensure_ascii=False)}
+
+Reglas contract-first:
+- Cumple estos file contracts exactamente.
+- No generes símbolos públicos fuera de contrato salvo helpers privados necesarios.
+- No inventes archivos fuera del lote.
+- No muevas endpoints entre archivos.
+
+SPEC (resumen/soporte, no reemplaza contracts):
 {json.dumps(spec, ensure_ascii=False)}
 
 ARCHIVOS A GENERAR EN ESTE LOTE (exactos):
