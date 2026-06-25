@@ -29,15 +29,16 @@ TAREA
 Genera el CONTENIDO de los siguientes archivos de un proyecto FastAPI.
 
 PATRONES CANÓNICOS (COPIAR LITERALMENTE, NO IMPROVISAR)
-- FastAPI Depends (CORRECTO):
-  - BIEN: `db: AsyncSession = Depends(get_db)`
-  - MAL:  `db: Depends(get_db)`
-  - BIEN: `svc: Service = Depends(get_service)`
+Nota: los siguientes patrones son ejemplos. La fuente de verdad es FILE CONTRACTS; solo aplica un patrón si el contract del archivo lo requiere.
+
+- FastAPI Depends (ejemplos, no obligatorios si el SPEC/contract no lo requiere):
+  - BIEN: `dep: DepType = Depends(get_dep)`
+  - MAL:  `dep: Depends(get_dep)` (falta anotación de tipo)
 - Settings lazy (PROHIBIDO evaluar env obligatoria en import-time):
-  - BIEN: `def get_settings(): return Settings()` (cacheada) y crear engine/session dentro de `get_engine()`/`get_db()`
-  - MAL: `settings = Settings()` o `engine = create_engine(Settings().URL)` en import-time
-- Si hay capa Service, debe ser inyectable (o no uses overrides en tests):
-  - BIEN: `def get_product_service(...): return ProductService(...)` y `svc: ProductService = Depends(get_product_service)`
+  - BIEN: `def get_settings(): return Settings()` (cacheada) y crear recursos en factorías/deps lazy
+  - MAL: instanciar Settings/clients/engines en import-time
+- Si hay capa Service, debe ser inyectable (solo si existe en contracts):
+  - BIEN: exponer `get_<service>()` y usar `Depends(get_<service>)`
 
 INVARIANTES (COMPILABLE / IMPORTABLE)
 - Paquete raíz: app/
@@ -101,15 +102,17 @@ REGLA CRÍTICA: no captures HTTPException en 500
   - `except HTTPException: raise`
   - `except Exception as e: logger.exception(...); raise HTTPException(500, ...)`
 - Router pattern (OBLIGATORIO):
-  - En CADA archivo `app/endpoints/*.py` debes definir EXACTAMENTE: `router = APIRouter()`
+  - En CADA archivo `app/api/endpoints/*.py` debes definir EXACTAMENTE: `router = APIRouter()`
   - Los endpoints deben declararse como `@router.get(...)` / `@router.post(...)`.
-  - `app/main.py` importará `router` desde cada endpoint y hará `app.include_router(router)`, por tanto el símbolo `router` debe existir SIEMPRE.
+  - Flujo correcto de routers:
+    - `app/main.py` debe importar `api_router` desde `app.api.router` y hacer `app.include_router(api_router)`.
+    - `app/api/router.py` debe importar cada router local de `app.api.endpoints.<modulo>` y hacer `api_router.include_router(router)`.
   - Prohibido `from app.main import app`
-  - Prohibido `@app.get/post/...`
+  - Prohibido `@app.get/post/...` en endpoints.
 - RUTAS (anti /x/x) - OBLIGATORIO:
-  - En `app/main.py` DEBES usar `app.include_router(<router>, prefix="")` (prefix vacío) para todos los routers.
-  - En los archivos `app/endpoints/*.py`, los decorators DEBEN usar el path completo final.
-  - Prohibido usar prefix no vacío en `include_router` (si lo haces, se duplican rutas).
+  - `app/main.py` NO debe aplicar prefix salvo que el SPEC/FileContracts lo exijan.
+  - En `app/api/router.py` evita duplicar prefixes: si incluyes `prefix=...` ahí, los endpoints deben usar paths relativos coherentes.
+  - Por defecto seguro: sin prefixes y los endpoints declaran el path final completo.
 - No incluyas texto fuera del JSON.
 - No uses bloques ```.
 

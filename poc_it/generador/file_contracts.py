@@ -82,6 +82,7 @@ def build_file_contracts_from_spec(spec: dict) -> List[FileContract]:
 
     endpoint_files = sorted([f for f in endpoints_by_file.keys() if f])
     endpoint_files_in_spec = [f for f in endpoint_files if f in spec_files]
+    endpoint_modules_in_spec = [_module_from_endpoint_file(f) for f in endpoint_files_in_spec]
 
     for path in spec_files:
         if path in seen:
@@ -129,8 +130,8 @@ def build_file_contracts_from_spec(spec: dict) -> List[FileContract]:
                 "incluir routers de endpoint files",
                 "no contener lógica de negocio",
             ]
-            # Permitimos fastapi y los módulos endpoint conocidos
-            allowed_imports = ["fastapi"] + endpoint_files_in_spec
+            # Permitimos fastapi y los módulos endpoint conocidos (como módulos importables, no paths .py)
+            allowed_imports = ["fastapi"] + endpoint_modules_in_spec
             notes.append("Debe incluir routers de todos los endpoint files del SPEC")
         elif kind == "endpoint":
             responsibilities = [
@@ -200,6 +201,18 @@ def build_file_contracts_from_spec(spec: dict) -> List[FileContract]:
     _validate_contracts_against_spec(spec_files=spec_files, endpoints=endpoints, contracts=contracts)
 
     return contracts
+
+
+def _module_from_endpoint_file(path: str) -> str:
+    """
+    Convierte un path de archivo endpoint a módulo importable.
+    Ej:
+      app/api/endpoints/productos.py -> app.api.endpoints.productos
+    """
+    p = (path or "").replace("\\", "/").strip()
+    if p.endswith(".py"):
+        p = p[:-3]
+    return p.replace("/", ".")
 
 
 def _infer_kind(path: str) -> str:

@@ -44,7 +44,8 @@ class ApiContractIR:
     description: str = ""
     request_type: RequestType = "none"
     request_schema_hint: Dict[str, Any] = field(default_factory=dict)
-    response_example: Dict[str, Any] = field(default_factory=dict)
+    # Puede ser dict o list (p.ej. GET /items devuelve lista). No forzar a dict.
+    response_example: Any = field(default_factory=dict)
     evidence: str = ""
     assumption: str = ""
 
@@ -156,7 +157,7 @@ def build_request_ir_from_context(
                             description=c.description,
                             request_type=c.request_type,
                             request_schema_hint=dict(c.request_schema_hint or {}),
-                            response_example=dict(c.response_example or {}),
+                            response_example=c.response_example,
                             evidence="",
                             assumption=c.assumption,
                         )
@@ -501,7 +502,11 @@ def _parse_contracts(raw: Any) -> List[ApiContractIR]:
         request_schema_hint = schema_hint if isinstance(schema_hint, dict) else {}
 
         response_example = resp.get("json_example")
-        response_example_dict = response_example if isinstance(response_example, dict) else {}
+        response_example_norm: Any
+        if isinstance(response_example, (dict, list)):
+            response_example_norm = response_example
+        else:
+            response_example_norm = {}
 
         evidence_parts: List[str] = []
         ev_req = req.get("evidence")
@@ -521,7 +526,7 @@ def _parse_contracts(raw: Any) -> List[ApiContractIR]:
                 description=str(c.get("notes") or "").strip(),
                 request_type=request_type,  # type: ignore[arg-type]
                 request_schema_hint=request_schema_hint,
-                response_example=response_example_dict,
+                response_example=response_example_norm,
                 evidence=evidence,
                 assumption=assumption,
             )
@@ -538,7 +543,7 @@ def _ensure_proposed_has_assumption(c: ApiContractIR) -> ApiContractIR:
         description=c.description,
         request_type=c.request_type,
         request_schema_hint=dict(c.request_schema_hint or {}),
-        response_example=dict(c.response_example or {}),
+        response_example=c.response_example,
         evidence=c.evidence,
         assumption="Endpoint propuesto sin evidencia literal; requiere confirmación del usuario.",
     )

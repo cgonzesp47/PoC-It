@@ -69,11 +69,6 @@ from poc_it.generador.file_contracts import (
     build_file_contracts_from_spec as _build_file_contracts_from_spec,
     file_contracts_to_dict as _file_contracts_to_dict,
 )
-from poc_it.generador.prompts_spec import (
-    build_prompt_spec as _build_prompt_spec,
-    reparar_spec_desde_spec as _reparar_spec_desde_spec,
-    reparar_spec_prompt as _reparar_spec_prompt,
-)
 from poc_it.generador.prompts_guardrails import (
     build_repair_prompt_por_restriccion as _build_repair_prompt_por_restriccion,
 )
@@ -617,7 +612,7 @@ def generar_proyecto_completo(
     spec: Optional[dict] = None
     errores_spec: List[str] = []
 
-    force_legacy = os.getenv("POC_IT_SPEC_LEGACY_LLM", "0").strip() in ("1", "true", "True", "yes", "YES")
+    force_legacy = False
 
     def _dump_debug_json(filename: str, payload: Any) -> None:
         try:
@@ -633,44 +628,41 @@ def generar_proyecto_completo(
     def _serialize_validation_errors(errors: List[_SpecValidationError]) -> List[dict]:
         return [e.__dict__ for e in errors]
 
-    if not force_legacy:
+    try:
+        # DEBUG #1: input EXACTO a RequestIR
+        _dump_debug_json("request_ir_input_context.json", contexto_normalizado)
+
+        req_ir = build_request_ir_from_context(contexto_normalizado, descripcion_global=descripcion_global)
+
+        # DEBUG #2: RequestIR como dict
         try:
-            # DEBUG #1: input EXACTO a RequestIR
-            _dump_debug_json("request_ir_input_context.json", contexto_normalizado)
+            from poc_it.generador.request_ir import request_ir_to_dict
 
-            req_ir = build_request_ir_from_context(contexto_normalizado, descripcion_global=descripcion_global)
+            _dump_debug_json("request_ir.json", request_ir_to_dict(req_ir))
+        except Exception:
+            pass
 
-            # DEBUG #2: RequestIR como dict
-            try:
-                from poc_it.generador.request_ir import request_ir_to_dict
+        # Checks defensivos: si el contexto traía señal estructurada, no aceptamos degradación silenciosa
+        if isinstance(contexto_normalizado, dict):
+            if (contexto_normalizado.get("contratos_api_propuestos") or []) and not req_ir.proposed_api_contracts:
+                raise ValueError(
+                    "RequestIR vacío: contexto_normalizado contenía contratos_api_propuestos pero RequestIR.proposed_api_contracts quedó vacío. "
+                    "Esto indica pérdida de contexto o parseo incorrecto. Abortando para evitar degradación a /health."
+                )
+            pctx = contexto_normalizado.get("persistence")
+            if isinstance(pctx, dict) and bool(pctx.get("required")) and not req_ir.persistence.required:
+                raise ValueError(
+                    "RequestIR inconsistente: contexto_normalizado.persistence.required=true pero RequestIR.persistence.required=false. "
+                    "Abortando para evitar degradación a SPEC sin persistencia."
+                )
 
-                _dump_debug_json("request_ir.json", request_ir_to_dict(req_ir))
-            except Exception:
-                pass
+        spec = build_spec_from_request_ir(req_ir)
 
-            # Checks defensivos: si el contexto traía señal estructurada, no aceptamos degradación silenciosa
-            if isinstance(contexto_normalizado, dict):
-                if (contexto_normalizado.get("contratos_api_propuestos") or []) and not req_ir.proposed_api_contracts:
-                    raise ValueError(
-                        "RequestIR vacío: contexto_normalizado contenía contratos_api_propuestos pero RequestIR.proposed_api_contracts quedó vacío. "
-                        "Esto indica pérdida de contexto o parseo incorrecto. Abortando para evitar fallback silencioso a /health."
-                    )
-                pctx = contexto_normalizado.get("persistence")
-                if isinstance(pctx, dict) and bool(pctx.get("required")) and not req_ir.persistence.required:
-                    raise ValueError(
-                        "RequestIR inconsistente: contexto_normalizado.persistence.required=true pero RequestIR.persistence.required=false. "
-                        "Abortando para evitar degradación a SPEC sin persistencia."
-                    )
-
-            spec = build_spec_from_request_ir(req_ir)
-
-            # DEBUG #3: SPEC base determinista (antes de LLM/alineación)
-            _dump_debug_json("spec_base.json", spec)
-        except Exception as e:
-            # No cortamos aquí: permitimos fallback a legacy para mantener ejecutabilidad,
-            # pero el objetivo del refactor es que este camino sea raro.
-            errores_spec = [f"spec_determinista_error: {e}"]
-            spec = None
+        # DEBUG #3: SPEC base determinista
+        _dump_debug_json("spec_base.json", spec)
+    except Exception as e:
+        errores_spec = [f"spec_determinista_error: {e}"]
+        raise RuntimeError(f"No se pudo construir SPEC determinista: {e}") from e
 
     # ------------------------------------------------------------
     # Validación fuerte del SPEC (nuevo flujo determinista)
@@ -731,48 +723,6 @@ def generar_proyecto_completo(
                     _serialize_validation_errors(warns0),
                 )
             spec["status"] = "valid"
-
-    # ------------------------------------------------------------
-    # DEPRECATED: legacy LLM spec generation, not used by contract-first flow.
-    # ------------------------------------------------------------
-    if not isinstance(spec, dict) or not spec:
-        raise RuntimeError(
-            "DEPRECATED legacy SPEC generation path triggered. "
-            "The contract-first flow requires a deterministic SPEC from RequestIR. "
-            "Fix RequestIR/SpecBuilder instead of falling back to LLM."
-        )
-
-    if not spec:
-        print("[DEBUG] No se pudo generar un SPEC válido.")
-        if errores_spec:
-            print("[DEBUG] Errores SPEC:", errores_spec)
-
-        # Persistencia de debug (solo en fallo) para diagnosticar:
-        # - si el LLM devolvió JSON inválido / truncado
-        # - o si el SPEC incumple invariantes (entrypoint/run_command/files/endpoints[*].file, etc.)
-        try:
-            debug_dir = Path("output/_debug")
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            debug_path = debug_dir / f"spec_failure_{ts}.json"
-            payload = {
-                "timestamp": ts,
-                "descripcion_global": descripcion_global,
-                "contexto_normalizado": contexto_normalizado,
-                "errores_spec": errores_spec,
-                # contract-first: ya no existe prompt_spec (legacy eliminado)
-                "prompt_spec": None,
-                # `resp` y `spec` no están disponibles aquí si falló antes de parsear o si se pisaron;
-                # por eso guardamos lo que tengamos en variables locales si existen.
-                "last_raw_response": locals().get("resp"),
-                "last_parsed_spec": locals().get("spec"),
-            }
-            debug_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"[DEBUG] SPEC failure dump guardado en: {debug_path.as_posix()}")
-        except Exception as e:
-            print(f"[DEBUG] No se pudo guardar SPEC failure dump: {e}")
-
-        return {"files": []}
 
     return _generar_desde_spec_validado(
         spec=spec,

@@ -309,11 +309,29 @@ def _build_request_block(c: ApiContractIR) -> Tuple[Dict[str, Any], List[str]]:
 def _build_response_block(c: ApiContractIR) -> Tuple[Dict[str, Any], List[str]]:
     assumptions: List[str] = []
 
-    ex = dict(c.response_example or {})
-    if not ex:
-        ex = {"ok": True}
-        assumptions.append(f"Response example vacío para {c.method} {c.path}; se usó {{\"ok\": true}} por defecto.")
-    return {"json_example": ex}, assumptions
+    ex = c.response_example
+
+    # Preservar dict o list tal cual si vienen del contrato.
+    if isinstance(ex, dict):
+        if ex:
+            return {"json_example": ex}, assumptions
+        assumptions.append(
+            f"Response example vacío (dict) para {c.method} {c.path}; se usó {{\"ok\": true}} por defecto."
+        )
+        return {"json_example": {"ok": True}}, assumptions
+
+    if isinstance(ex, list):
+        if ex:
+            return {"json_example": ex}, assumptions
+        # lista vacía: preservar tipo y registrar assumption (no convertir a dict)
+        assumptions.append(
+            f"Response example vacío (list) para {c.method} {c.path}; se preservó [] (debe confirmarse el ejemplo real)."
+        )
+        return {"json_example": []}, assumptions
+
+    # Si no hay ejemplo utilizable, default seguro.
+    assumptions.append(f"Response example ausente para {c.method} {c.path}; se usó {{\"ok\": true}} por defecto.")
+    return {"json_example": {"ok": True}}, assumptions
 
 
 def _dedupe_endpoints_by_method_path(endpoints: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
