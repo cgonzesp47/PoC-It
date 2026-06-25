@@ -36,18 +36,36 @@ def seleccionar_error_bloqueante(errores: List[str]) -> Tuple[str, str] | None:
     """
     Selecciona un único error "prioritario" para reparación atómica.
     Devuelve (path, mensaje) si puede; si no, None.
+
+    Arquitectura preferida (nuevo estándar):
+    - app/core/config.py
+    - app/api/endpoints/*.py
+    - app/api/router.py
+    - app/main.py
+
+    Compat opcional (legacy):
+    - app/config/*
+    - app/endpoints/*
     """
     by_file = extraer_errores_por_archivo(errores)
 
-    # Heurística simple y estable:
-    # - priorizar archivos de config/DB (suelen disparar security/env)
-    # - luego endpoints/services
+    preferred_exact = (
+        "app/core/config.py",
+        "app/api/router.py",
+        "app/main.py",
+    )
+    for p0 in preferred_exact:
+        if p0 in by_file and by_file[p0]:
+            return p0, by_file[p0][0]
+
     preferred_prefixes = (
-        "app/config/",
-        "app/db",
-        "app/settings",
-        "app/endpoints/",
+        "app/core/",
+        "app/api/endpoints/",
+        "app/api/",
         "app/services/",
+        # legacy (no preferente)
+        "app/config/",
+        "app/endpoints/",
     )
     for pref in preferred_prefixes:
         for p, msgs in by_file.items():
@@ -116,10 +134,17 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
                 if isinstance(resp, dict) and "json_example" in resp:
                     response_example_by_path[path] = resp.get("json_example")
 
-    # --- 1) main.py: include_router debe incluir SOLO routers de endpoints listados ---
+    # --- 1) main.py: imports de endpoints deben corresponder al SPEC ---
     main_src = by_path.get("app/main.py", "")
     if main_src:
-        # Heurística: si main.py importa app.endpoints.X y X.py no está en spec -> error
+        # Preferido: app.api.endpoints.<name>
+        for m in re.findall(r"from\s+app\.api\.endpoints\.([a-zA-Z0-9_]+)\s+import\s+router", main_src):
+            f = f"app/api/endpoints/{m}.py"
+            if expected_ep_files and f not in expected_ep_files:
+                errores.append(f"Endpoint extra no listado en SPEC (importado en main.py): {f}")
+                reparar.add("app/main.py")
+
+        # Compat legacy: app.endpoints.<name>
         for m in re.findall(
             r"from\s+app\.endpoints\.([a-zA-Z0-9_]+)\s+import\s+router",
             main_src,
@@ -145,7 +170,10 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
 
         if any_json_endpoint:
             for p, src in by_path.items():
-                if not p.startswith("app/endpoints/") or not p.endswith(".py"):
+                if not p.endswith(".py"):
+                    continue
+                is_endpoint_file = p.startswith("app/api/endpoints/") or p.startswith("app/endpoints/")
+                if not is_endpoint_file:
                     continue
                 uses_uploadfile = "UploadFile" in src or "File(" in src
                 if uses_uploadfile and not any_multipart_endpoint:
@@ -176,7 +204,7 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
             continue
         if "except Exception" in src and "logger.exception" not in src:
             msg = f"Falta logging obligatorio (logger.exception) en: {p}"
-            if p.startswith(("app/endpoints/", "app/services/")):
+            if p.startswith(("app/api/endpoints/", "app/endpoints/", "app/services/")):
                 errores.append(msg)
                 reparar.add(p)
             else:
@@ -193,7 +221,9 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
         expected_keys = [str(k) for k in json_example.keys()]
 
         for file_path, source_code in by_path.items():
-            if not file_path.startswith("app/endpoints/") or not file_path.endswith(".py"):
+            if not file_path.endswith(".py"):
+                continue
+            if not (file_path.startswith("app/api/endpoints/") or file_path.startswith("app/endpoints/")):
                 continue
             if path not in source_code or "@router" not in source_code:
                 continue

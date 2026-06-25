@@ -171,7 +171,12 @@ def _dump_codegen_file_accepted(*, path: str, file_obj: Dict[str, str]) -> None:
         pass
 
 
-def _extract_single_generated_file(*, data: dict, expected_path: str) -> Dict[str, str] | None:
+def _extract_single_generated_file(
+    *,
+    data: dict,
+    expected_path: str,
+    allow_empty_content: bool = False,
+) -> Dict[str, str] | None:
     """
     Acepta:
     - {"path": expected_path, "content": "..."}
@@ -181,36 +186,52 @@ def _extract_single_generated_file(*, data: dict, expected_path: str) -> Dict[st
     - JSON sin path/content
     - files con != 1
     - path distinto
-    - content vacío
+    - content vacío (salvo allow_empty_content=True)
     """
     expected_path = (expected_path or "").replace("\\", "/")
 
     if not isinstance(data, dict) or not data:
         return None
 
-    if "path" in data and "content" in data:
-        p = str(data.get("path") or "").replace("\\", "/")
-        c = str(data.get("content") or "")
+    def _extract_one(obj: dict) -> Dict[str, str] | None:
+        if not isinstance(obj, dict):
+            return None
+        if "path" not in obj or "content" not in obj:
+            return None
+
+        p_raw = obj.get("path")
+        c_raw = obj.get("content")
+
+        if not isinstance(p_raw, str):
+            return None
+        if not isinstance(c_raw, str):
+            return None
+
+        p = p_raw.replace("\\", "/")
+        c = c_raw
+
         if p != expected_path:
             return None
-        if not c.strip():
+        if (not c.strip()) and not allow_empty_content:
             return None
         return {"path": p, "content": c}
 
+    if "path" in data and "content" in data:
+        return _extract_one(data)
+
     files = data.get("files")
     if isinstance(files, list) and len(files) == 1 and isinstance(files[0], dict):
-        p = str(files[0].get("path") or "").replace("\\", "/")
-        c = str(files[0].get("content") or "")
-        if p != expected_path:
-            return None
-        if not c.strip():
-            return None
-        return {"path": p, "content": c}
+        return _extract_one(files[0])
 
     return None
 
 
-def _parse_single_file_response(*, raw: str, expected_path: str) -> Tuple[Optional[Dict[str, str]], List[str]]:
+def _parse_single_file_response(
+    *,
+    raw: str,
+    expected_path: str,
+    allow_empty_content: bool = False,
+) -> Tuple[Optional[Dict[str, str]], List[str]]:
     """
     Parser tolerante: devuelve (file_obj, errors).
 
@@ -225,7 +246,28 @@ def _parse_single_file_response(*, raw: str, expected_path: str) -> Tuple[Option
     if isinstance(files, list) and len(files) > 1:
         return None, ["multiple_files_returned"]
 
-    file_obj = _extract_single_generated_file(data=data, expected_path=expected_path)
+    # Mejora de error: si path es correcto pero content vacío, distinguimos el caso.
+    try:
+        if "path" in data and "content" in data:
+            p = data.get("path")
+            c = data.get("content")
+            if isinstance(p, str) and p.replace("\\", "/") == expected_path and isinstance(c, str) and not c.strip():
+                if not allow_empty_content:
+                    return None, ["empty_content_not_allowed"]
+        if isinstance(files, list) and len(files) == 1 and isinstance(files[0], dict):
+            p = files[0].get("path")
+            c = files[0].get("content")
+            if isinstance(p, str) and p.replace("\\", "/") == expected_path and isinstance(c, str) and not c.strip():
+                if not allow_empty_content:
+                    return None, ["empty_content_not_allowed"]
+    except Exception:
+        pass
+
+    file_obj = _extract_single_generated_file(
+        data=data,
+        expected_path=expected_path,
+        allow_empty_content=allow_empty_content,
+    )
     if not file_obj:
         return None, ["single_file_extract_failed"]
     return file_obj, []
@@ -286,10 +328,22 @@ def _validate_single_generated_file_against_contract(
                 continue
             if sym == "router":
                 continue
+
+            # Solo tiene sentido validar defs para identificadores Python válidos.
+            # Si el contract trae símbolos con caracteres especiales (p.ej. "create_producto("),
+            # no deben romper el validador.
+            if not sym.isidentifier():
+                continue
+
             # requerido como def/async def
             # Evitar falsos positivos por strings/comentarios: buscamos defs al inicio de línea.
             pattern = r"(?m)^\s*(async\s+def|def)\s+" + re.escape(sym) + r"\s*\("
-            if not re.search(pattern, content):
+            try:
+                ok = bool(re.search(pattern, content))
+            except re.error:
+                ok = False
+
+            if not ok:
                 errors.append(f"missing_required_symbol_def:{sym}")
     elif kind == "config":
         if "class Settings" not in content:
@@ -388,6 +442,13 @@ def _generar_archivos_por_file_contracts(
         if not path or path not in allowed_paths:
             continue
 
+        # package_init NO debe depender del LLM: determinista y robusto.
+        if kind == "package_init":
+            file_obj = {"path": path, "content": ""}
+            by_path[path] = ""
+            _dump_codegen_file_accepted(path=path, file_obj=file_obj)
+            continue
+
         related = _related_contracts_for(contract=fc, file_contracts=sorted_contracts, spec=spec)
 
         last_errors: List[str] = []
@@ -425,7 +486,11 @@ def _generar_archivos_por_file_contracts(
                 provider_hint="gen-code",
             )
 
-            file_obj, parse_errs = _parse_single_file_response(raw=raw, expected_path=path)
+            file_obj, parse_errs = _parse_single_file_response(
+                raw=raw,
+                expected_path=path,
+                allow_empty_content=False,
+            )
             if parse_errs:
                 _dump_codegen_raw_for_debug(path=path, intento=intento, raw=raw)
                 last_errors = parse_errs
@@ -745,33 +810,49 @@ def _generar_archivos_por_lotes(
     return files_generados
 
 
-def _validar_y_reparar_final(
+def _validar_y_reparar_final_with_report(
     *,
     spec: dict,
     files_generados: List[Dict[str, str]],
     allowed_paths: Set[str],
     intentos: int,
     file_contracts: Optional[List[dict]] = None,
-) -> bool:
+) -> tuple[bool, dict]:
     """
-    Aplica la fase final de validación + repairs sobre `files_generados` IN-MEMORY.
+    Variante reportable de `_validar_y_reparar_final`.
 
-    Mantiene EXACTAMENTE el comportamiento previo (antes duplicado en 2 flows):
-    - AST global
-    - imports internos + repair loop de imports
-    - guardrails + repair atómico por restricción
+    Devuelve: (ok, report)
+    report = {
+      "ast_ok": bool,
+      "file_contracts_ok": bool,
+      "imports_ok": bool,
+      "guardrails_ok": bool,
+      "errors": [str],
+      "warnings": [str],
+    }
 
-    Devuelve:
-    - True si el proyecto queda en estado válido
-    - False si no converge o hay fallos no reparables
+    Importante:
+    - No imprime por stdout.
+    - Mantiene el comportamiento (repairs) del flujo actual.
     """
+    report = {
+        "ast_ok": True,
+        "file_contracts_ok": True,
+        "imports_ok": True,
+        "guardrails_ok": True,
+        "errors": [],
+        "warnings": [],
+    }
+
     file_contracts = file_contracts or []
     if not isinstance(file_contracts, list):
         file_contracts = []
 
     # 1) AST global
     if not _validar_proyecto(files_generados):
-        return False
+        report["ast_ok"] = False
+        report["errors"].append("AST_INVALID")
+        return False, report
 
     # 1.1) Validación mínima contra FileContracts (post-generación, pre-guardrails)
     fc_violations = _validate_generated_files_against_file_contracts(
@@ -779,10 +860,18 @@ def _validar_y_reparar_final(
         file_contracts=file_contracts,
     )
     if fc_violations:
+        report["file_contracts_ok"] = False
+        report["errors"].append("FILE_CONTRACTS_VIOLATIONS")
+        try:
+            for v in fc_violations:
+                report["errors"].append(f"[{v.code}] {v.path}: {v.message}")
+        except Exception:
+            pass
+
         repair_paths = sorted(list({v.path for v in fc_violations if getattr(v, "path", None)}))
         repair_paths = [p for p in repair_paths if p in allowed_paths]
         if not repair_paths:
-            return False
+            return False, report
 
         max_fc_repairs = max(2, intentos)
         for _ in range(max_fc_repairs):
@@ -820,20 +909,33 @@ def _validar_y_reparar_final(
                 _aplicar_patch_en_memoria(files_generados, cand)
 
             if not _validar_proyecto(files_generados):
+                report["ast_ok"] = False
+                report["errors"].append("AST_INVALID_AFTER_FC_REPAIR")
                 continue
             fc_violations = _validate_generated_files_against_file_contracts(
                 files_generados=files_generados,
                 file_contracts=file_contracts,
             )
             if not fc_violations:
+                report["file_contracts_ok"] = True
                 break
 
         if fc_violations:
-            return False
+            report["file_contracts_ok"] = False
+            report["errors"].append("FILE_CONTRACTS_REPAIR_NOT_CONVERGED")
+            return False, report
 
     # 2) Imports globales vs allowed_paths
     ok_imports, e_imports = _validar_imports_internos(files_generados, allowed_paths)
     if not ok_imports:
+        report["imports_ok"] = False
+        report["errors"].append("IMPORTS_INVALID")
+        try:
+            for e in e_imports or []:
+                report["errors"].append(str(e))
+        except Exception:
+            pass
+
         patched_ok, _repair_paths = aplicar_repair_loop_imports(
             spec=spec,
             files_generados=files_generados,
@@ -843,21 +945,38 @@ def _validar_y_reparar_final(
             intentos=intentos,
         )
         if not patched_ok:
-            return False
+            report["errors"].append("IMPORTS_REPAIR_NOT_CONVERGED")
+            return False, report
 
-        ok_imports2, _e_imports2 = _validar_imports_internos(files_generados, allowed_paths)
+        ok_imports2, e_imports2 = _validar_imports_internos(files_generados, allowed_paths)
         if not ok_imports2:
-            return False
+            report["imports_ok"] = False
+            report["errors"].append("IMPORTS_INVALID_AFTER_REPAIR")
+            try:
+                for e in e_imports2 or []:
+                    report["errors"].append(str(e))
+            except Exception:
+                pass
+            return False, report
 
-    # 3) Guardrails por SPEC (contrato usuario): si fallan, intentamos repair dirigido
+        report["imports_ok"] = True
+
+    # 3) Guardrails por SPEC (contrato usuario)
     guard = guardrails_por_spec(spec, files_generados)
     if guard.warnings:
-        if not is_demo_mode():
-            print("[DEBUG] Guardrails warnings:", guard.warnings)
+        report["warnings"].extend(list(guard.warnings))
 
     if not guard.ok:
+        report["guardrails_ok"] = False
+        report["errors"].append("GUARDRAILS_FAILED")
+        try:
+            for e in guard.errors or []:
+                report["errors"].append(str(e))
+        except Exception:
+            pass
+
         if not guard.repair_paths:
-            return False
+            return False, report
 
         max_guardrail_repairs = max(2, intentos)
         for _ in range(max_guardrail_repairs):
@@ -886,17 +1005,43 @@ def _validar_y_reparar_final(
             cand = data.get("files")
             if isinstance(cand, list) and cand:
                 _aplicar_patch_en_memoria(files_generados, cand)
-
                 guard = guardrails_por_spec(spec, files_generados)
                 if guard.ok:
+                    report["guardrails_ok"] = True
                     break
                 continue
             break
 
         if not guard.ok:
-            return False
+            report["guardrails_ok"] = False
+            report["errors"].append("GUARDRAILS_REPAIR_NOT_CONVERGED")
+            return False, report
 
-    return True
+    report["guardrails_ok"] = True
+    return True, report
+
+
+def _validar_y_reparar_final(
+    *,
+    spec: dict,
+    files_generados: List[Dict[str, str]],
+    allowed_paths: Set[str],
+    intentos: int,
+    file_contracts: Optional[List[dict]] = None,
+) -> bool:
+    """
+    Wrapper legacy para mantener compatibilidad: devuelve solo bool.
+
+    Fuente de verdad: `_validar_y_reparar_final_with_report`.
+    """
+    ok, _report = _validar_y_reparar_final_with_report(
+        spec=spec,
+        files_generados=files_generados,
+        allowed_paths=allowed_paths,
+        intentos=intentos,
+        file_contracts=file_contracts,
+    )
+    return bool(ok)
 
 
 def _generar_desde_spec_validado(
@@ -968,7 +1113,14 @@ def _generar_desde_spec_validado(
     )
 
     if not files_generados:
-        return {"files": [], "spec": spec}
+        return {
+            "files": [],
+            "spec": spec,
+            "codegen_status": "failed",
+            "materializable": False,
+            "codegen_errors": ["file_contract_generation_failed"],
+            "validation_report": None,
+        }
 
     # DEBUG: confirmar restrictions finales (post-compilación + sanitización)
     try:
@@ -991,20 +1143,46 @@ def _generar_desde_spec_validado(
     except Exception:
         pass
 
-    if not _validar_y_reparar_final(
+    ok_final, report = _validar_y_reparar_final_with_report(
         spec=spec,
         files_generados=files_generados,
         allowed_paths=allowed_paths,
         intentos=intentos,
         file_contracts=file_contracts_dict,
-    ):
-        if not is_demo_mode():
-            print("[DEBUG] Fase final de validación/repair no convergió.")
-        # Importante: si el SPEC es válido pero la fase final no converge, devolvemos el SPEC
-        # para permitir reintentos aguas arriba (orquestador) reutilizando la “fuente de verdad”.
-        return {"files": [], "spec": spec}
+    )
 
-    return {"files": files_generados, "spec": spec}
+    # persist report para diagnóstico (siempre, best-effort)
+    try:
+        debug_dir = Path("output/_debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / "final_validation_report.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    if not ok_final:
+        if not is_demo_mode():
+            print("[DEBUG] Fase final de validación/repair no convergió (pero hay candidatos).")
+
+        return {
+            "files": files_generados,
+            "spec": spec,
+            "codegen_status": "generated_with_errors",
+            "materializable": True,
+            "codegen_errors": ["final_validation_failed"],
+            "validation_report": report,
+        }
+
+    return {
+        "files": files_generados,
+        "spec": spec,
+        "codegen_status": "valid",
+        "materializable": True,
+        "codegen_errors": [],
+        "validation_report": report,
+    }
 
 
 def generar_proyecto_desde_spec(
