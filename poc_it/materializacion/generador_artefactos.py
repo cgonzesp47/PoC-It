@@ -48,17 +48,12 @@ from poc_it.generador.repair_loop import (
     aplicar_repair_loop_imports,
 )
 from poc_it.generador.restrictions import compilar_restricciones
-from poc_it.generador.spec_alignment import (
-    alinear_spec_con_contexto as _alinear_spec_con_contexto,
-)
 from poc_it.generador.spec_validation import (
     SpecValidationError as _SpecValidationError,
     completar_inits_en_files as _completar_inits_en_files,
-    normalizar_paths as _normalizar_paths,
     persistir_spec_debug as _persistir_spec_debug,
     repair_spec_deterministic as _repair_spec_deterministic,
     validate_spec as _validate_spec,
-    validar_spec as _validar_spec,
 )
 from poc_it.generador.prompts_lotes import (
     build_prompt_lote as _build_prompt_lote,
@@ -69,8 +64,15 @@ from poc_it.generador.file_contracts import (
     build_file_contracts_from_spec as _build_file_contracts_from_spec,
     file_contracts_to_dict as _file_contracts_to_dict,
 )
+from poc_it.materializacion.file_contracts_validation import (
+    validate_generated_files_against_file_contracts as _validate_generated_files_against_file_contracts,
+)
 from poc_it.generador.prompts_guardrails import (
     build_repair_prompt_por_restriccion as _build_repair_prompt_por_restriccion,
+)
+from poc_it.generador.prompts_file_contracts import (
+    build_prompt_file_contract as _build_prompt_file_contract,
+    build_prompt_file_contract_fix as _build_prompt_file_contract_fix,
 )
 from poc_it.generador.validators import (
     validar_imports_internos as _validar_imports_internos,
@@ -82,7 +84,405 @@ from poc_it.infraestructura.llm_client import chat_completion_json, solicitarJSO
 
 
 # ==========================================================
-# AGRUPACIÓN DE LOTES
+# GENERACIÓN ROBUSTA POR ARCHIVO (FileContracts)
+# ==========================================================
+
+
+def _sort_file_contracts_for_generation(file_contracts: List[dict]) -> List[dict]:
+    """
+    Orden determinista recomendado para reducir referencias rotas.
+
+    Orden requerido por la estrategia contract-first (fase actual):
+    - package_init
+    - requirements
+    - config
+    - endpoint
+    - router
+    - main
+    - docs
+    - unknown al final
+    """
+    kind_order = {
+        "package_init": 0,
+        "requirements": 1,
+        "config": 2,
+        "endpoint": 3,
+        "router": 4,
+        "main": 5,
+        "docs": 6,
+    }
+
+    def key(fc: dict) -> tuple:
+        k = str(fc.get("kind") or "")
+        p = str(fc.get("path") or "")
+        return (kind_order.get(k, 50), p)
+
+    return sorted([fc for fc in file_contracts if isinstance(fc, dict)], key=key)
+
+
+def _debug_safe_path_token(path: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", (path or "unknown").replace("/", "_").replace("\\", "_"))
+
+
+def _dump_codegen_raw_for_debug(*, path: str, intento: int, raw: str) -> None:
+    """
+    Persiste el RAW del LLM para diagnóstico cuando viene truncado/JSON inválido.
+
+    Requisito: output/_debug/codegen_raw_<safe_path>_attempt_<n>.txt
+    """
+    try:
+        safe = _debug_safe_path_token(path)
+        debug_dir = Path("output/_debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / f"codegen_raw_{safe}_attempt_{intento}.txt").write_text(raw or "", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _dump_codegen_contract_errors(*, path: str, errors: List[str]) -> None:
+    """
+    Requisito: output/_debug/codegen_contract_errors_<safe_path>.json
+    """
+    try:
+        safe = _debug_safe_path_token(path)
+        debug_dir = Path("output/_debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / f"codegen_contract_errors_{safe}.json").write_text(
+            json.dumps({"path": path, "errors": errors}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _dump_codegen_file_accepted(*, path: str, file_obj: Dict[str, str]) -> None:
+    """
+    Requisito: output/_debug/codegen_file_<safe_path>.json
+    """
+    try:
+        safe = _debug_safe_path_token(path)
+        debug_dir = Path("output/_debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / f"codegen_file_{safe}.json").write_text(
+            json.dumps(file_obj, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _extract_single_generated_file(*, data: dict, expected_path: str) -> Dict[str, str] | None:
+    """
+    Acepta:
+    - {"path": expected_path, "content": "..."}
+    - {"files": [{"path": expected_path, "content": "..."}]}
+
+    Rechaza:
+    - JSON sin path/content
+    - files con != 1
+    - path distinto
+    - content vacío
+    """
+    expected_path = (expected_path or "").replace("\\", "/")
+
+    if not isinstance(data, dict) or not data:
+        return None
+
+    if "path" in data and "content" in data:
+        p = str(data.get("path") or "").replace("\\", "/")
+        c = str(data.get("content") or "")
+        if p != expected_path:
+            return None
+        if not c.strip():
+            return None
+        return {"path": p, "content": c}
+
+    files = data.get("files")
+    if isinstance(files, list) and len(files) == 1 and isinstance(files[0], dict):
+        p = str(files[0].get("path") or "").replace("\\", "/")
+        c = str(files[0].get("content") or "")
+        if p != expected_path:
+            return None
+        if not c.strip():
+            return None
+        return {"path": p, "content": c}
+
+    return None
+
+
+def _parse_single_file_response(*, raw: str, expected_path: str) -> Tuple[Optional[Dict[str, str]], List[str]]:
+    """
+    Parser tolerante: devuelve (file_obj, errors).
+
+    Requisito: el caller debe persistir RAW si falla parseo.
+    """
+    expected_path = (expected_path or "").replace("\\", "/")
+    data = extraer_json_tolerante(raw) or {}
+    if not isinstance(data, dict) or not data:
+        return None, ["json_parse_failed"]
+
+    files = data.get("files")
+    if isinstance(files, list) and len(files) > 1:
+        return None, ["multiple_files_returned"]
+
+    file_obj = _extract_single_generated_file(data=data, expected_path=expected_path)
+    if not file_obj:
+        return None, ["single_file_extract_failed"]
+    return file_obj, []
+
+
+def _validate_single_generated_file_against_contract(
+    *,
+    file: Dict[str, str],
+    contract: dict,
+) -> List[str]:
+    """
+    Validación local mínima por archivo (determinista).
+    Devuelve lista de errores (strings).
+    """
+    errors: List[str] = []
+    expected_path = str(contract.get("path") or "").replace("\\", "/")
+    kind = str(contract.get("kind") or "")
+
+    path = str(file.get("path") or "").replace("\\", "/")
+    content = str(file.get("content") or "")
+
+    if path != expected_path:
+        errors.append(f"path_mismatch: expected={expected_path} got={path}")
+        return errors
+
+    if kind != "package_init":
+        if not content.strip():
+            errors.append("empty_content")
+
+    # AST parse si es .py y no está vacío (permitimos __init__ vacío)
+    if expected_path.endswith(".py") and content.strip():
+        try:
+            import ast
+
+            ast.parse(content)
+        except SyntaxError as e:
+            errors.append(f"syntax_error: {e}")
+
+    # Checks por kind (mínimos)
+    required_symbols = contract.get("required_symbols") or []
+    if not isinstance(required_symbols, list):
+        required_symbols = []
+
+    if kind == "main":
+        if "app" in required_symbols and "app" not in content:
+            errors.append("missing_symbol_app")
+        if "include_router" in content and "app.include_router" not in content:
+            # suave, pero útil si el modelo alucina
+            pass
+    elif kind == "router":
+        if "api_router" in required_symbols and "api_router" not in content:
+            errors.append("missing_symbol_api_router")
+    elif kind == "endpoint":
+        if "router = APIRouter()" not in content:
+            errors.append("missing_router_assignment")
+        for sym in required_symbols:
+            if not isinstance(sym, str) or not sym.strip():
+                continue
+            if sym == "router":
+                continue
+            # requerido como def/async def
+            # Evitar falsos positivos por strings/comentarios: buscamos defs al inicio de línea.
+            pattern = r"(?m)^\s*(async\s+def|def)\s+" + re.escape(sym) + r"\s*\("
+            if not re.search(pattern, content):
+                errors.append(f"missing_required_symbol_def:{sym}")
+    elif kind == "config":
+        if "class Settings" not in content:
+            errors.append("config_missing_settings_class")
+        if "def get_settings" not in content:
+            errors.append("config_missing_get_settings")
+
+    return errors
+
+
+def _related_contracts_for(
+    *,
+    contract: dict,
+    file_contracts: List[dict],
+    spec: dict,
+    max_related: int = 6,
+) -> List[dict]:
+    """
+    Usa bundle_files SOLO como contexto: busca contracts cuyos paths estén en bundle_files.
+    """
+    related: List[dict] = []
+    p = str(contract.get("path") or "").replace("\\", "/")
+
+    # Map path->contract
+    by_path = {str(fc.get("path") or "").replace("\\", "/"): fc for fc in file_contracts if isinstance(fc, dict)}
+
+    # Buscar endpoint en spec que coincida con este path
+    for ep in spec.get("endpoints", []) if isinstance(spec, dict) else []:
+        if not isinstance(ep, dict):
+            continue
+        if str(ep.get("file") or "").replace("\\", "/") != p:
+            continue
+        extras = ep.get("bundle_files") or []
+        if isinstance(extras, list):
+            for x in extras:
+                xp = str(x or "").replace("\\", "/")
+                if xp in by_path and xp != p:
+                    related.append(by_path[xp])
+
+    # Dedup + cap
+    out = []
+    seen = set()
+    for fc in related:
+        rp = str(fc.get("path") or "").replace("\\", "/")
+        if rp in seen:
+            continue
+        seen.add(rp)
+        out.append(fc)
+        if len(out) >= max_related:
+            break
+    return out
+
+
+def _max_tokens_for_kind(kind: str) -> int:
+    kind = (kind or "").strip()
+    if kind in ("endpoint",):
+        return 3000
+    if kind in ("router", "main", "config"):
+        return 2200
+    if kind in ("requirements", "docs"):
+        return 1400
+    return 1800
+
+
+def _generar_archivos_por_file_contracts(
+    *,
+    spec: dict,
+    file_contracts: List[dict],
+    intentos: int,
+    descripcion_global: str = "",
+    contexto_normalizado: Optional[dict] = None,
+) -> List[Dict[str, str]] | None:
+    """
+    Estrategia robusta principal:
+    1 FileContract = 1 llamada LLM = 1 archivo.
+
+    Contrato:
+    - Devuelve list[{"path","content"}] si converge para TODOS los paths obligatorios.
+    - Devuelve None si algún archivo obligatorio no converge.
+
+    Reglas:
+    - No generar paths fuera de spec.files
+    - No generar archivos extra
+    - No usar _agrupar_lotes()
+    - No usar bundle_files para agrupar generación (solo contexto opcional)
+    """
+    allowed_paths = set((p or "").replace("\\", "/") for p in (spec.get("files") or []) if isinstance(p, str))
+    sorted_contracts = _sort_file_contracts_for_generation(file_contracts)
+
+    # Map para acumular incrementalmente (path->content)
+    by_path: Dict[str, str] = {}
+
+    for fc in sorted_contracts:
+        path = str(fc.get("path") or "").replace("\\", "/")
+        kind = str(fc.get("kind") or "")
+        if not path or path not in allowed_paths:
+            continue
+
+        related = _related_contracts_for(contract=fc, file_contracts=sorted_contracts, spec=spec)
+
+        last_errors: List[str] = []
+
+        max_intentos_por_archivo = max(2, int(intentos))
+
+        for intento in range(1, max_intentos_por_archivo + 1):
+            if intento == 1:
+                prompt = _build_prompt_file_contract(
+                    spec=spec,
+                    file_contract=fc,
+                    related_contracts=related,
+                    descripcion_global=descripcion_global,
+                    contexto_normalizado=contexto_normalizado,
+                )
+                fase = "generacion_codigo_file_contract"
+                temperature = 0.2
+            else:
+                prompt = _build_prompt_file_contract_fix(
+                    spec=spec,
+                    file_contract=fc,
+                    previous_content=by_path.get(path, ""),
+                    errors=last_errors or ["previous_attempt_failed"],
+                    related_contracts=related,
+                )
+                fase = "generacion_codigo_file_contract_fix"
+                temperature = 0.1
+
+            raw = solicitarJSONEstructurado(
+                prompt=prompt,
+                system=None,
+                temperature=temperature,
+                max_tokens=_max_tokens_for_kind(kind),
+                fase=fase,
+                provider_hint="gen-code",
+            )
+
+            file_obj, parse_errs = _parse_single_file_response(raw=raw, expected_path=path)
+            if parse_errs:
+                _dump_codegen_raw_for_debug(path=path, intento=intento, raw=raw)
+                last_errors = parse_errs
+                _dump_codegen_contract_errors(path=path, errors=last_errors)
+                continue
+
+            assert file_obj is not None
+
+            local_errs = _validate_single_generated_file_against_contract(file=file_obj, contract=fc)
+            if local_errs:
+                last_errors = local_errs
+                _dump_codegen_contract_errors(path=path, errors=last_errors)
+                continue
+
+            fc_violations = _validate_generated_files_against_file_contracts(
+                files_generados=[file_obj],
+                file_contracts=[fc],
+            )
+            if fc_violations:
+                last_errors = [f"[{v.code}] {v.path}: {v.message}" for v in fc_violations]
+                _dump_codegen_contract_errors(path=path, errors=last_errors)
+                continue
+
+            # accept
+            by_path[path] = file_obj.get("content", "")
+            _dump_codegen_file_accepted(path=path, file_obj=file_obj)
+            last_errors = []
+            break
+
+        if path not in by_path:
+            # no converge para un archivo obligatorio => aborta el proyecto completo
+            if not last_errors:
+                last_errors = ["generation_failed"]
+            _dump_codegen_contract_errors(path=path, errors=last_errors)
+            return None
+
+    # materializa lista final en orden de spec.files (sin extras)
+    out: List[Dict[str, str]] = []
+    for p in spec.get("files", []) if isinstance(spec, dict) else []:
+        if not isinstance(p, str):
+            continue
+        pn = p.replace("\\", "/")
+        if pn in by_path:
+            out.append({"path": pn, "content": by_path[pn]})
+
+    # hard check: todos los archivos del spec deben existir (incluyendo __init__.py autocompletados)
+    missing = sorted([p for p in allowed_paths if p not in by_path])
+    if missing:
+        for m in missing:
+            _dump_codegen_contract_errors(path=m, errors=["missing_after_generation"])
+        return None
+
+    return out
+
+
+# ==========================================================
+# AGRUPACIÓN DE LOTES (DEPRECATED)
 # ==========================================================
 
 
@@ -351,6 +751,7 @@ def _validar_y_reparar_final(
     files_generados: List[Dict[str, str]],
     allowed_paths: Set[str],
     intentos: int,
+    file_contracts: Optional[List[dict]] = None,
 ) -> bool:
     """
     Aplica la fase final de validación + repairs sobre `files_generados` IN-MEMORY.
@@ -364,9 +765,71 @@ def _validar_y_reparar_final(
     - True si el proyecto queda en estado válido
     - False si no converge o hay fallos no reparables
     """
+    file_contracts = file_contracts or []
+    if not isinstance(file_contracts, list):
+        file_contracts = []
+
     # 1) AST global
     if not _validar_proyecto(files_generados):
         return False
+
+    # 1.1) Validación mínima contra FileContracts (post-generación, pre-guardrails)
+    fc_violations = _validate_generated_files_against_file_contracts(
+        files_generados=files_generados,
+        file_contracts=file_contracts,
+    )
+    if fc_violations:
+        repair_paths = sorted(list({v.path for v in fc_violations if getattr(v, "path", None)}))
+        repair_paths = [p for p in repair_paths if p in allowed_paths]
+        if not repair_paths:
+            return False
+
+        max_fc_repairs = max(2, intentos)
+        for _ in range(max_fc_repairs):
+            lote_contracts = [
+                c
+                for c in file_contracts
+                if isinstance(c, dict) and (c.get("path") or "").replace("\\", "/") in set(repair_paths)
+            ]
+            errores = [f"[{v.code}] {v.path}: {v.message}" for v in fc_violations]
+
+            prompt_fix = _build_prompt_lote_fix_errors(
+                spec=spec,
+                lote=repair_paths,
+                errores_lote=errores,
+                ultimo_raw=json.dumps(
+                    {"files": [f for f in files_generados if f.get("path") in set(repair_paths)]},
+                    ensure_ascii=False,
+                ),
+                file_contracts=lote_contracts,
+                file_contract_errors=errores,
+            )
+
+            raw = solicitarJSONEstructurado(
+                prompt=prompt_fix,
+                system=None,
+                temperature=0.1,
+                max_tokens=2200,
+                fase="generacion_codigo_repair_file_contracts",
+                provider_hint="gen-code",
+            )
+
+            data = extraer_json_tolerante(raw) or {}
+            cand = data.get("files")
+            if isinstance(cand, list) and cand:
+                _aplicar_patch_en_memoria(files_generados, cand)
+
+            if not _validar_proyecto(files_generados):
+                continue
+            fc_violations = _validate_generated_files_against_file_contracts(
+                files_generados=files_generados,
+                file_contracts=file_contracts,
+            )
+            if not fc_violations:
+                break
+
+        if fc_violations:
+            return False
 
     # 2) Imports globales vs allowed_paths
     ok_imports, e_imports = _validar_imports_internos(files_generados, allowed_paths)
@@ -442,6 +905,7 @@ def _generar_desde_spec_validado(
     contexto_normalizado: dict | None,
     intentos: int,
     files_iniciales: Optional[List[Dict[str, str]]] = None,
+    descripcion_global: str = "",
 ) -> Dict[str, Any]:
     """
     Ejecuta Fase 2 (generación por lotes) + Fase 3 (validación final) dado un SPEC ya válido.
@@ -484,6 +948,7 @@ def _generar_desde_spec_validado(
             files_generados=files_generados,
             allowed_paths=allowed_paths,
             intentos=intentos,
+            file_contracts=file_contracts_dict,
         ):
             # Importante: si el SPEC es válido pero la fase final no converge, devolvemos el SPEC
             # para permitir reintentos aguas arriba (orquestador) reutilizando la “fuente de verdad”.
@@ -491,22 +956,19 @@ def _generar_desde_spec_validado(
 
         return {"files": files_generados, "spec": spec}
 
-    lotes = _agrupar_lotes(files_plan, spec=spec)
-    lotes = sorted(
-        lotes,
-        key=lambda lote: 1
-        if any(p in ("app/main.py", "app/__init__.py") or p.startswith("app/config/") for p in lote)
-        else 0,
+    # ------------------------------------------------------------
+    # Estrategia principal: generación robusta POR ARCHIVO (FileContract)
+    # ------------------------------------------------------------
+    files_generados = _generar_archivos_por_file_contracts(
+        spec=spec,
+        file_contracts=file_contracts_dict,
+        intentos=intentos,
+        descripcion_global=descripcion_global,
+        contexto_normalizado=contexto_normalizado,
     )
 
-    files_generados = _generar_archivos_por_lotes(
-        spec=spec,
-        lotes=lotes,
-        intentos=intentos,
-        file_contracts=file_contracts_dict,
-    )
     if not files_generados:
-        return {"files": []}
+        return {"files": [], "spec": spec}
 
     # DEBUG: confirmar restrictions finales (post-compilación + sanitización)
     try:
@@ -534,6 +996,7 @@ def _generar_desde_spec_validado(
         files_generados=files_generados,
         allowed_paths=allowed_paths,
         intentos=intentos,
+        file_contracts=file_contracts_dict,
     ):
         if not is_demo_mode():
             print("[DEBUG] Fase final de validación/repair no convergió.")
@@ -575,6 +1038,7 @@ def generar_proyecto_desde_spec(
         contexto_normalizado=contexto_normalizado,
         intentos=intentos,
         files_iniciales=files_iniciales,
+        descripcion_global=descripcion_global,
     )
 
 
@@ -728,4 +1192,5 @@ def generar_proyecto_completo(
         spec=spec,
         contexto_normalizado=contexto_normalizado,
         intentos=intentos,
+        descripcion_global=descripcion_global,
     )

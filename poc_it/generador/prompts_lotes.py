@@ -28,16 +28,45 @@ def build_prompt_lote(*, spec: dict, lote: List[str], file_contracts: Optional[L
 TAREA
 Genera el CONTENIDO de los siguientes archivos de un proyecto FastAPI.
 
-PATRONES CANÓNICOS (COPIAR LITERALMENTE, NO IMPROVISAR)
-Nota: los siguientes patrones son ejemplos. La fuente de verdad es FILE CONTRACTS; solo aplica un patrón si el contract del archivo lo requiere.
+REGLA PRINCIPAL (CONTRACT-FIRST, NO NEGOCIABLE)
+- Para CADA archivo, cumple SU FileContract (kind/responsibilities/required_symbols/imports/notes) ANTES que cualquier ejemplo general.
+- Está PROHIBIDO crear símbolos públicos fuera de `required_symbols` (solo helpers privados si son imprescindibles).
+- Está PROHIBIDO mover símbolos a otros archivos: cada símbolo debe vivir en el archivo cuyo FileContract lo exige.
 
-- FastAPI Depends (ejemplos, no obligatorios si el SPEC/contract no lo requiere):
+FILE CONTRACTS (FUENTE DE VERDAD POR ARCHIVO; CUMPLIR ESTRICTAMENTE):
+{json.dumps(file_contracts, ensure_ascii=False)}
+
+Guía por kind (aplica SOLO si coincide con el FileContract.kind):
+- kind=\"main\" (app/main.py):
+  - Debe definir `app` (FastAPI).
+  - Debe importar `api_router` desde `app.api.router`.
+  - Debe hacer `app.include_router(api_router)`.
+- kind=\"router\" (app/api/router.py):
+  - Debe definir `api_router` (APIRouter).
+  - Debe importar routers locales desde `app.api.endpoints.<modulo>`.
+  - Debe incluirlos con `api_router.include_router(router)`.
+- kind=\"endpoint\" (app/api/endpoints/*.py):
+  - Debe definir `router = APIRouter()`.
+  - Debe definir TODAS las funciones listadas en `required_symbols` del FileContract.
+  - Cada endpoint debe respetar method/path/request/response/errors presentes en el FileContract.endpoints.
+- kind=\"config\" (app/core/config.py):
+  - Debe definir `class Settings` y `def get_settings`.
+  - `get_settings` debe ser lazy/cacheado.
+  - No debe lanzar errores por variables de entorno faltantes al importar el módulo.
+
+PATRONES CANÓNICOS (COPIAR LITERALMENTE, NO IMPROVISAR)
+Nota: los siguientes patrones son ejemplos. Si contradicen un FileContract, el FileContract manda.
+
+- FastAPI Depends (ejemplos, no obligatorios si el FileContract/SPEC no lo requiere):
   - BIEN: `dep: DepType = Depends(get_dep)`
   - MAL:  `dep: Depends(get_dep)` (falta anotación de tipo)
 - Settings lazy (PROHIBIDO evaluar env obligatoria en import-time):
   - BIEN: `def get_settings(): return Settings()` (cacheada) y crear recursos en factorías/deps lazy
   - MAL: instanciar Settings/clients/engines en import-time
-- Si hay capa Service, debe ser inyectable (solo si existe en contracts):
+- Persistencia / DB (NO ES PATRÓN UNIVERSAL):
+  - Está PROHIBIDO inventar SQLAlchemy/get_db/AsyncSession/create_async_engine si NO está exigido por FileContracts/SPEC o no está en dependencies.
+  - Si persistence.required=true pero no hay vendor/capa definida, usa almacenamiento in-memory o fake documentado en README (PoC parcial), sin conexiones externas en import-time.
+- Si hay capa Service/Repository, debe ser inyectable (solo si existe en FileContracts):
   - BIEN: exponer `get_<service>()` y usar `Depends(get_<service>)`
 
 INVARIANTES (COMPILABLE / IMPORTABLE)
@@ -116,29 +145,11 @@ REGLA CRÍTICA: no captures HTTPException en 500
 - No incluyas texto fuera del JSON.
 - No uses bloques ```.
 
-DECISIONES / CONTRATOS DE ESTA PoC (fuente de verdad)
-- ENV esperada:
-{json.dumps(env, ensure_ascii=False)}
-- Dependencias esperadas (runtime):
-{json.dumps(dependencies, ensure_ascii=False)}
-- Dependencias esperadas (dev/tests):
-{json.dumps(dev_dependencies, ensure_ascii=False)}
-- Contratos de comportamiento (por endpoint):
-{json.dumps(contracts, ensure_ascii=False)}
-- Restricciones ejecutables (NO NEGOCIABLES):
-{json.dumps(restrictions, ensure_ascii=False)}
-
-FILE CONTRACTS (fuente de verdad por archivo; CUMPLIR ESTRICTAMENTE):
-{json.dumps(file_contracts, ensure_ascii=False)}
-
-Reglas contract-first:
-- Cumple estos file contracts exactamente.
-- No generes símbolos públicos fuera de contrato salvo helpers privados necesarios.
-- No inventes archivos fuera del lote.
-- No muevas endpoints entre archivos.
-
-SPEC (resumen/soporte, no reemplaza contracts):
+SPEC (resumen/soporte, referencia secundaria):
 {json.dumps(spec, ensure_ascii=False)}
+
+Restricciones ejecutables (NO NEGOCIABLES):
+{json.dumps(restrictions, ensure_ascii=False)}
 
 ARCHIVOS A GENERAR EN ESTE LOTE (exactos):
 {json.dumps(lote, ensure_ascii=False)}
@@ -211,6 +222,8 @@ def build_prompt_lote_fix_errors(
     lote: List[str],
     errores_lote: List[str],
     ultimo_raw: str,
+    file_contracts: Optional[List[dict]] = None,
+    file_contract_errors: Optional[List[str]] = None,
 ) -> str:
     """
     Prompt de reparación por lote cuando hay errores (paths/AST/contenido vacío).
@@ -219,8 +232,27 @@ def build_prompt_lote_fix_errors(
     - Función pura.
     - Mantener el texto igual para no alterar el comportamiento.
     """
+    file_contracts = file_contracts or []
+    if not isinstance(file_contracts, list):
+        file_contracts = []
+    file_contract_errors = file_contract_errors or []
+    if not isinstance(file_contract_errors, list):
+        file_contract_errors = []
+
     return f"""
 Hay errores en los archivos del lote. Corrige SOLO los archivos de este lote.
+
+REGLA PRINCIPAL (CONTRACT-FIRST)
+- Para CADA archivo del lote, cumple SU FileContract ANTES que cualquier ejemplo general.
+- Prohibido mover símbolos a otros archivos.
+- Prohibido crear símbolos públicos fuera de required_symbols.
+- Corrige SOLO los archivos del lote (no tocar otros).
+
+FILE CONTRACTS del lote:
+{json.dumps(file_contracts, ensure_ascii=False)}
+
+Errores de validación FileContracts (si existen):
+- {chr(10).join(file_contract_errors) if file_contract_errors else "(none)"}
 
 Errores:
 - {chr(10).join(errores_lote)}
