@@ -15,7 +15,6 @@ from poc_it.orquestacion.venv_manager import ensure_project_venv_ready
 from poc_it.orquestacion.generacion_tests import generar_tests_unitarios
 from poc_it.orquestacion.pytest_llm_repair import repair_tests_until_pytest_passes
 from poc_it.orquestacion.test_plan import TEST_PLAN_PATH, build_test_plan, persist_test_plan
-from poc_it.orquestacion.tests_coverage_llm_repair import repair_tests_coverage_until_ok
 from poc_it.orquestacion.wiring_verifier import verify_wiring_against_runtime_contracts
 from poc_it.orquestacion.runtime_probe import run_runtime_probe
 from poc_it.entrada.demo_progress import demo_progress, is_demo_mode
@@ -551,23 +550,6 @@ SALIDA
             )
         except Exception as exc:
             logger.info("[TESTS] Error generando tests: %s", exc)
-
-        # Fase C0: coverage loop (solo tests) para asegurar tests por endpoint hermético antes de pytest
-        # DESACTIVADO TEMPORALMENTE: incrementa complejidad y no corrige los fallos más frecuentes observados
-        # (harness roto: fixtures called directly / client fixture missing / async-sync mismatch).
-        #
-        # logger.info("[PIPELINE][C0] Coverage loop (solo tests/ + pytest.ini)")
-        # try:
-        #     max_cov = int(os.getenv("TESTS_COVERAGE_REPAIR_MAX", "2"))
-        #     cov = repair_tests_coverage_until_ok(
-        #         nombre_proyecto=nombre_proyecto,
-        #         estructura=estructura,
-        #         max_repairs=max_cov,
-        #     )
-        #     if not cov.ok:
-        #         logger.info("[TESTS] Coverage repair loop agotado: %s", cov.detail)
-        # except Exception as exc:
-        #     logger.info("[TESTS] Aviso: coverage repair loop no ejecutable: %s", exc)
 
         # Fase C: loop de pytest SOLO sobre tests (prohibido tocar app/**).
         #
