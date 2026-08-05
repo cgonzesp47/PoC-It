@@ -35,6 +35,94 @@ PersistenceKind = Literal[
     "event_log",
     "unknown",
 ]
+RequirementSource = Literal["explicit", "inferred", "default", "unknown"]
+ImplementationLevel = Literal[
+    "fully_local",
+    "integration_skeleton",
+    "mocked",
+    "documentation_only",
+]
+IntegrationKind = Literal[
+    "external_api",
+    "database",
+    "queue",
+    "cache",
+    "object_storage",
+    "email",
+    "auth",
+    "observability",
+    "runtime",
+    "other",
+]
+ActionKind = Literal[
+    "internal_processing",
+    "persistence",
+    "external_call",
+    "validation",
+    "transformation",
+    "notification",
+    "other",
+]
+
+
+@dataclass(frozen=True)
+class AuthenticationIR:
+    mechanism: Optional[str] = None
+    source: RequirementSource = "unknown"
+    evidence: str = ""
+    assumption: str = ""
+
+
+@dataclass(frozen=True)
+class ConfigurationIR:
+    key: str
+    purpose: str = ""
+    required: bool = False
+    secret: bool = False
+    source: RequirementSource = "unknown"
+    evidence: str = ""
+    assumption: str = ""
+    delivery: str = "env"
+
+
+@dataclass(frozen=True)
+class IntegrationIR:
+    id: str
+    name: str
+    kind: IntegrationKind = "other"
+    role: str = ""
+    required: bool = True
+    implementation_level: ImplementationLevel = "integration_skeleton"
+    authentication: AuthenticationIR = field(default_factory=AuthenticationIR)
+    technology_refs: List[str] = field(default_factory=list)
+    configuration_refs: List[str] = field(default_factory=list)
+    packages: List[str] = field(default_factory=list)
+    source: RequirementSource = "unknown"
+    evidence: str = ""
+    assumption: str = ""
+
+
+@dataclass(frozen=True)
+class ActionIR:
+    id: str
+    kind: ActionKind
+    description: str
+    required: bool = True
+    integration_ref: Optional[str] = None
+    source: RequirementSource = "unknown"
+    evidence: str = ""
+    assumption: str = ""
+
+
+@dataclass(frozen=True)
+class ErrorIR:
+    status_code: Optional[int]
+    code: str
+    description: str = ""
+    required: bool = True
+    source: RequirementSource = "unknown"
+    evidence: str = ""
+    assumption: str = ""
 
 
 @dataclass(frozen=True)
@@ -48,11 +136,15 @@ class ApiContractIR:
     response_example: Any = field(default_factory=dict)
     evidence: str = ""
     assumption: str = ""
+    actions: List[ActionIR] = field(default_factory=list)
+    errors: List[ErrorIR] = field(default_factory=list)
+    integration_refs: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class TechnologySignalIR:
     name: str
+    package: str = ""
     category: str = "unknown"
     role: str = ""
     evidence: str = ""
@@ -104,6 +196,8 @@ class RequestIR:
     assumptions: List[str] = field(default_factory=list)
     open_questions: List[str] = field(default_factory=list)
     persistence: PersistenceIR = field(default_factory=PersistenceIR)
+    integrations: List[IntegrationIR] = field(default_factory=list)
+    configuration: List[ConfigurationIR] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------
@@ -139,12 +233,9 @@ def build_request_ir_from_context(
     proposed_raw = ctx.get("contratos_api_propuestos")
 
     if isinstance(explicit_raw, list) or isinstance(proposed_raw, list):
-        # 1) Parse explícitos/propuestos
         explicit_parsed = _parse_contracts(explicit_raw)
         proposed_parsed = _parse_contracts(proposed_raw)
 
-        # 2) Enforce invariantes:
-        # - explícitos requieren evidence; si no, se mueven a propuestos con assumption
         for c in explicit_parsed:
             if _has_literal_evidence(c):
                 explicit_api_contracts.append(c)
@@ -160,14 +251,15 @@ def build_request_ir_from_context(
                             response_example=c.response_example,
                             evidence="",
                             assumption=c.assumption,
+                            actions=list(c.actions or []),
+                            errors=list(c.errors or []),
+                            integration_refs=list(c.integration_refs or []),
                         )
                     )
                 )
 
-        # - propuestos requieren assumption
         proposed_api_contracts.extend([_ensure_proposed_has_assumption(c) for c in proposed_parsed])
     else:
-        # Legacy: contratos_api. Se separa por evidence literal.
         contracts_raw = ctx.get("contratos_api")
         contracts = _parse_contracts(contracts_raw)
 
@@ -182,23 +274,22 @@ def build_request_ir_from_context(
     technology_signals = _parse_technology_signals(ctx.get("technology_signals"))
     domain_entities = _parse_domain_entities(ctx.get("domain_entities"))
     operation_groups = _parse_operation_groups(ctx.get("operation_groups"))
+    integrations = _parse_integrations(ctx.get("integrations"))
+    configuration = _parse_configuration(ctx.get("configuration"))
 
     persistence = build_persistence_ir_from_context(ctx)
 
     assumptions: List[str] = []
-    open_questions: List[str] = []
+    open_questions: List[str] = _list_of_str(ctx.get("open_questions"))
 
-    # gaps estructurales
     if not explicit_api_contracts and proposed_api_contracts:
         assumptions.append(
             "Se han propuesto endpoints sin evidencia literal; deben confirmarse con el usuario antes de tratarlos como contrato explícito."
         )
 
-    # si required=True pero sin evidence estructurada => el validador lo marcará, pero añadimos pregunta
     if persistence.required and not persistence.evidence:
         open_questions.append("Se requiere persistencia según el contexto estructurado, pero falta evidencia textual/citas en el campo persistence.evidence.")
 
-    # si required=True y kind no viene, normalizamos a unknown
     if persistence.required and persistence.kind is None:
         persistence = PersistenceIR(
             required=True,
@@ -226,11 +317,12 @@ def build_request_ir_from_context(
         assumptions=_dedupe_stable(assumptions),
         open_questions=_dedupe_stable(open_questions),
         persistence=persistence,
+        integrations=_dedupe_integrations(integrations),
+        configuration=_dedupe_configuration(configuration),
     )
 
 
 def request_ir_to_dict(ir: RequestIR) -> Dict[str, Any]:
-    # dataclasses.asdict convierte anidados
     return asdict(ir)
 
 
@@ -242,21 +334,84 @@ def validate_request_ir(ir: RequestIR) -> List[str]:
     if not isinstance(ir.objective, str) or not ir.objective.strip():
         errors.append("objective requerido")
 
-    # Contratos: method/path mínimos
-    for c in (ir.explicit_api_contracts or []) + (ir.proposed_api_contracts or []):
-        if not str(c.method).strip():
-            errors.append("ApiContractIR.method vacío")
-        if not str(c.path).strip() or not str(c.path).startswith("/"):
-            errors.append(f"ApiContractIR.path inválido: {c.path!r}")
-        if c.request_type not in ("json", "multipart", "query", "none"):
-            errors.append(f"ApiContractIR.request_type inválido: {c.request_type!r}")
+    technology_signal_names = {s.name.strip().lower() for s in ir.technology_signals or [] if s.name.strip()}
+    integration_ids = {i.id.strip().lower() for i in ir.integrations or [] if i.id.strip()}
+    configuration_keys = {c.key.strip().lower() for c in ir.configuration or [] if c.key.strip()}
 
-    # Regla fuerte: explícitos requieren evidencia literal
+    for integration in ir.integrations or []:
+        if not integration.id.strip():
+            errors.append("integration.id requerido")
+        if not integration.name.strip():
+            errors.append("integration.name requerido")
+        if integration.source == "explicit" and not integration.evidence.strip():
+            errors.append(f"integration.source=explicit requiere evidence: {integration.id or integration.name}")
+        if integration.authentication.source == "explicit" and not integration.authentication.evidence.strip():
+            errors.append(
+                f"authentication.source=explicit requiere evidence en integración: {integration.id or integration.name}"
+            )
+        for configuration_ref in integration.configuration_refs or []:
+            if configuration_ref.strip().lower() not in configuration_keys:
+                errors.append(
+                    f"configuration_ref inexistente en integración {integration.id}: {configuration_ref}"
+                )
+        for technology_ref in integration.technology_refs or []:
+            if technology_ref.strip().lower() not in technology_signal_names:
+                errors.append(
+                    f"technology_ref inexistente en integración {integration.id}: {technology_ref}"
+                )
+
+    for config in ir.configuration or []:
+        if not config.key.strip():
+            errors.append("configuration.key requerido")
+        if config.source == "explicit" and not config.evidence.strip():
+            errors.append(f"configuration.source=explicit requiere evidence: {config.key}")
+
+    for contract in (ir.explicit_api_contracts or []) + (ir.proposed_api_contracts or []):
+        if not str(contract.method).strip():
+            errors.append("ApiContractIR.method vacío")
+        if not str(contract.path).strip() or not str(contract.path).startswith("/"):
+            errors.append(f"ApiContractIR.path inválido: {contract.path!r}")
+        if contract.request_type not in ("json", "multipart", "query", "none"):
+            errors.append(f"ApiContractIR.request_type inválido: {contract.request_type!r}")
+
+        for integration_ref in contract.integration_refs or []:
+            if integration_ref.strip().lower() not in integration_ids:
+                errors.append(
+                    f"integration_ref inexistente en contrato {contract.method} {contract.path}: {integration_ref}"
+                )
+
+        for action in contract.actions or []:
+            if not action.id.strip():
+                errors.append(f"action.id requerido en contrato {contract.method} {contract.path}")
+            if not action.description.strip():
+                errors.append(
+                    f"action.description requerida en contrato {contract.method} {contract.path}: {action.id or '<sin_id>'}"
+                )
+            if action.source == "explicit" and not action.evidence.strip():
+                errors.append(
+                    f"action.source=explicit requiere evidence en contrato {contract.method} {contract.path}: {action.id or '<sin_id>'}"
+                )
+            if action.kind == "external_call" and not _coalesce_str(action.integration_ref, "").strip():
+                errors.append(
+                    f"external_call requiere integration_ref en contrato {contract.method} {contract.path}: {action.id or '<sin_id>'}"
+                )
+            if _coalesce_str(action.integration_ref, "").strip() and action.integration_ref.strip().lower() not in integration_ids:
+                errors.append(
+                    f"integration_ref inexistente en acción {action.id} de {contract.method} {contract.path}: {action.integration_ref}"
+                )
+
+        for error_item in contract.errors or []:
+            if not error_item.code.strip():
+                errors.append(f"error.code requerido en contrato {contract.method} {contract.path}")
+            if error_item.source == "explicit" and not error_item.evidence.strip():
+                errors.append(
+                    f"error.source=explicit requiere evidence en contrato {contract.method} {contract.path}: {error_item.code or '<sin_code>'}"
+                )
+
     for c in ir.explicit_api_contracts or []:
         if not _coalesce_str(c.evidence, "").strip():
             errors.append(f"explicit_api_contracts sin evidence: {c.method} {c.path}")
 
-    # persistencia: required False => kind None y durable_state False
     if not ir.persistence.required:
         if ir.persistence.kind is not None:
             errors.append("persistence.kind no debe informarse si persistence.required=False")
@@ -267,7 +422,6 @@ def validate_request_ir(ir: RequestIR) -> List[str]:
         if ir.persistence.evidence:
             errors.append("persistence.evidence no debe informarse si persistence.required=False")
 
-    # persistencia: required True => kind no None (se permite unknown) y evidence presente
     if ir.persistence.required:
         if ir.persistence.kind is None:
             errors.append("persistence.kind debe ser 'unknown' o un tipo concreto si persistence.required=True")
@@ -294,17 +448,13 @@ def build_persistence_ir_from_context(ctx: Dict[str, Any]) -> PersistenceIR:
     - No inspecciona descripcion_global.
     - No aplica heurísticas por keywords.
     """
-    # 1) Preferir ctx["persistence"]/ctx["persistencia"] si existe.
     for key in ("persistence", "persistencia", "persistence_requirement", "data_lifecycle"):
         v = ctx.get(key)
         if isinstance(v, dict):
             p = _parse_persistence_dict(v, source_key=key)
-            # Si el dict existe pero está "vacío" (required=False, sin evidence), NO cortar:
-            # permitimos fallback desde state_requirements.
             if p is not None and (p.required or p.evidence or p.business_entities):
                 return p
 
-    # 2) Fallback permitido: state_requirements durable con evidence -> persistence requerida
     v_state = ctx.get("state_requirements")
     if isinstance(v_state, dict):
         durable = bool(v_state.get("durable")) if "durable" in v_state else False
@@ -314,7 +464,6 @@ def build_persistence_ir_from_context(ctx: Dict[str, Any]) -> PersistenceIR:
             if p is not None:
                 return p
 
-    # Formato 3: ctx["requisitos_persistencia"] (lista)
     v = ctx.get("requisitos_persistencia")
     if isinstance(v, list) and v:
         p = _parse_persistence_requirements_list(v)
@@ -330,12 +479,11 @@ def _parse_persistence_dict(d: Dict[str, Any], *, source_key: str) -> Optional[P
     1) persistence: {required, kind, durable_state, business_entities, evidence, uncertainty}
     2) state_requirements: {durable, entities, evidence}
     """
-    # Mapeo state_requirements -> persistence
     if source_key == "state_requirements":
         durable = bool(d.get("durable")) if "durable" in d else False
         entities = d.get("entities")
         evidence = d.get("evidence")
-        required = bool(durable)  # regla: durable => persistence requerida
+        required = bool(durable)
         return PersistenceIR(
             required=required,
             kind="unknown" if required else None,
@@ -347,7 +495,6 @@ def _parse_persistence_dict(d: Dict[str, Any], *, source_key: str) -> Optional[P
 
     required = bool(d.get("required")) if "required" in d else False
     durable_state = bool(d.get("durable_state")) if "durable_state" in d else False
-    # normalización: si durable_state True, required debe ser True
     if durable_state:
         required = True
 
@@ -369,10 +516,6 @@ def _parse_persistence_dict(d: Dict[str, Any], *, source_key: str) -> Optional[P
 
 
 def _parse_persistence_requirements_list(items: List[Any]) -> Optional[PersistenceIR]:
-    """
-    Formato 3:
-    requisitos_persistencia: [{required, entity, evidence}, ...]
-    """
     required = False
     entities: List[str] = []
     evidence: List[str] = []
@@ -392,7 +535,6 @@ def _parse_persistence_requirements_list(items: List[Any]) -> Optional[Persisten
         return None
 
     if not required:
-        # si vienen datos pero required no está explicitado, no asumimos
         return PersistenceIR(required=False, kind=None, durable_state=False, business_entities=[], evidence=[], uncertainty="")
 
     return PersistenceIR(
@@ -455,21 +597,81 @@ def _dedupe_stable(items: Sequence[str]) -> List[str]:
     return out
 
 
+def _dedupe_last_by_key(items: Sequence[Any], key_fn: Any) -> List[Any]:
+    out: List[Any] = []
+    seen: Dict[Any, int] = {}
+    for item in items:
+        key = key_fn(item)
+        if key in seen:
+            out[seen[key]] = item
+        else:
+            seen[key] = len(out)
+            out.append(item)
+    return out
+
+
+def _normalize_source(v: Any) -> RequirementSource:
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("explicit", "inferred", "default", "unknown"):
+            return s  # type: ignore[return-value]
+    return "unknown"
+
+
+def _normalize_implementation_level(v: Any) -> ImplementationLevel:
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("fully_local", "integration_skeleton", "mocked", "documentation_only"):
+            return s  # type: ignore[return-value]
+    return "integration_skeleton"
+
+
+def _normalize_integration_kind(v: Any) -> IntegrationKind:
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("external_api", "database", "queue", "cache", "object_storage", "email", "auth", "observability", "runtime", "other"):
+            return s  # type: ignore[return-value]
+    return "other"
+
+
+def _normalize_action_kind(v: Any) -> ActionKind:
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("internal_processing", "persistence", "external_call", "validation", "transformation", "notification", "other"):
+            return s  # type: ignore[return-value]
+    return "other"
+
+
+def _normalize_configuration_delivery(v: Any) -> str:
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("env", "file", "argument", "runtime", "unknown"):
+            return s
+    return "env"
+
+
 def _contract_key(c: ApiContractIR) -> Tuple[str, str]:
     return (str(c.method or "").upper().strip(), str(c.path or "").strip())
 
 
 def _dedupe_contracts(items: Sequence[ApiContractIR]) -> List[ApiContractIR]:
-    out: List[ApiContractIR] = []
-    seen: Dict[Tuple[str, str], int] = {}
-    for c in items:
-        k = _contract_key(c)
-        if k in seen:
-            out[seen[k]] = c
-        else:
-            seen[k] = len(out)
-            out.append(c)
-    return out
+    return _dedupe_last_by_key(items, _contract_key)
+
+
+def _dedupe_integrations(items: Sequence[IntegrationIR]) -> List[IntegrationIR]:
+    return _dedupe_last_by_key(items, lambda i: i.id.strip().lower())
+
+
+def _dedupe_configuration(items: Sequence[ConfigurationIR]) -> List[ConfigurationIR]:
+    return _dedupe_last_by_key(items, lambda c: c.key.strip().lower())
+
+
+def _dedupe_actions(items: Sequence[ActionIR]) -> List[ActionIR]:
+    return _dedupe_last_by_key(items, lambda a: a.id.strip().lower())
+
+
+def _dedupe_errors(items: Sequence[ErrorIR]) -> List[ErrorIR]:
+    return _dedupe_last_by_key(items, lambda e: (e.status_code, e.code.strip().lower()))
 
 
 def _parse_contracts(raw: Any) -> List[ApiContractIR]:
@@ -493,8 +695,6 @@ def _parse_contracts(raw: Any) -> List[ApiContractIR]:
         if request_type not in ("json", "multipart", "query", "none"):
             request_type = "none"
 
-        # Normalización defensiva: path params no son query params.
-        # Si el path contiene {id}, GET/DELETE no deben marcarse como query.
         if "{id}" in path and request_type == "query" and method in ("GET", "DELETE"):
             request_type = "none"
 
@@ -529,6 +729,9 @@ def _parse_contracts(raw: Any) -> List[ApiContractIR]:
                 response_example=response_example_norm,
                 evidence=evidence,
                 assumption=assumption,
+                actions=_parse_actions(c.get("actions")),
+                errors=_parse_errors(c.get("errors")),
+                integration_refs=_dedupe_stable(_list_of_str(c.get("integration_refs"))),
             )
         )
     return out
@@ -546,11 +749,144 @@ def _ensure_proposed_has_assumption(c: ApiContractIR) -> ApiContractIR:
         response_example=c.response_example,
         evidence=c.evidence,
         assumption="Endpoint propuesto sin evidencia literal; requiere confirmación del usuario.",
+        actions=list(c.actions or []),
+        errors=list(c.errors or []),
+        integration_refs=list(c.integration_refs or []),
     )
 
 
 def _has_literal_evidence(c: ApiContractIR) -> bool:
     return bool(str(c.evidence or "").strip())
+
+
+def _parse_authentication(raw: Any) -> AuthenticationIR:
+    if not isinstance(raw, dict):
+        return AuthenticationIR()
+    mechanism = _coalesce_str(raw.get("mechanism"), "")
+    return AuthenticationIR(
+        mechanism=mechanism or None,
+        source=_normalize_source(raw.get("source")),
+        evidence=_coalesce_str(raw.get("evidence"), ""),
+        assumption=_coalesce_str(raw.get("assumption"), ""),
+    )
+
+
+def _parse_integrations(raw: Any) -> List[IntegrationIR]:
+    if not isinstance(raw, list):
+        return []
+    out: List[IntegrationIR] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        integration_id = _coalesce_str(item.get("id"), "")
+        name = _coalesce_str(item.get("name"), "")
+        if not integration_id or not name:
+            continue
+        out.append(
+            IntegrationIR(
+                id=integration_id,
+                name=name,
+                kind=_normalize_integration_kind(item.get("kind")),
+                role=_coalesce_str(item.get("role"), ""),
+                required=bool(item.get("required")) if "required" in item else True,
+                implementation_level=_normalize_implementation_level(item.get("implementation_level")),
+                authentication=_parse_authentication(item.get("authentication")),
+                technology_refs=_dedupe_stable(_list_of_str(item.get("technology_refs"))),
+                configuration_refs=_dedupe_stable(_list_of_str(item.get("configuration_refs"))),
+                packages=_dedupe_stable(_list_of_str(item.get("packages"))),
+                source=_normalize_source(item.get("source")),
+                evidence=_coalesce_str(item.get("evidence"), ""),
+                assumption=_coalesce_str(item.get("assumption"), ""),
+            )
+        )
+    return _dedupe_integrations(out)
+
+
+def _parse_configuration(raw: Any) -> List[ConfigurationIR]:
+    if not isinstance(raw, list):
+        return []
+    out: List[ConfigurationIR] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        key = _coalesce_str(item.get("key"), "")
+        if not key:
+            continue
+        out.append(
+            ConfigurationIR(
+                key=key,
+                purpose=_coalesce_str(item.get("purpose"), ""),
+                required=bool(item.get("required")) if "required" in item else False,
+                secret=bool(item.get("secret")) if "secret" in item else False,
+                source=_normalize_source(item.get("source")),
+                evidence=_coalesce_str(item.get("evidence"), ""),
+                assumption=_coalesce_str(item.get("assumption"), ""),
+                delivery=_normalize_configuration_delivery(item.get("delivery")),
+            )
+        )
+    return _dedupe_configuration(out)
+
+
+def _parse_actions(raw: Any) -> List[ActionIR]:
+    if not isinstance(raw, list):
+        return []
+    out: List[ActionIR] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        action_id = _coalesce_str(item.get("id"), "")
+        description = _coalesce_str(item.get("description"), "")
+        if not action_id or not description:
+            continue
+        integration_ref = _coalesce_str(item.get("integration_ref"), "")
+        out.append(
+            ActionIR(
+                id=action_id,
+                kind=_normalize_action_kind(item.get("kind")),
+                description=description,
+                required=bool(item.get("required")) if "required" in item else True,
+                integration_ref=integration_ref or None,
+                source=_normalize_source(item.get("source")),
+                evidence=_coalesce_str(item.get("evidence"), ""),
+                assumption=_coalesce_str(item.get("assumption"), ""),
+            )
+        )
+    return _dedupe_actions(out)
+
+
+def _parse_errors(raw: Any) -> List[ErrorIR]:
+    if not isinstance(raw, list):
+        return []
+    out: List[ErrorIR] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        code = _coalesce_str(item.get("code"), "")
+        if not code:
+            continue
+        status_code_raw = item.get("status_code")
+        status_code: Optional[int]
+        if isinstance(status_code_raw, bool):
+            status_code = None
+        elif isinstance(status_code_raw, int):
+            status_code = status_code_raw
+        elif isinstance(status_code_raw, float) and status_code_raw.is_integer():
+            status_code = int(status_code_raw)
+        else:
+            status_code = None
+
+        out.append(
+            ErrorIR(
+                status_code=status_code,
+                code=code,
+                description=_coalesce_str(item.get("description"), ""),
+                required=bool(item.get("required")) if "required" in item else True,
+                source=_normalize_source(item.get("source")),
+                evidence=_coalesce_str(item.get("evidence"), ""),
+                assumption=_coalesce_str(item.get("assumption"), ""),
+            )
+        )
+    return _dedupe_errors(out)
 
 
 def _parse_technology_signals(raw: Any) -> List[TechnologySignalIR]:
@@ -566,6 +902,7 @@ def _parse_technology_signals(raw: Any) -> List[TechnologySignalIR]:
         out.append(
             TechnologySignalIR(
                 name=name,
+                package=_coalesce_str(it.get("package"), ""),
                 category=_coalesce_str(it.get("category"), "unknown") or "unknown",
                 role=_coalesce_str(it.get("role"), ""),
                 evidence=_coalesce_str(it.get("evidence"), ""),

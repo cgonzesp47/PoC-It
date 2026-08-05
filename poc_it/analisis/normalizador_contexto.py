@@ -45,13 +45,69 @@ Devuelve ÚNICAMENTE JSON válido con la siguiente estructura:
   "riesgos_inherentes": ["string"],
   "complejidad_inferida": "BAJA | MEDIA | ALTA | CRITICA",
 
+  "integrations": [
+    {
+      "id": "string estable en snake_case",
+      "name": "string",
+      "kind": "external_api | database | queue | cache | object_storage | email | auth | observability | runtime | other",
+      "role": "string",
+      "required": true,
+      "implementation_level": "fully_local | integration_skeleton | mocked | documentation_only",
+      "authentication": {
+        "mechanism": "string o null",
+        "source": "explicit | inferred | default | unknown",
+        "evidence": "string"
+      },
+      "technology_refs": ["string"],
+      "configuration_refs": ["string"],
+      "source": "explicit | inferred | default | unknown",
+      "evidence": "string",
+      "assumption": "string"
+    }
+  ],
+  "configuration": [
+    {
+      "key": "string",
+      "purpose": "string",
+      "required": true,
+      "secret": false,
+      "source": "explicit | inferred | default | unknown",
+      "evidence": "string",
+      "assumption": "string"
+    }
+  ],
+
   "contratos_api_explicitos": [
     {
       "method": "GET | POST | PUT | PATCH | DELETE",
       "path": "/ruta",
       "request": {"type": "json | multipart | query | none", "schema_hint": {}, "evidence": "cita literal"},
       "response": {"json_example": {}, "evidence": "cita literal"},
-      "notes": "string opcional"
+      "notes": "string opcional",
+      "actions": [
+        {
+          "id": "string estable en snake_case",
+          "kind": "internal_processing | persistence | external_call | validation | transformation | notification | other",
+          "description": "string",
+          "required": true,
+          "integration_ref": "id de integración o null",
+          "source": "explicit | inferred | default | unknown",
+          "evidence": "string",
+          "assumption": "string"
+        }
+      ],
+      "errors": [
+        {
+          "status_code": 401,
+          "code": "string estable en snake_case",
+          "description": "string",
+          "required": true,
+          "source": "explicit | inferred | default | unknown",
+          "evidence": "string",
+          "assumption": "string"
+        }
+      ],
+      "integration_refs": ["string"]
     }
   ],
   "contratos_api_propuestos": [
@@ -60,7 +116,31 @@ Devuelve ÚNICAMENTE JSON válido con la siguiente estructura:
       "path": "/ruta",
       "request": {"type": "json | multipart | query | none", "schema_hint": {}, "assumption": "por qué se propone"},
       "response": {"json_example": {}},
-      "notes": "string opcional"
+      "notes": "string opcional",
+      "actions": [
+        {
+          "id": "string estable en snake_case",
+          "kind": "internal_processing | persistence | external_call | validation | transformation | notification | other",
+          "description": "string",
+          "required": true,
+          "integration_ref": "id de integración o null",
+          "source": "explicit | inferred | default | unknown",
+          "evidence": "string",
+          "assumption": "string"
+        }
+      ],
+      "errors": [
+        {
+          "status_code": 401,
+          "code": "string estable en snake_case",
+          "description": "string",
+          "required": true,
+          "source": "explicit | inferred | default | unknown",
+          "evidence": "string",
+          "assumption": "string"
+        }
+      ],
+      "integration_refs": ["string"]
     }
   ],
 
@@ -118,6 +198,16 @@ Reglas:
 - Extrae domain_entities y operation_groups cuando exista evidencia literal; si no, deja vacío.
 - Todo endpoint explícito debe incluir evidence (request.evidence y/o response.evidence) con cita literal.
 - Todo endpoint propuesto debe incluir request.assumption.
+- Conserva como explicit cualquier acción, error, tecnología, autenticación o configuración que el usuario haya solicitado literalmente.
+- No inventes errores explícitos.
+- Si el usuario proporciona un código HTTP concreto, consérvalo.
+- Si el usuario no especifica errores, deja errors vacío o añade solo propuestas marcadas como inferred.
+- Toda acción que llame a un sistema externo debe usar kind="external_call" y referenciar una integración mediante integration_ref.
+- integration_skeleton significa que debe generarse la base de la integración, aunque no pueda verificarse con credenciales o recursos reales.
+- No inventes valores reales de secretos, IDs de carpetas, URLs privadas ni credenciales.
+- Puedes proponer una variable de configuración cuando sea imprescindible para implementar una integración, pero debes marcarla como inferred.
+- evidence debe contener una cita o fragmento respaldado por la plantilla cuando source="explicit".
+- assumption debe explicar la inferencia cuando source!="explicit".
 
 Reglas persistence/state:
 - persistence.required=true SOLO si el usuario pide conservar estado de negocio durable entre peticiones/sesiones.
@@ -129,6 +219,8 @@ Reglas technology_signals:
 - Extrae tecnologías mencionadas explícitamente por el usuario (no inventar).
 - Cada señal debe incluir evidence literal y confidence.
 - Si no puedes clasificar con seguridad: category="unknown", confidence="unknown".
+
+No hagas obligatorios integrations, configuration, actions, errors ni integration_refs: usa listas vacías cuando no apliquen.
 
 No añadas texto fuera del JSON.
 """
@@ -374,6 +466,9 @@ def _propose_api_contracts_from_crud_if_evidenced(data: Dict[str, Any]) -> None:
                 "request": {"type": "json", "schema_hint": {}, "assumption": assumption},
                 "response": {"json_example": {}},
                 "notes": "",
+                "actions": [],
+                "errors": [],
+                "integration_refs": [],
             },
             {
                 "method": "GET",
@@ -381,6 +476,9 @@ def _propose_api_contracts_from_crud_if_evidenced(data: Dict[str, Any]) -> None:
                 "request": {"type": "none", "schema_hint": {}, "assumption": assumption},
                 "response": {"json_example": {}},
                 "notes": "",
+                "actions": [],
+                "errors": [],
+                "integration_refs": [],
             },
             {
                 "method": "GET",
@@ -388,6 +486,9 @@ def _propose_api_contracts_from_crud_if_evidenced(data: Dict[str, Any]) -> None:
                 "request": {"type": "none", "schema_hint": {"path_params": {"id": "integer"}}, "assumption": assumption},
                 "response": {"json_example": {}},
                 "notes": "",
+                "actions": [],
+                "errors": [],
+                "integration_refs": [],
             },
             {
                 "method": "PUT",
@@ -395,6 +496,9 @@ def _propose_api_contracts_from_crud_if_evidenced(data: Dict[str, Any]) -> None:
                 "request": {"type": "json", "schema_hint": {}, "assumption": assumption},
                 "response": {"json_example": {}},
                 "notes": "",
+                "actions": [],
+                "errors": [],
+                "integration_refs": [],
             },
             {
                 "method": "PATCH",
@@ -402,6 +506,9 @@ def _propose_api_contracts_from_crud_if_evidenced(data: Dict[str, Any]) -> None:
                 "request": {"type": "json", "schema_hint": {}, "assumption": assumption},
                 "response": {"json_example": {}},
                 "notes": "",
+                "actions": [],
+                "errors": [],
+                "integration_refs": [],
             },
             {
                 "method": "DELETE",
@@ -409,6 +516,9 @@ def _propose_api_contracts_from_crud_if_evidenced(data: Dict[str, Any]) -> None:
                 "request": {"type": "none", "schema_hint": {"path_params": {"id": "integer"}}, "assumption": assumption},
                 "response": {"json_example": {}},
                 "notes": "",
+                "actions": [],
+                "errors": [],
+                "integration_refs": [],
             },
         ]
         return
@@ -432,6 +542,8 @@ def _ensure_normalized_shape(data: Dict[str, Any], plantilla: PlantillaUsuario) 
         "requisitos_no_funcionales": [],
         "riesgos_inherentes": [],
         "complejidad_inferida": "MEDIA",
+        "integrations": [],
+        "configuration": [],
         "contratos_api_explicitos": [],
         "contratos_api_propuestos": [],
         "persistence": {
@@ -483,6 +595,13 @@ def _ensure_normalized_shape(data: Dict[str, Any], plantilla: PlantillaUsuario) 
         out.get("contratos_api_propuestos") if isinstance(out.get("contratos_api_propuestos"), list) else []
     )
 
+    if not isinstance(out.get("integrations"), list):
+        out["integrations"] = []
+    if not isinstance(out.get("configuration"), list):
+        out["configuration"] = []
+
+    out["integrations"] = _normalize_integrations(out.get("integrations"))
+    out["configuration"] = _normalize_configuration(out.get("configuration"))
     out["persistence"] = _normalize_persistence(out.get("persistence"))
     out["technology_signals"] = _normalize_technology_signals(out.get("technology_signals"))
     out["domain_entities"] = _normalize_domain_entities(out.get("domain_entities"))
@@ -515,23 +634,30 @@ def _split_contracts_legacy(
         ev_resp = resp.get("evidence") if isinstance(resp.get("evidence"), str) else ""
         has_evidence = bool((ev_req or "").strip() or (ev_resp or "").strip())
 
+        normalized_contract = _normalize_contract_shape(it)
+
         if has_evidence:
-            explicit.append(it)
+            explicit.append(normalized_contract)
             if (ev_req or "").strip():
                 evidence.append(ev_req.strip())
             if (ev_resp or "").strip():
                 evidence.append(ev_resp.strip())
         else:
             # propuesto: exigir assumption
-            if not isinstance(req.get("assumption"), str) or not req.get("assumption", "").strip():
-                req = dict(req)
-                req["assumption"] = (
+            req_norm = (
+                normalized_contract.get("request")
+                if isinstance(normalized_contract.get("request"), dict)
+                else {}
+            )
+            if not isinstance(req_norm.get("assumption"), str) or not req_norm.get("assumption", "").strip():
+                req_norm = dict(req_norm)
+                req_norm["assumption"] = (
                     "Endpoint propuesto (legacy) sin evidencia literal; requiere confirmación del usuario."
                 )
-                it = dict(it)
-                it["request"] = req
-                assumptions.append(req["assumption"])
-            proposed.append(it)
+                normalized_contract = dict(normalized_contract)
+                normalized_contract["request"] = req_norm
+                assumptions.append(req_norm["assumption"])
+            proposed.append(normalized_contract)
 
     return explicit, proposed, assumptions, evidence
 
@@ -552,22 +678,24 @@ def _sanitize_contracts_inplace(data: Dict[str, Any]) -> None:
         propuestos = []
 
     fixed_explicitos: List[Dict[str, Any]] = []
-    fixed_propuestos: List[Dict[str, Any]] = list(propuestos)
+    moved_to_propuestos: List[Dict[str, Any]] = []
     assumptions: List[str] = list(data.get("assumptions") or [])
     evidence: List[str] = list(data.get("evidence") or [])
 
     for it in explicitos:
         if not isinstance(it, dict):
             continue
-        req = it.get("request") if isinstance(it.get("request"), dict) else {}
-        resp = it.get("response") if isinstance(it.get("response"), dict) else {}
+
+        normalized_contract = _normalize_contract_shape(it)
+        req = normalized_contract.get("request") if isinstance(normalized_contract.get("request"), dict) else {}
+        resp = normalized_contract.get("response") if isinstance(normalized_contract.get("response"), dict) else {}
 
         ev_req = req.get("evidence") if isinstance(req.get("evidence"), str) else ""
         ev_resp = resp.get("evidence") if isinstance(resp.get("evidence"), str) else ""
         has_evidence = bool((ev_req or "").strip() or (ev_resp or "").strip())
 
         if has_evidence:
-            fixed_explicitos.append(it)
+            fixed_explicitos.append(normalized_contract)
             if (ev_req or "").strip():
                 evidence.append(ev_req.strip())
             if (ev_resp or "").strip():
@@ -579,31 +707,33 @@ def _sanitize_contracts_inplace(data: Dict[str, Any]) -> None:
                 req2["assumption"] = (
                     "Endpoint sin evidencia literal; se trató como propuesto y requiere confirmación del usuario."
                 )
-            it2 = dict(it)
-            it2["request"] = req2
-            fixed_propuestos.append(it2)
+            moved_contract = dict(normalized_contract)
+            moved_contract["request"] = req2
+            moved_to_propuestos.append(moved_contract)
             assumptions.append(req2["assumption"])
 
     # propuestos: asegurar assumption
-    fixed_propuestos2: List[Dict[str, Any]] = []
-    for it in fixed_propuestos:
+    fixed_propuestos: List[Dict[str, Any]] = []
+    for it in list(propuestos) + moved_to_propuestos:
         if not isinstance(it, dict):
             continue
-        req = it.get("request") if isinstance(it.get("request"), dict) else {}
+        normalized_contract = _normalize_contract_shape(it)
+        req = normalized_contract.get("request") if isinstance(normalized_contract.get("request"), dict) else {}
         req2 = dict(req)
         if not isinstance(req2.get("assumption"), str) or not req2.get("assumption", "").strip():
             req2["assumption"] = "Endpoint propuesto sin evidence literal; requiere confirmación del usuario."
             assumptions.append(req2["assumption"])
-        it2 = dict(it)
-        it2["request"] = req2
-        fixed_propuestos2.append(it2)
+        normalized_contract["request"] = req2
+        fixed_propuestos.append(normalized_contract)
 
     data["contratos_api_explicitos"] = fixed_explicitos
-    data["contratos_api_propuestos"] = fixed_propuestos2
+    data["contratos_api_propuestos"] = fixed_propuestos
     data["assumptions"] = _dedupe_str_list(assumptions)
     data["evidence"] = _dedupe_str_list(evidence)
 
     # persistence / technology / state sanitization
+    data["integrations"] = _normalize_integrations(data.get("integrations"))
+    data["configuration"] = _normalize_configuration(data.get("configuration"))
     data["persistence"] = _normalize_persistence(
         data.get("persistence"), assumptions_sink=data["assumptions"]
     )
@@ -659,6 +789,320 @@ def _template_evidence_lines(plantilla: PlantillaUsuario) -> List[str]:
     if plantilla.tecnologias:
         out.append(f"Tecnologías declaradas: {plantilla.tecnologias}")
     return out
+
+
+def _normalize_source(value: Any) -> str:
+    allowed = {"explicit", "inferred", "default", "unknown"}
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in allowed else "unknown"
+
+
+def _normalize_implementation_level(value: Any) -> str:
+    allowed = {
+        "fully_local",
+        "integration_skeleton",
+        "mocked",
+        "documentation_only",
+    }
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in allowed else "integration_skeleton"
+
+
+def _normalize_integrations(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+
+    allowed_kinds = {
+        "external_api",
+        "database",
+        "queue",
+        "cache",
+        "object_storage",
+        "email",
+        "auth",
+        "observability",
+        "runtime",
+        "other",
+    }
+
+    out: List[Dict[str, Any]] = []
+    seen = set()
+
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+
+        integration_id = item.get("id") if isinstance(item.get("id"), str) else ""
+        name = item.get("name") if isinstance(item.get("name"), str) else ""
+        integration_id = integration_id.strip()
+        name = name.strip()
+        if not integration_id or not name:
+            continue
+
+        kind_raw = item.get("kind") if isinstance(item.get("kind"), str) else ""
+        kind = kind_raw.strip().lower()
+        if kind not in allowed_kinds:
+            kind = "other"
+
+        role = item.get("role") if isinstance(item.get("role"), str) else ""
+        source = _normalize_source(item.get("source"))
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), str) else ""
+        assumption = item.get("assumption") if isinstance(item.get("assumption"), str) else ""
+        required = bool(item.get("required")) if "required" in item else False
+
+        auth_raw = item.get("authentication") if isinstance(item.get("authentication"), dict) else {}
+        auth_mechanism = auth_raw.get("mechanism")
+        if not (isinstance(auth_mechanism, str) and auth_mechanism.strip()):
+            auth_mechanism = None
+        auth_source = _normalize_source(auth_raw.get("source"))
+        auth_evidence = auth_raw.get("evidence") if isinstance(auth_raw.get("evidence"), str) else ""
+
+        source, evidence, assumption = _sanitize_source_evidence_assumption(
+            source=source,
+            evidence=evidence,
+            assumption=assumption,
+            missing_evidence_assumption="Se degradó source=explicit a inferred por falta de evidencia literal suficiente.",
+        )
+        auth_source, auth_evidence, _ = _sanitize_source_evidence_assumption(
+            source=auth_source,
+            evidence=auth_evidence,
+            assumption="",
+            missing_evidence_assumption="Se degradó authentication.source=explicit a inferred por falta de evidencia literal suficiente.",
+        )
+
+        normalized = {
+            "id": integration_id,
+            "name": name,
+            "kind": kind,
+            "role": role.strip(),
+            "required": required,
+            "implementation_level": _normalize_implementation_level(item.get("implementation_level")),
+            "authentication": {
+                "mechanism": auth_mechanism,
+                "source": auth_source,
+                "evidence": auth_evidence.strip(),
+            },
+            "technology_refs": _dedupe_str_list(_ensure_list_of_str(item.get("technology_refs"))),
+            "configuration_refs": _dedupe_str_list(_ensure_list_of_str(item.get("configuration_refs"))),
+            "source": source,
+            "evidence": evidence.strip(),
+            "assumption": assumption.strip(),
+        }
+
+        dedupe_key = normalized["id"].lower()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        out.append(normalized)
+
+    return out
+
+
+def _normalize_configuration(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    seen = set()
+
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+
+        key = item.get("key") if isinstance(item.get("key"), str) else ""
+        purpose = item.get("purpose") if isinstance(item.get("purpose"), str) else ""
+        key = key.strip()
+        purpose = purpose.strip()
+        if not key or not purpose:
+            continue
+
+        source = _normalize_source(item.get("source"))
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), str) else ""
+        assumption = item.get("assumption") if isinstance(item.get("assumption"), str) else ""
+        source, evidence, assumption = _sanitize_source_evidence_assumption(
+            source=source,
+            evidence=evidence,
+            assumption=assumption,
+            missing_evidence_assumption="Se degradó source=explicit a inferred por falta de evidencia literal suficiente.",
+        )
+
+        normalized = {
+            "key": key,
+            "purpose": purpose,
+            "required": bool(item.get("required")) if "required" in item else False,
+            "secret": bool(item.get("secret")) if "secret" in item else False,
+            "source": source,
+            "evidence": evidence.strip(),
+            "assumption": assumption.strip(),
+        }
+
+        dedupe_key = normalized["key"].lower()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        out.append(normalized)
+
+    return out
+
+
+def _normalize_contract_actions(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+
+    allowed_kinds = {
+        "internal_processing",
+        "persistence",
+        "external_call",
+        "validation",
+        "transformation",
+        "notification",
+        "other",
+    }
+
+    out: List[Dict[str, Any]] = []
+    seen = set()
+
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+
+        action_id = item.get("id") if isinstance(item.get("id"), str) else ""
+        description = item.get("description") if isinstance(item.get("description"), str) else ""
+        action_id = action_id.strip()
+        description = description.strip()
+        if not action_id or not description:
+            continue
+
+        kind_raw = item.get("kind") if isinstance(item.get("kind"), str) else ""
+        kind = kind_raw.strip().lower()
+        if kind not in allowed_kinds:
+            kind = "other"
+
+        integration_ref = item.get("integration_ref")
+        if not (isinstance(integration_ref, str) and integration_ref.strip()):
+            integration_ref = None
+        else:
+            integration_ref = integration_ref.strip()
+
+        source = _normalize_source(item.get("source"))
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), str) else ""
+        assumption = item.get("assumption") if isinstance(item.get("assumption"), str) else ""
+        source, evidence, assumption = _sanitize_source_evidence_assumption(
+            source=source,
+            evidence=evidence,
+            assumption=assumption,
+            missing_evidence_assumption="Se degradó source=explicit a inferred por falta de evidencia literal suficiente.",
+        )
+
+        normalized = {
+            "id": action_id,
+            "kind": kind,
+            "description": description,
+            "required": bool(item.get("required")) if "required" in item else False,
+            "integration_ref": integration_ref,
+            "source": source,
+            "evidence": evidence.strip(),
+            "assumption": assumption.strip(),
+        }
+
+        dedupe_key = normalized["id"].lower()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        out.append(normalized)
+
+    return out
+
+
+def _normalize_contract_errors(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    seen = set()
+
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+
+        code = item.get("code") if isinstance(item.get("code"), str) else ""
+        description = item.get("description") if isinstance(item.get("description"), str) else ""
+        code = code.strip()
+        description = description.strip()
+        if not code or not description:
+            continue
+
+        status_code = item.get("status_code")
+        if isinstance(status_code, bool):
+            status_code = None
+        elif isinstance(status_code, int):
+            pass
+        elif isinstance(status_code, float) and status_code.is_integer():
+            status_code = int(status_code)
+        else:
+            status_code = None
+
+        source = _normalize_source(item.get("source"))
+        evidence = item.get("evidence") if isinstance(item.get("evidence"), str) else ""
+        assumption = item.get("assumption") if isinstance(item.get("assumption"), str) else ""
+        source, evidence, assumption = _sanitize_source_evidence_assumption(
+            source=source,
+            evidence=evidence,
+            assumption=assumption,
+            missing_evidence_assumption="Se degradó source=explicit a inferred por falta de evidencia literal suficiente.",
+        )
+
+        normalized = {
+            "status_code": status_code,
+            "code": code,
+            "description": description,
+            "required": bool(item.get("required")) if "required" in item else False,
+            "source": source,
+            "evidence": evidence.strip(),
+            "assumption": assumption.strip(),
+        }
+
+        dedupe_key = (normalized["status_code"], normalized["code"].lower())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        out.append(normalized)
+
+    return out
+
+
+def _normalize_contract_shape(contract: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(contract)
+
+    request = out.get("request") if isinstance(out.get("request"), dict) else {}
+    response = out.get("response") if isinstance(out.get("response"), dict) else {}
+
+    out["request"] = dict(request)
+    out["response"] = dict(response)
+    out["actions"] = _normalize_contract_actions(out.get("actions"))
+    out["errors"] = _normalize_contract_errors(out.get("errors"))
+    out["integration_refs"] = _dedupe_str_list(_ensure_list_of_str(out.get("integration_refs")))
+
+    return out
+
+
+def _sanitize_source_evidence_assumption(
+    *,
+    source: str,
+    evidence: str,
+    assumption: str,
+    missing_evidence_assumption: str,
+) -> Tuple[str, str, str]:
+    source_norm = _normalize_source(source)
+    evidence_norm = evidence.strip() if isinstance(evidence, str) else ""
+    assumption_norm = assumption.strip() if isinstance(assumption, str) else ""
+
+    if source_norm == "explicit" and not evidence_norm:
+        source_norm = "inferred"
+        if not assumption_norm:
+            assumption_norm = missing_evidence_assumption
+
+    return source_norm, evidence_norm, assumption_norm
 
 
 def _normalize_persistence(p: Any, assumptions_sink: List[str] | None = None) -> Dict[str, Any]:

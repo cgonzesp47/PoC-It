@@ -55,6 +55,10 @@ from poc_it.generador.spec_validation import (
     repair_spec_deterministic as _repair_spec_deterministic,
     validate_spec as _validate_spec,
 )
+from poc_it.generador.spec_traceability import (
+    TraceabilityError as _TraceabilityError,
+    validate_request_ir_to_spec_traceability as _validate_request_ir_to_spec_traceability,
+)
 from poc_it.generador.prompts_lotes import (
     build_prompt_lote as _build_prompt_lote,
     build_prompt_lote_fix_errors as _build_prompt_lote_fix_errors,
@@ -1270,6 +1274,9 @@ def generar_proyecto_completo(
     def _serialize_validation_errors(errors: List[_SpecValidationError]) -> List[dict]:
         return [e.__dict__ for e in errors]
 
+    def _serialize_traceability_errors(errors: List[_TraceabilityError]) -> List[dict]:
+        return [e.__dict__ for e in errors]
+
     try:
         # DEBUG #1: input EXACTO a RequestIR
         _dump_debug_json("request_ir_input_context.json", contexto_normalizado)
@@ -1299,6 +1306,17 @@ def generar_proyecto_completo(
                 )
 
         spec = build_spec_from_request_ir(req_ir)
+
+        traceability_errors = _validate_request_ir_to_spec_traceability(req_ir, spec)
+        if traceability_errors:
+            _dump_debug_json(
+                "spec_traceability_errors.json",
+                _serialize_traceability_errors(traceability_errors),
+            )
+            raise ValueError(
+                "Traceability validation failed: "
+                + "; ".join(error.code for error in traceability_errors)
+            )
 
         # DEBUG #3: SPEC base determinista
         _dump_debug_json("spec_base.json", spec)

@@ -14,7 +14,7 @@ Nota:
 """
 
 from dataclasses import asdict
-from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Literal, Sequence, Tuple
 
 from poc_it.generador.request_ir import ApiContractIR, PersistenceIR, RequestIR
 
@@ -58,12 +58,16 @@ def build_spec_from_request_ir(ir: RequestIR) -> Dict[str, Any]:
         "run_command": "uvicorn app.main:app --reload",
         "imports_policy": "absolute_from_app",
         "files": files,
-        "dependencies": _default_dependencies(),
+        "dependencies": _build_dependencies(ir),
         "dev_dependencies": _default_dev_dependencies(),
-        "env": _build_env(ir.persistence),
+        "env": _build_env(ir),
         "endpoints": endpoints,
         "contracts": _build_contracts(endpoints),
         "assumptions": _dedupe_stable(assumptions),
+        "open_questions": _dedupe_stable(ir.open_questions or []),
+        "technology_signals": _build_technology_signals(ir),
+        "integrations": _build_integrations(ir),
+        "configuration": _build_configuration(ir),
         "source": {
             "from_user": source_from_user,
             "from_assumptions": source_from_assumptions,
@@ -71,6 +75,9 @@ def build_spec_from_request_ir(ir: RequestIR) -> Dict[str, Any]:
         "persistence": persistence_block,
         "test_strategy": test_strategy,
     }
+
+    if ir.external_integrations:
+        spec["external_integrations"] = list(ir.external_integrations)
 
     return spec
 
@@ -83,6 +90,23 @@ def build_spec_from_request_ir(ir: RequestIR) -> Dict[str, Any]:
 def _default_dependencies() -> List[str]:
     # No hardcodear tecnologías específicas de persistencia.
     return ["fastapi", "uvicorn"]
+
+
+def _build_dependencies(ir: RequestIR) -> List[str]:
+    candidates: List[str] = _default_dependencies()
+
+    for signal in ir.technology_signals or []:
+        package = str(getattr(signal, "package", "") or "").strip()
+        if package:
+            candidates.append(package)
+
+    for integration in ir.integrations or []:
+        for package in getattr(integration, "packages", []) or []:
+            normalized = str(package or "").strip()
+            if normalized:
+                candidates.append(normalized)
+
+    return _dedupe_stable_case_insensitive(candidates)
 
 
 def _default_dev_dependencies() -> List[str]:
@@ -132,9 +156,10 @@ def _build_endpoints(ir: RequestIR) -> Tuple[List[Dict[str, Any]], List[str]]:
 
     endpoints = _dedupe_endpoints_by_method_path(endpoints)
 
-    # Si venían de proposed, registramos una assumption global
     if source_type == "proposed":
-        assumptions.append("Los endpoints provienen de contratos propuestos (sin evidencia literal); deben confirmarse con el usuario.")
+        assumptions.append(
+            "Los endpoints provienen de contratos propuestos (sin evidencia literal); deben confirmarse con el usuario."
+        )
 
     return endpoints, _dedupe_stable(assumptions)
 
@@ -179,7 +204,6 @@ def _contract_to_endpoint(
     response_block, resp_assumptions = _build_response_block(c)
     assumptions.extend(resp_assumptions)
 
-    # Path params: si el path incluye {id}, declararlo como path param (no query)
     if "{id}" in path:
         request_block = dict(request_block)
         request_block["path_params"] = _infer_path_params_from_schema_hint(c.request_schema_hint)
@@ -195,7 +219,10 @@ def _contract_to_endpoint(
     elif source_type == "builder_default":
         ep_source["assumption"] = "builder default endpoint"
 
-    errors = _default_errors_for_endpoint(method=method, path=path)
+    errors = _merge_endpoint_errors(
+        explicit_or_inferred_errors=c.errors,
+        default_errors=_default_errors_for_endpoint(method=method, path=path),
+    )
 
     endpoint: Dict[str, Any] = {
         "method": method,
@@ -204,6 +231,8 @@ def _contract_to_endpoint(
         "func": func_name,
         "request": request_block,
         "response": response_block,
+        "actions": _build_endpoint_actions(c),
+        "integration_refs": _dedupe_stable(c.integration_refs or []),
         "errors": errors,
         "bundle_files": bundle_files,
         "source": ep_source,
@@ -212,8 +241,97 @@ def _contract_to_endpoint(
     return endpoint, assumptions
 
 
+def _build_endpoint_actions(c: ApiContractIR) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for action in c.actions or []:
+        out.append(
+            {
+                "id": action.id,
+                "kind": action.kind,
+                "description": action.description,
+                "required": action.required,
+                "integration_ref": action.integration_ref,
+                "source": action.source,
+                "evidence": action.evidence,
+                "assumption": action.assumption,
+            }
+        )
+    return out
+
+
+def _build_technology_signals(ir: RequestIR) -> List[Dict[str, Any]]:
+    return [asdict(item) for item in (ir.technology_signals or [])]
+
+
+def _build_integrations(ir: RequestIR) -> List[Dict[str, Any]]:
+    return [asdict(item) for item in (ir.integrations or [])]
+
+
+def _build_configuration(ir: RequestIR) -> List[Dict[str, Any]]:
+    return [asdict(item) for item in (ir.configuration or [])]
+
+
+def _merge_endpoint_errors(
+    *,
+    explicit_or_inferred_errors: Sequence[Any],
+    default_errors: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: set[Tuple[Any, str]] = set()
+
+    for error in explicit_or_inferred_errors or []:
+        if hasattr(error, "status_code") and hasattr(error, "code"):
+            payload = {
+                "status_code": error.status_code,
+                "code": error.code,
+                "description": getattr(error, "description", ""),
+                "required": getattr(error, "required", True),
+                "source": getattr(error, "source", "unknown"),
+                "evidence": getattr(error, "evidence", ""),
+                "assumption": getattr(error, "assumption", ""),
+            }
+        elif isinstance(error, dict):
+            payload = {
+                "status_code": error.get("status_code"),
+                "code": error.get("code"),
+                "description": error.get("description", ""),
+                "required": error.get("required", True),
+                "source": error.get("source", "unknown"),
+                "evidence": error.get("evidence", ""),
+                "assumption": error.get("assumption", ""),
+            }
+        else:
+            continue
+
+        code = str(payload.get("code") or "").strip()
+        key = (payload.get("status_code"), code.lower())
+        if not code or key in seen:
+            continue
+        seen.add(key)
+        out.append(payload)
+
+    for error in default_errors or []:
+        code = str(error.get("code") or "").strip()
+        key = (error.get("status_code"), code.lower())
+        if not code or key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "status_code": error.get("status_code"),
+                "code": code,
+                "description": error.get("description", ""),
+                "required": error.get("required", False),
+                "source": error.get("source", "default"),
+                "evidence": error.get("evidence", ""),
+                "assumption": error.get("assumption", "Default técnico del SPEC builder"),
+            }
+        )
+
+    return out
+
+
 def _bundle_files_for_contract(_c: ApiContractIR) -> List[str]:
-    # Bundle mínimo, sin cajón desastre common.py.
     return list(_bundle_files_base())
 
 
@@ -243,13 +361,6 @@ def _normalize_path(path: str) -> str:
 
 
 def _func_name_from_contract(c: ApiContractIR) -> str:
-    """
-    Nombres estables y más semánticos para CRUD.
-
-    Regla:
-    - Derivar singular/plural del primer segmento del path.
-    - Si incluye "{id}" asumimos operación sobre recurso singular.
-    """
     base_seg = _first_path_segment(c.path) or "root"
     base_seg = base_seg.replace("{", "").replace("}", "")
     base_seg = "".join(ch for ch in base_seg if ch.isalnum() or ch in ("_", "-")).replace("-", "_") or "root"
@@ -266,7 +377,6 @@ def _func_name_from_contract(c: ApiContractIR) -> str:
     if m == "GET" and has_id:
         return f"get_{singular}"
     if m == "POST":
-        # crear en colección => singular si disponible
         return f"create_{singular}" if singular else f"create_{plural}"
     if m == "PUT":
         return f"replace_{singular}" if has_id else f"replace_{plural}"
@@ -287,8 +397,6 @@ def _build_request_block(c: ApiContractIR) -> Tuple[Dict[str, Any], List[str]]:
     if rt not in ("json", "multipart", "query", "none"):
         rt = "none"
 
-    # Regla explícita: path params NO son query params.
-    # Para GET/DELETE con {id}, request.type debe ser "none".
     method = (c.method or "GET").upper().strip()
     if has_id and method in ("GET", "DELETE") and rt == "query":
         rt = "none"
@@ -311,7 +419,6 @@ def _build_response_block(c: ApiContractIR) -> Tuple[Dict[str, Any], List[str]]:
 
     ex = c.response_example
 
-    # Preservar dict o list tal cual si vienen del contrato.
     if isinstance(ex, dict):
         if ex:
             return {"json_example": ex}, assumptions
@@ -323,13 +430,11 @@ def _build_response_block(c: ApiContractIR) -> Tuple[Dict[str, Any], List[str]]:
     if isinstance(ex, list):
         if ex:
             return {"json_example": ex}, assumptions
-        # lista vacía: preservar tipo y registrar assumption (no convertir a dict)
         assumptions.append(
             f"Response example vacío (list) para {c.method} {c.path}; se preservó [] (debe confirmarse el ejemplo real)."
         )
         return {"json_example": []}, assumptions
 
-    # Si no hay ejemplo utilizable, default seguro.
     assumptions.append(f"Response example ausente para {c.method} {c.path}; se usó {{\"ok\": true}} por defecto.")
     return {"json_example": {"ok": True}}, assumptions
 
@@ -377,7 +482,6 @@ def _build_persistence_and_test_strategy(
     }
 
     if not p.required:
-        # reglas explícitas
         persistence_block["kind"] = None
         persistence_block["durable_state"] = False
         persistence_block["business_entities"] = []
@@ -385,24 +489,39 @@ def _build_persistence_and_test_strategy(
         persistence_block["uncertainty"] = ""
         return persistence_block, assumptions, test_strategy
 
-    # required=True: no meter vendor, solo preparar estrategia
     test_strategy["requires_dependency_overrides"] = True
     test_strategy["notes"] = [
         "Se requiere persistencia; los puertos (DB/colas/etc.) se resolverán en fases posteriores mediante overrides/fakes."
     ]
 
     if persistence_block.get("kind") == "unknown":
-        assumptions.append("Persistencia requerida pero kind='unknown'; debe especificarse el tipo de almacenamiento en fases posteriores.")
+        assumptions.append(
+            "Persistencia requerida pero kind='unknown'; debe especificarse el tipo de almacenamiento en fases posteriores."
+        )
 
     return persistence_block, assumptions, test_strategy
 
 
-def _build_env(p: PersistenceIR) -> List[Dict[str, Any]]:
-    # Regla: si no hay persistencia, no hay env por persistencia.
-    if not p.required:
-        return []
-    # No añadimos vars específicas (vendor), se resolverá después.
-    return []
+def _build_env(ir: RequestIR) -> List[Dict[str, Any]]:
+    env: List[Dict[str, Any]] = []
+
+    for item in ir.configuration or []:
+        delivery = str(getattr(item, "delivery", "env") or "env").strip().lower() or "env"
+        if delivery != "env":
+            continue
+        env.append(
+            {
+                "name": item.key,
+                "purpose": item.purpose,
+                "required": item.required,
+                "secret": item.secret,
+                "source": item.source,
+                "evidence": item.evidence,
+                "assumption": item.assumption,
+            }
+        )
+
+    return _dedupe_env_by_name(env)
 
 
 # ---------------------------------------------------------------------
@@ -411,10 +530,6 @@ def _build_env(p: PersistenceIR) -> List[Dict[str, Any]]:
 
 
 def _build_contracts(endpoints: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Contratos ligeros para inspección/validación.
-    No duplican el endpoint entero; resumen estable.
-    """
     out: List[Dict[str, Any]] = []
     for ep in endpoints:
         out.append(
@@ -451,8 +566,6 @@ def _build_files(endpoints: Sequence[Dict[str, Any]]) -> List[str]:
     files.extend(required)
     files.extend(sorted(set(endpoint_files)))
     files.extend(sorted(set(bundle_files)))
-
-    # dedupe estable preservando orden
     files = list(dict.fromkeys([p.replace("\\", "/") for p in files]).keys())
     return files
 
@@ -471,22 +584,37 @@ def _assert_no_duplicates(items: Sequence[str]) -> None:
 
 
 def _build_source_from_user(ir: RequestIR) -> List[str]:
-    """
-    Evidencias trazables a campos aportados por el usuario/normalizador.
-    No incluye decisiones internas del builder.
-    """
     out: List[str] = []
-    # evidencias de contratos explícitos
+
     for c in ir.explicit_api_contracts or []:
         if isinstance(c.evidence, str) and c.evidence.strip():
             out.append(c.evidence.strip())
+        for action in c.actions or []:
+            if getattr(action, "source", "") == "explicit" and isinstance(getattr(action, "evidence", ""), str) and action.evidence.strip():
+                out.append(action.evidence.strip())
+        for error in c.errors or []:
+            if getattr(error, "source", "") == "explicit" and isinstance(getattr(error, "evidence", ""), str) and error.evidence.strip():
+                out.append(error.evidence.strip())
 
-    # evidencias de persistencia (estructuradas)
+    for tech in ir.technology_signals or []:
+        if isinstance(getattr(tech, "evidence", ""), str) and tech.evidence.strip():
+            out.append(tech.evidence.strip())
+
+    for integration in ir.integrations or []:
+        if getattr(integration, "source", "") == "explicit" and isinstance(getattr(integration, "evidence", ""), str) and integration.evidence.strip():
+            out.append(integration.evidence.strip())
+        auth = getattr(integration, "authentication", None)
+        if auth is not None and getattr(auth, "source", "") == "explicit" and isinstance(getattr(auth, "evidence", ""), str) and auth.evidence.strip():
+            out.append(auth.evidence.strip())
+
+    for config in ir.configuration or []:
+        if getattr(config, "source", "") == "explicit" and isinstance(getattr(config, "evidence", ""), str) and config.evidence.strip():
+            out.append(config.evidence.strip())
+
     for ev in (ir.persistence.evidence or []):
         if isinstance(ev, str) and ev.strip():
             out.append(ev.strip())
 
-    # user_facts (ya estructurados por normalizador)
     for f in (ir.user_facts or []):
         if isinstance(f, str) and f.strip():
             out.append(f.strip())
@@ -501,12 +629,32 @@ def _build_source_from_assumptions(
     endpoints: Sequence[Dict[str, Any]],
 ) -> List[str]:
     out: List[str] = []
-    # assumptions ya presentes en RequestIR
-    out.extend([a for a in (ir.assumptions or []) if isinstance(a, str) and a.strip()])
-    # assumptions generadas por builder
-    out.extend([a for a in (builder_assumptions or []) if isinstance(a, str) and a.strip()])
 
-    # marcar si hubo fallback /health
+    out.extend([a for a in (ir.assumptions or []) if isinstance(a, str) and a.strip()])
+    out.extend([a for a in (builder_assumptions or []) if isinstance(a, str) and a.strip()])
+    out.extend([q for q in (ir.open_questions or []) if isinstance(q, str) and q.strip()])
+
+    for c in list(ir.explicit_api_contracts or []) + list(ir.proposed_api_contracts or []):
+        if isinstance(c.assumption, str) and c.assumption.strip():
+            out.append(c.assumption.strip())
+        for action in c.actions or []:
+            if isinstance(getattr(action, "assumption", ""), str) and action.assumption.strip():
+                out.append(action.assumption.strip())
+        for error in c.errors or []:
+            if isinstance(getattr(error, "assumption", ""), str) and error.assumption.strip():
+                out.append(error.assumption.strip())
+
+    for integration in ir.integrations or []:
+        if isinstance(getattr(integration, "assumption", ""), str) and integration.assumption.strip():
+            out.append(integration.assumption.strip())
+        auth = getattr(integration, "authentication", None)
+        if auth is not None and isinstance(getattr(auth, "assumption", ""), str) and auth.assumption.strip():
+            out.append(auth.assumption.strip())
+
+    for config in ir.configuration or []:
+        if isinstance(getattr(config, "assumption", ""), str) and config.assumption.strip():
+            out.append(config.assumption.strip())
+
     if any((ep.get("source") or {}).get("type") == "builder_default" for ep in endpoints or []):
         out.append("Se añadió endpoint por defecto (builder_default) para garantizar arrancabilidad.")
 
@@ -514,34 +662,33 @@ def _build_source_from_assumptions(
 
 
 def _infer_path_params_from_schema_hint(schema_hint: Any) -> Dict[str, str]:
-    """
-    Inferencia mínima y determinista (sin LLM):
-    - Si schema_hint declara algo para id, respetarlo.
-    - Si no, default "string".
-    """
     if isinstance(schema_hint, dict):
-        # soportar varias formas sin imponer un schema fuerte
         for key in ("path_params", "pathParams", "params"):
             v = schema_hint.get(key)
             if isinstance(v, dict) and "id" in v and isinstance(v.get("id"), str) and v.get("id").strip():
                 return {"id": v.get("id").strip()}
-        # forma: {"id": "integer"}
         if "id" in schema_hint and isinstance(schema_hint.get("id"), str) and schema_hint.get("id").strip():
             return {"id": schema_hint.get("id").strip()}
     return {"id": "string"}
 
 
 def _default_errors_for_endpoint(*, method: str, path: str) -> List[Dict[str, Any]]:
-    # Política mínima:
-    # - Operaciones sobre recurso (/{id}) => 404
     if "{id}" in path and method in ("GET", "PUT", "PATCH", "DELETE"):
-        return [{"status_code": 404, "code": "not_found"}]
+        return [
+            {
+                "status_code": 404,
+                "code": "not_found",
+                "description": "",
+                "required": False,
+                "source": "default",
+                "evidence": "",
+                "assumption": "Default técnico del SPEC builder",
+            }
+        ]
     return []
 
 
 def _singularize_es(plural: str) -> str:
-    # Heurística mínima (no NLP):
-    # productos -> producto, pedidos -> pedido
     s = (plural or "").strip()
     if s.endswith("es") and len(s) > 2:
         return s[:-2]
@@ -559,4 +706,33 @@ def _dedupe_stable(items: Sequence[str]) -> List[str]:
             continue
         seen.add(s)
         out.append(s)
+    return out
+
+
+def _dedupe_stable_case_insensitive(items: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for x in items:
+        s = str(x).strip()
+        key = s.lower()
+        if not s or key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+def _dedupe_env_by_name(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: Dict[str, int] = {}
+    for item in items:
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            out[seen[key]] = item
+        else:
+            seen[key] = len(out)
+            out.append(item)
     return out
