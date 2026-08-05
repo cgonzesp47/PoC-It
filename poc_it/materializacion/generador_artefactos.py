@@ -68,8 +68,17 @@ from poc_it.generador.file_contracts import (
     build_file_contracts_from_spec as _build_file_contracts_from_spec,
     file_contracts_to_dict as _file_contracts_to_dict,
 )
+from poc_it.generador.implementation_contracts import (
+    build_implementation_contracts_from_spec,
+)
+from poc_it.generador.file_planner import (
+    enrich_spec_files_for_implementation,
+)
 from poc_it.materializacion.file_contracts_validation import (
     validate_generated_files_against_file_contracts as _validate_generated_files_against_file_contracts,
+)
+from poc_it.generador.file_contracts_validation import (
+    validate_file_contracts as _validate_file_contracts,
 )
 from poc_it.generador.prompts_guardrails import (
     build_repair_prompt_por_restriccion as _build_repair_prompt_por_restriccion,
@@ -110,15 +119,20 @@ def _sort_file_contracts_for_generation(file_contracts: List[dict]) -> List[dict
         "package_init": 0,
         "requirements": 1,
         "config": 2,
-        "endpoint": 3,
-        "router": 4,
-        "main": 5,
-        "docs": 6,
+        "schema": 3,
+        "repository": 4,
+        "service": 5,
+        "integration": 6,
+        "endpoint": 7,
+        "test": 8,
+        "router": 9,
+        "main": 10,
+        "docs": 11,
     }
 
     def key(fc: dict) -> tuple:
-        k = str(fc.get("kind") or "")
-        p = str(fc.get("path") or "")
+        k = str(fc.get("kind") or "").strip()
+        p = str(fc.get("path") or "").strip()
         return (kind_order.get(k, 50), p)
 
     return sorted([fc for fc in file_contracts if isinstance(fc, dict)], key=key)
@@ -365,34 +379,65 @@ def _related_contracts_for(
     spec: dict,
     max_related: int = 6,
 ) -> List[dict]:
-    """
-    Usa bundle_files SOLO como contexto: busca contracts cuyos paths estén en bundle_files.
-    """
     related: List[dict] = []
-    p = str(contract.get("path") or "").replace("\\", "/")
+    path = str(contract.get("path") or "").replace("\\", "/")
+    kind = str(contract.get("kind") or "").strip()
 
-    # Map path->contract
-    by_path = {str(fc.get("path") or "").replace("\\", "/"): fc for fc in file_contracts if isinstance(fc, dict)}
-
-    # Buscar endpoint en spec que coincida con este path
-    for ep in spec.get("endpoints", []) if isinstance(spec, dict) else []:
-        if not isinstance(ep, dict):
+    by_path = {
+        str(fc.get("path") or "").replace("\\", "/"): fc
+        for fc in file_contracts
+        if isinstance(fc, dict)
+    }
+    by_kind: Dict[str, List[dict]] = {}
+    for fc in file_contracts:
+        if not isinstance(fc, dict):
             continue
-        if str(ep.get("file") or "").replace("\\", "/") != p:
-            continue
-        extras = ep.get("bundle_files") or []
-        if isinstance(extras, list):
-            for x in extras:
-                xp = str(x or "").replace("\\", "/")
-                if xp in by_path and xp != p:
-                    related.append(by_path[xp])
+        by_kind.setdefault(str(fc.get("kind") or "").strip(), []).append(fc)
 
-    # Dedup + cap
-    out = []
-    seen = set()
+    implementation_files = spec.get("implementation_files") or []
+    integration_path_by_ref: Dict[str, str] = {}
+    for item in implementation_files:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind") or "").strip() != "integration":
+            continue
+        ref = str(item.get("integration_ref") or "").strip()
+        item_path = str(item.get("path") or "").replace("\\", "/").strip()
+        if ref and item_path:
+            integration_path_by_ref[ref] = item_path
+
+    if kind == "endpoint":
+        for ref in contract.get("integration_refs") or []:
+            ref_str = str(ref or "").strip()
+            integration_path = integration_path_by_ref.get(ref_str)
+            if integration_path and integration_path in by_path and integration_path != path:
+                related.append(by_path[integration_path])
+    elif kind == "integration":
+        related.extend(by_kind.get("config", []))
+        related.extend(by_kind.get("requirements", []))
+        integration_refs = {
+            str(ref or "").strip()
+            for ref in (contract.get("integration_refs") or [])
+            if str(ref or "").strip()
+        }
+        for fc in by_kind.get("endpoint", []):
+            refs = {
+                str(ref or "").strip()
+                for ref in (fc.get("integration_refs") or [])
+                if str(ref or "").strip()
+            }
+            if refs.intersection(integration_refs):
+                related.append(fc)
+    elif kind == "router":
+        related.extend(by_kind.get("endpoint", []))
+    elif kind == "main":
+        related.extend(by_kind.get("router", []))
+
+    out: List[dict] = []
+    seen: Set[str] = set()
     for fc in related:
         rp = str(fc.get("path") or "").replace("\\", "/")
-        if rp in seen:
+        if not rp or rp == path or rp in seen:
             continue
         seen.add(rp)
         out.append(fc)
@@ -1061,6 +1106,13 @@ def _generar_desde_spec_validado(
 
     No genera ni alinea el SPEC: eso es responsabilidad del caller.
     """
+    implementation_contracts = build_implementation_contracts_from_spec(spec)
+    plan_result = enrich_spec_files_for_implementation(
+        spec,
+        implementation_contracts=implementation_contracts,
+    )
+    spec = plan_result.spec
+
     files_plan = _completar_inits_en_files(spec.get("files", []))
     spec["files"] = files_plan
     allowed_paths = set(files_plan)
@@ -1068,19 +1120,83 @@ def _generar_desde_spec_validado(
     # ------------------------------------------------------------
     # Contract-first: derive explicit FileContracts from SPEC (deterministic)
     # ------------------------------------------------------------
-    file_contracts = _build_file_contracts_from_spec(spec)
+    file_contracts = _build_file_contracts_from_spec(
+        spec,
+        implementation_contracts=implementation_contracts,
+    )
     file_contracts_dict = _file_contracts_to_dict(file_contracts)
+
+    file_contract_errors = _validate_file_contracts(
+        spec=spec,
+        implementation_contracts=implementation_contracts,
+        file_contracts=file_contracts_dict,
+    )
 
     # Persist debug artifact
     try:
         debug_dir = Path("output/_debug")
         debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / "implementation_contracts.json").write_text(
+            json.dumps(
+                implementation_contracts,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        (debug_dir / "file_plan.json").write_text(
+            json.dumps(
+                {
+                    "generated_paths": plan_result.generated_paths,
+                    "implementation_files": spec.get("implementation_files", []),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         (debug_dir / "file_contracts.json").write_text(
             json.dumps(file_contracts_dict, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        (debug_dir / "file_contract_validation.json").write_text(
+            json.dumps(
+                [error.__dict__ for error in file_contract_errors],
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     except Exception:
         pass
+
+    if file_contract_errors:
+        if not is_demo_mode():
+            print(
+                "[DEBUG] File Contract gate failed:",
+                json.dumps(
+                    [
+                        {"code": error.code, "path": error.path}
+                        for error in file_contract_errors
+                    ],
+                    ensure_ascii=False,
+                ),
+            )
+        return {
+            "files": [],
+            "spec": spec,
+            "codegen_status": "file_contract_validation_failed",
+            "materializable": False,
+            "codegen_errors": [
+                f"{error.code}:{error.path}" if error.path else error.code
+                for error in file_contract_errors
+            ],
+            "validation_report": {
+                "stage": "file_contract_gate",
+                "ok": False,
+                "errors": [error.__dict__ for error in file_contract_errors],
+            },
+        }
 
     # mantener la misma compilación/sanitización de restricciones
     spec["restrictions"] = compilar_restricciones(spec, contexto_normalizado, intentos=intentos)

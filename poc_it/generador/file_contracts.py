@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set
 
@@ -7,7 +8,7 @@ from typing import Any, Dict, List, Set
 @dataclass(frozen=True)
 class FileContract:
     path: str
-    kind: str  # main | router | endpoint | config | schema | service | repository | test | docs | requirements | package_init | unknown
+    kind: str  # main | router | endpoint | config | schema | service | repository | integration | test | docs | requirements | package_init | unknown
     responsibilities: List[str] = field(default_factory=list)
     required_symbols: List[str] = field(default_factory=list)
     allowed_imports: List[str] = field(default_factory=list)
@@ -19,6 +20,16 @@ class FileContract:
     test_strategy: Dict[str, Any] = field(default_factory=dict)
     source: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
+    implementation_contracts: List[Dict[str, Any]] = field(default_factory=list)
+    must_implement: List[str] = field(default_factory=list)
+    must_not: List[str] = field(default_factory=list)
+    implementation_plan: List[str] = field(default_factory=list)
+    actions: List[Dict[str, Any]] = field(default_factory=list)
+    errors: List[Dict[str, Any]] = field(default_factory=list)
+    integration_refs: List[str] = field(default_factory=list)
+    external_dependencies: List[Dict[str, Any]] = field(default_factory=list)
+    implementation_levels: List[str] = field(default_factory=list)
+    configuration: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def file_contracts_to_dict(contracts: List[FileContract]) -> List[dict]:
@@ -37,27 +48,42 @@ def file_contracts_to_dict(contracts: List[FileContract]) -> List[dict]:
             "test_strategy": dict(c.test_strategy),
             "source": dict(c.source),
             "notes": list(c.notes),
+            "implementation_contracts": list(c.implementation_contracts),
+            "must_implement": list(c.must_implement),
+            "must_not": list(c.must_not),
+            "implementation_plan": list(c.implementation_plan),
+            "actions": list(c.actions),
+            "errors": list(c.errors),
+            "integration_refs": list(c.integration_refs),
+            "external_dependencies": list(c.external_dependencies),
+            "implementation_levels": list(c.implementation_levels),
+            "configuration": list(c.configuration),
         }
         for c in contracts
     ]
 
 
-def build_file_contracts_from_spec(spec: dict) -> List[FileContract]:
+def build_file_contracts_from_spec(
+    spec: dict,
+    *,
+    implementation_contracts: List[Dict[str, Any]] | None = None,
+) -> List[FileContract]:
     if not isinstance(spec, dict):
         raise TypeError("spec must be a dict")
+
+    implementation_contracts = (
+        implementation_contracts if isinstance(implementation_contracts, list) else []
+    )
 
     files = spec.get("files")
     if not isinstance(files, list) or not files:
         raise ValueError("spec.files must be a non-empty list")
 
-    # Normalize paths to posix
     spec_files = [str(p).replace("\\", "/") for p in files if p]
     if not spec_files:
         raise ValueError("spec.files has no usable paths")
 
-    endpoints = spec.get("endpoints", [])
-    if endpoints is None:
-        endpoints = []
+    endpoints = spec.get("endpoints", []) or []
     if not isinstance(endpoints, list):
         raise ValueError("spec.endpoints must be a list")
 
@@ -66,8 +92,12 @@ def build_file_contracts_from_spec(spec: dict) -> List[FileContract]:
     persistence = spec.get("persistence", {}) or {}
     test_strategy = spec.get("test_strategy", {}) or {}
     source = spec.get("source", {}) or {}
+    configuration_by_key = _configuration_by_key(spec)
+    integrations_by_id = _integrations_by_id(spec)
+    technologies_by_name = _technology_signals_by_name(spec)
+    env_by_name = _env_by_name(spec)
+    implementation_files = spec.get("implementation_files", []) or []
 
-    # Map endpoints by file
     endpoints_by_file: Dict[str, List[Dict[str, Any]]] = {}
     for ep in endpoints:
         if not isinstance(ep, dict):
@@ -77,12 +107,27 @@ def build_file_contracts_from_spec(spec: dict) -> List[FileContract]:
             continue
         endpoints_by_file.setdefault(f, []).append(ep)
 
+    implementation_by_endpoint = _implementation_contracts_by_endpoint(
+        implementation_contracts
+    )
+    implementation_files_by_path = _implementation_files_by_path(
+        implementation_files
+    )
+    integration_module_by_ref = _integration_module_by_ref(
+        implementation_files
+    )
+    integration_actions_by_ref = _integration_actions_by_ref(
+        implementation_contracts
+    )
+
     contracts: List[FileContract] = []
     seen: Set[str] = set()
 
     endpoint_files = sorted([f for f in endpoints_by_file.keys() if f])
     endpoint_files_in_spec = [f for f in endpoint_files if f in spec_files]
-    endpoint_modules_in_spec = [_module_from_endpoint_file(f) for f in endpoint_files_in_spec]
+    endpoint_modules_in_spec = [
+        _module_from_endpoint_file(f) for f in endpoint_files_in_spec
+    ]
 
     for path in spec_files:
         if path in seen:
@@ -91,29 +136,29 @@ def build_file_contracts_from_spec(spec: dict) -> List[FileContract]:
 
         kind = _infer_kind(path)
 
-        # Kind overrides for canonical paths
-        if path == "app/main.py":
-            kind = "main"
-        elif path == "app/api/router.py":
-            kind = "router"
-        elif path == "app/core/config.py":
-            kind = "config"
-        elif path.endswith("/__init__.py") or path == "app/__init__.py":
-            kind = "package_init"
-        elif path == "requirements.txt":
-            kind = "requirements"
-        elif path.lower().endswith("readme.md") or path == "README.md":
-            kind = "docs"
-        elif path.startswith("app/api/endpoints/") and path.endswith(".py"):
-            kind = "endpoint"
-
         responsibilities: List[str] = []
         required_symbols: List[str] = []
         allowed_imports: List[str] = []
         forbidden_imports: List[str] = []
         eps_for_file = endpoints_by_file.get(path, [])
 
+        implementation_for_file: List[Dict[str, Any]] = []
+        must_implement: List[str] = []
+        must_not: List[str] = []
+        implementation_plan: List[str] = []
+        actions: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        integration_refs: List[str] = []
+        external_dependencies: List[Dict[str, Any]] = []
+        implementation_levels: List[str] = []
+        configuration: List[Dict[str, Any]] = []
+
         notes: List[str] = []
+        file_source: Dict[str, Any] = {}
+        file_env: List[Any] = []
+        file_dependencies: List[str] = []
+        file_test_strategy: Dict[str, Any] = {}
+        file_persistence: Dict[str, Any] = {}
 
         if kind == "main":
             required_symbols = ["app"]
@@ -123,6 +168,7 @@ def build_file_contracts_from_spec(spec: dict) -> List[FileContract]:
                 "no contener lógica de negocio",
             ]
             allowed_imports = ["fastapi", "app.api.router"]
+            file_source = dict(source)
         elif kind == "router":
             required_symbols = ["api_router"]
             responsibilities = [
@@ -130,11 +176,11 @@ def build_file_contracts_from_spec(spec: dict) -> List[FileContract]:
                 "incluir routers de endpoint files",
                 "no contener lógica de negocio",
             ]
-            # Permitimos fastapi y los módulos endpoint conocidos (como módulos importables, no paths .py)
             allowed_imports = ["fastapi"] + endpoint_modules_in_spec
             notes.append("Debe incluir routers de todos los endpoint files del SPEC")
+            file_source = dict(source)
         elif kind == "endpoint":
-            responsibilities = [
+            base_responsibilities = [
                 "declarar APIRouter local",
                 "implementar handlers para method/path del SPEC",
                 "respetar request/response/errors/source",
@@ -146,18 +192,376 @@ def build_file_contracts_from_spec(spec: dict) -> List[FileContract]:
                 fn = ep.get("func") or ep.get("function") or ep.get("handler")
                 if isinstance(fn, str) and fn.strip():
                     required_symbols.append(fn.strip())
-            # Dedup preserving order
             required_symbols = list(dict.fromkeys(required_symbols).keys())
 
-            allowed_imports = [
-                "fastapi",
-                "typing",
-                "pydantic",
-            ]
             if bool((persistence or {}).get("required")):
                 notes.append(
                     "Si persistence.required=true, no abrir DB en endpoint; depender de servicios/repositorios/ports o fakes"
                 )
+
+            for endpoint in eps_for_file:
+                key = _endpoint_key(endpoint.get("method"), endpoint.get("path"))
+                implementation_for_file.extend(implementation_by_endpoint.get(key, []))
+
+            implementation_for_file = _dedupe_contract_dicts(implementation_for_file)
+
+            must_implement = _dedupe_strings(
+                [
+                    item
+                    for contract in implementation_for_file
+                    for item in (contract.get("must_implement") or [])
+                ]
+            )
+            must_not = _dedupe_strings(
+                [
+                    item
+                    for contract in implementation_for_file
+                    for item in (contract.get("must_not") or [])
+                ]
+            )
+            implementation_plan = _dedupe_strings(
+                [
+                    item
+                    for contract in implementation_for_file
+                    for item in (contract.get("implementation_plan") or [])
+                ]
+            )
+            integration_refs = _dedupe_strings(
+                [
+                    item
+                    for contract in implementation_for_file
+                    for item in (contract.get("integration_refs") or [])
+                ]
+                + [
+                    item
+                    for endpoint in eps_for_file
+                    for item in (endpoint.get("integration_refs") or [])
+                    if isinstance(item, str)
+                ]
+            )
+            implementation_levels = _dedupe_strings(
+                [
+                    item
+                    for contract in implementation_for_file
+                    for item in (contract.get("implementation_levels") or [])
+                ]
+            )
+
+            action_groups: List[List[Dict[str, Any]]] = []
+            error_groups: List[List[Dict[str, Any]]] = []
+            external_dependency_groups: List[List[Dict[str, Any]]] = []
+
+            for contract in implementation_for_file:
+                contract_actions = contract.get("actions")
+                if isinstance(contract_actions, list) and contract_actions:
+                    action_groups.append(contract_actions)
+                else:
+                    endpoint = _find_matching_endpoint(
+                        endpoints=eps_for_file,
+                        method=contract.get("method"),
+                        path=contract.get("path"),
+                    )
+                    if endpoint:
+                        action_groups.append(
+                            [
+                                item
+                                for item in (endpoint.get("actions") or [])
+                                if isinstance(item, dict)
+                            ]
+                        )
+
+                contract_errors = contract.get("errors")
+                if isinstance(contract_errors, list) and contract_errors:
+                    error_groups.append(contract_errors)
+                else:
+                    endpoint = _find_matching_endpoint(
+                        endpoints=eps_for_file,
+                        method=contract.get("method"),
+                        path=contract.get("path"),
+                    )
+                    if endpoint:
+                        error_groups.append(
+                            [
+                                item
+                                for item in (endpoint.get("errors") or [])
+                                if isinstance(item, dict)
+                            ]
+                        )
+
+                external_dependency_groups.append(
+                    [
+                        item
+                        for item in (contract.get("external_dependencies") or [])
+                        if isinstance(item, dict)
+                    ]
+                )
+
+            for endpoint in eps_for_file:
+                endpoint_actions = endpoint.get("actions") or []
+                if isinstance(endpoint_actions, list) and endpoint_actions:
+                    action_groups.append(
+                        [item for item in endpoint_actions if isinstance(item, dict)]
+                    )
+
+                endpoint_errors = endpoint.get("errors") or []
+                if isinstance(endpoint_errors, list) and endpoint_errors:
+                    error_groups.append(
+                        [item for item in endpoint_errors if isinstance(item, dict)]
+                    )
+
+            actions = _merge_dict_lists(action_groups, identity_fields=("id",))
+            errors = _merge_dict_lists(
+                error_groups,
+                identity_fields=("status_code", "code"),
+            )
+            external_dependencies = _merge_external_dependencies(
+                external_dependency_groups
+            )
+
+            configuration_refs = _dedupe_strings(
+                [
+                    ref
+                    for dependency in external_dependencies
+                    for ref in (dependency.get("configuration_refs") or [])
+                ]
+            )
+            for ref in integration_refs:
+                integration = integrations_by_id.get(ref)
+                if not isinstance(integration, dict):
+                    continue
+                configuration_refs.extend(
+                    [
+                        conf_ref
+                        for conf_ref in (integration.get("configuration_refs") or [])
+                        if isinstance(conf_ref, str)
+                    ]
+                )
+
+            configuration = _resolve_configuration(
+                configuration_refs=configuration_refs,
+                configuration_by_key=configuration_by_key,
+            )
+            configuration_names = {
+                str(item.get("key") or "").strip()
+                for item in configuration
+                if isinstance(item, dict)
+            }
+            file_env = [
+                dict(item)
+                for item in env
+                if isinstance(item, dict)
+                and str(item.get("name") or "").strip() in configuration_names
+            ]
+
+            dedicated_modules = [
+                integration_module_by_ref[ref]
+                for ref in integration_refs
+                if ref in integration_module_by_ref
+            ]
+            has_dedicated_integration_module = bool(dedicated_modules)
+            responsibilities = _build_endpoint_responsibilities(
+                base=base_responsibilities,
+                implementation_contracts=implementation_for_file,
+                has_dedicated_integration_module=has_dedicated_integration_module,
+            )
+            if integration_refs and not has_dedicated_integration_module:
+                notes.append(
+                    "Implementar provisionalmente la integración en este archivo, sin conexiones en import-time y manteniendo la construcción del cliente en una función lazy."
+                )
+
+            endpoint_specific_obligations: List[str] = []
+            should_add_generic_obligations = (
+                not implementation_for_file
+                or bool(actions)
+                or bool(errors)
+                or bool(integration_refs)
+                or bool(external_dependencies)
+                or bool(configuration)
+            )
+            if should_add_generic_obligations:
+                if any(
+                    isinstance(endpoint.get("request"), dict)
+                    and str(endpoint.get("request", {}).get("type") or "").strip()
+                    and str(endpoint.get("request", {}).get("type") or "").strip()
+                    != "none"
+                    for endpoint in eps_for_file
+                ):
+                    endpoint_specific_obligations.append("Validate the declared request")
+                if actions:
+                    endpoint_specific_obligations.append("Execute all required actions")
+                endpoint_specific_obligations.append(
+                    "Invoke the referenced service or integration"
+                    if integration_refs or external_dependencies
+                    else "Keep invocation logic inside the endpoint boundary"
+                )
+                if errors:
+                    endpoint_specific_obligations.append("Map declared HTTP errors")
+                if any(endpoint.get("response") for endpoint in eps_for_file):
+                    endpoint_specific_obligations.append("Build the declared response")
+
+            must_implement = _dedupe_strings(
+                must_implement + endpoint_specific_obligations
+            )
+            must_not = _dedupe_strings(
+                must_not
+                + (
+                    [
+                        "Do not embed credentials or secret values",
+                        "Do not open external connections at import time",
+                        "Do not return a hard-coded success response",
+                        "Do not execute real integrations in hermetic tests",
+                    ]
+                    if integration_refs or external_dependencies
+                    else []
+                )
+                + (
+                    ["Do not make this endpoint depend on external systems"]
+                    if _is_health_endpoint(eps_for_file)
+                    and not (integration_refs or external_dependencies)
+                    else []
+                )
+            )
+
+            allowed_imports = ["fastapi", "typing", "pydantic"]
+            if configuration:
+                allowed_imports.append("app.core.config")
+            if dedicated_modules:
+                allowed_imports.extend(
+                    [
+                        _module_from_endpoint_file(module_path)
+                        for module_path in dedicated_modules
+                    ]
+                )
+            else:
+                allowed_imports.extend(
+                    _import_roots_for_integrations(
+                        integration_refs=integration_refs,
+                        integrations_by_id=integrations_by_id,
+                        technologies_by_name=technologies_by_name,
+                    )
+                )
+            allowed_imports = _dedupe_strings(allowed_imports)
+
+            file_persistence = dict(persistence)
+            file_test_strategy = dict(test_strategy)
+            file_source = {
+                "spec_source": dict(source),
+                "implementation_contracts": list(implementation_for_file),
+                "integrations": [
+                    dict(integrations_by_id[ref])
+                    for ref in integration_refs
+                    if isinstance(integrations_by_id.get(ref), dict)
+                ],
+                "configuration": list(configuration),
+                "technology_signals": _technology_signals_for_integrations(
+                    integration_refs=integration_refs,
+                    integrations_by_id=integrations_by_id,
+                    technologies_by_name=technologies_by_name,
+                ),
+            }
+        elif kind == "integration":
+            implementation_file = implementation_files_by_path.get(path, {})
+            integration_ref = str(implementation_file.get("integration_ref") or "").strip()
+            integration = integrations_by_id.get(integration_ref, {})
+            technology_notes = _missing_import_root_notes(
+                integration_refs=[integration_ref],
+                integrations_by_id=integrations_by_id,
+                technologies_by_name=technologies_by_name,
+            )
+            notes.extend(technology_notes)
+            required_symbols = ["build_client"]
+            responsibilities = [
+                "encapsular la integración externa asignada",
+                "construir el cliente de forma lazy",
+                "aplicar autenticación declarada",
+                "leer configuración declarada",
+                "exponer operaciones llamables",
+                "traducir excepciones del proveedor a errores internos",
+                "no ejecutar llamadas externas en import-time",
+            ]
+            integration_refs = [integration_ref] if integration_ref else []
+            external_dependencies = _integration_external_dependencies(
+                integration_ref=integration_ref,
+                integration=integration,
+                implementation_contracts=implementation_contracts,
+            )
+            implementation_levels = _dedupe_strings(
+                [
+                    item
+                    for contract in implementation_contracts
+                    if isinstance(contract, dict)
+                    and integration_ref in (contract.get("integration_refs") or [])
+                    for item in (contract.get("implementation_levels") or [])
+                ]
+                + [
+                    str(integration.get("implementation_level") or "").strip()
+                ]
+            )
+            configuration = _resolve_configuration(
+                configuration_refs=_dedupe_strings(
+                    integration.get("configuration_refs") or []
+                ),
+                configuration_by_key=configuration_by_key,
+            )
+            configuration_names = {
+                str(item.get("key") or "").strip()
+                for item in configuration
+                if isinstance(item, dict)
+            }
+            file_env = [
+                dict(item)
+                for item in env
+                if isinstance(item, dict)
+                and str(item.get("name") or "").strip() in configuration_names
+            ]
+            actions = _integration_actions_for_ref(
+                integration_ref=integration_ref,
+                endpoints=endpoints,
+                implementation_contracts=implementation_contracts,
+            )
+            must_implement = _dedupe_strings(
+                [
+                    "Build the integration client lazily",
+                    "Apply the declared authentication flow",
+                    "Read the declared configuration",
+                    "Raise internal or domain errors",
+                    "Allow substitution by mocks in tests",
+                ]
+                + [
+                    f"Implement external action '{action.get('id')}'"
+                    for action in actions
+                    if isinstance(action, dict)
+                    and str(action.get("id") or "").strip()
+                ]
+            )
+            must_not = _dedupe_strings(
+                [
+                    "Do not store credentials",
+                    "Do not open connections at import time",
+                    "Do not return a fake success response",
+                    "Do not convert provider exceptions directly into FastAPI responses",
+                    "Do not perform real calls in hermetic tests",
+                ]
+            )
+            allowed_imports = _dedupe_strings(
+                ["typing", "functools", "app.core.config"]
+                + _import_roots_for_integrations(
+                    integration_refs=integration_refs,
+                    integrations_by_id=integrations_by_id,
+                    technologies_by_name=technologies_by_name,
+                )
+            )
+            file_source = {
+                "spec_source": dict(source),
+                "integration": dict(integration) if isinstance(integration, dict) else {},
+                "implementation_file": dict(implementation_file),
+                "actions": list(actions),
+                "technology_signals": _technology_signals_for_integrations(
+                    integration_refs=integration_refs,
+                    integrations_by_id=integrations_by_id,
+                    technologies_by_name=technologies_by_name,
+                ),
+            }
         elif kind == "config":
             required_symbols = ["Settings", "get_settings"]
             responsibilities = [
@@ -170,12 +574,103 @@ def build_file_contracts_from_spec(spec: dict) -> List[FileContract]:
                 notes.append(
                     "Preparar settings de persistencia sin hardcodear vendor si SPEC no lo exige"
                 )
+            configuration = [
+                dict(item)
+                for item in (spec.get("configuration") or [])
+                if isinstance(item, dict) and str(item.get("key") or "").strip()
+            ]
+            file_env = list(env)
+            must_implement = _build_config_must_implement(configuration)
+            must_not = [
+                "Do not validate external credentials at import time",
+                "Do not embed secret values",
+            ]
+            file_persistence = dict(persistence)
+            file_test_strategy = dict(test_strategy)
+            file_source = {
+                "spec_source": dict(source),
+                "configuration": list(configuration),
+                "env": list(file_env),
+            }
         elif kind == "requirements":
             responsibilities = ["declarar dependencias runtime"]
+            file_dependencies = list(deps)
+            must_implement = [
+                f"Declare runtime dependency '{dependency}'"
+                for dependency in file_dependencies
+                if str(dependency or "").strip()
+            ]
+            must_not = [
+                "Do not place import module names when a different installable package is declared"
+            ]
+            file_source = {
+                "spec_source": dict(source),
+                "technology_signals": _technology_signals_for_dependencies(
+                    dependencies=file_dependencies,
+                    technologies_by_name=technologies_by_name,
+                ),
+            }
+        elif kind == "test":
+            responsibilities = [
+                "materializar la estrategia de tests declarada",
+                "cubrir el comportamiento observable del endpoint asociado cuando exista",
+            ]
+            file_test_strategy = dict(test_strategy)
+            related_endpoints = _endpoints_for_test_file(path=path, endpoints=endpoints)
+            related_integration_refs = _dedupe_strings(
+                [
+                    ref
+                    for endpoint in related_endpoints
+                    for ref in (endpoint.get("integration_refs") or [])
+                    if isinstance(ref, str)
+                ]
+            )
+            configuration_refs = []
+            for ref in related_integration_refs:
+                integration = integrations_by_id.get(ref)
+                if isinstance(integration, dict):
+                    configuration_refs.extend(
+                        [
+                            conf_ref
+                            for conf_ref in (integration.get("configuration_refs") or [])
+                            if isinstance(conf_ref, str)
+                        ]
+                    )
+            configuration = _resolve_configuration(
+                configuration_refs=_dedupe_strings(configuration_refs),
+                configuration_by_key=configuration_by_key,
+            )
+            must_implement = _dedupe_strings(
+                ["Reflect the declared test strategy"]
+                + (
+                    ["Cover endpoint integration scenarios without real external side effects"]
+                    if related_integration_refs
+                    else []
+                )
+            )
+            must_not = _dedupe_strings(
+                ["Do not execute real integrations in hermetic tests"]
+                if related_integration_refs
+                else []
+            )
+            file_source = {
+                "spec_source": dict(source),
+                "endpoints": list(related_endpoints),
+                "integrations": [
+                    dict(integrations_by_id[ref])
+                    for ref in related_integration_refs
+                    if isinstance(integrations_by_id.get(ref), dict)
+                ],
+                "configuration": list(configuration),
+            }
         elif kind == "docs":
             responsibilities = ["documentación del proyecto"]
         elif kind == "package_init":
             responsibilities = ["marcar paquete python"]
+        elif kind == "service":
+            responsibilities = ["módulo interno de servicio"]
+        elif kind == "repository":
+            responsibilities = ["módulo interno de repositorio"]
         else:
             responsibilities = ["módulo del proyecto"]
             notes.append("Contrato derivado del SPEC sin reglas específicas")
@@ -186,33 +681,526 @@ def build_file_contracts_from_spec(spec: dict) -> List[FileContract]:
                 kind=kind,
                 responsibilities=responsibilities,
                 required_symbols=required_symbols,
-                allowed_imports=allowed_imports,
+                allowed_imports=_dedupe_strings(allowed_imports),
                 forbidden_imports=forbidden_imports,
                 endpoints=list(eps_for_file),
-                dependencies=list(deps) if kind == "requirements" else [],
-                env=list(env) if kind in ("main", "config") else [],
-                persistence=dict(persistence) if kind in ("endpoint", "config") else {},
-                test_strategy=dict(test_strategy) if kind in ("endpoint", "config", "main") else {},
-                source=dict(source) if kind in ("endpoint", "main", "router") else {},
+                dependencies=list(file_dependencies),
+                env=list(file_env),
+                persistence=dict(file_persistence),
+                test_strategy=dict(file_test_strategy),
+                source=dict(file_source),
                 notes=notes,
+                implementation_contracts=list(implementation_for_file),
+                must_implement=list(must_implement),
+                must_not=list(must_not),
+                implementation_plan=list(implementation_plan),
+                actions=list(actions),
+                errors=list(errors),
+                integration_refs=list(integration_refs),
+                external_dependencies=list(external_dependencies),
+                implementation_levels=list(implementation_levels),
+                configuration=list(configuration),
             )
         )
 
-    _validate_contracts_against_spec(spec_files=spec_files, endpoints=endpoints, contracts=contracts)
+    _validate_contracts_against_spec(
+        spec_files=spec_files,
+        endpoints=endpoints,
+        contracts=contracts,
+    )
+    _validate_implementation_assignment(
+        endpoints=endpoints,
+        implementation_contracts=implementation_contracts,
+        file_contracts=contracts,
+    )
 
     return contracts
 
 
+def _endpoint_key(method: Any, path: Any) -> tuple[str, str]:
+    return (str(method or "").strip().upper(), str(path or "").strip())
+
+
+def _implementation_contracts_by_endpoint(
+    implementation_contracts: List[Dict[str, Any]],
+) -> Dict[tuple[str, str], List[Dict[str, Any]]]:
+    result: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+    for contract in implementation_contracts:
+        if not isinstance(contract, dict):
+            continue
+        key = _endpoint_key(contract.get("method"), contract.get("path"))
+        if not key[0] or not key[1]:
+            continue
+        result.setdefault(key, []).append(contract)
+    return result
+
+
+def _dedupe_strings(values: List[Any]) -> List[str]:
+    seen: Set[str] = set()
+    result: List[str] = []
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def _merge_dict_lists(
+    groups: List[List[Dict[str, Any]]],
+    *,
+    identity_fields: tuple[str, ...],
+) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    seen: Set[tuple[Any, ...]] = set()
+    for group in groups:
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            key = tuple(item.get(field) for field in identity_fields)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(dict(item))
+    return result
+
+
+def _merge_external_dependencies(
+    groups: List[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    seen: Set[tuple[Any, ...]] = set()
+    for group in groups:
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            dep_id = item.get("id")
+            dep_name = item.get("name")
+            key = ("id", dep_id) if dep_id is not None else ("name", dep_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(dict(item))
+    return result
+
+
+def _configuration_by_key(spec: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for item in spec.get("configuration") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        sanitized = {
+            k: v
+            for k, v in dict(item).items()
+            if str(k) not in {"value", "secret_value"}
+        }
+        result[key] = sanitized
+    return result
+
+
+def _integrations_by_id(spec: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for item in spec.get("integrations") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("id") or "").strip()
+        if not key:
+            continue
+        result[key] = dict(item)
+    return result
+
+
+def _technology_signals_by_name(
+    spec: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for item in spec.get("technology_signals") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("name") or "").strip()
+        if not key:
+            continue
+        result[key] = dict(item)
+    return result
+
+
+def _env_by_name(spec: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for item in spec.get("env") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("name") or "").strip()
+        if not key:
+            continue
+        result[key] = dict(item)
+    return result
+
+
+def _implementation_files_by_path(
+    implementation_files: List[Any],
+) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for item in implementation_files:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").replace("\\", "/").strip()
+        if not path:
+            continue
+        result[path] = dict(item)
+    return result
+
+
+def _integration_module_by_ref(
+    implementation_files: List[Any],
+) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for item in implementation_files:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind") or "").strip() != "integration":
+            continue
+        ref = str(item.get("integration_ref") or "").strip()
+        path = str(item.get("path") or "").replace("\\", "/").strip()
+        if ref and path:
+            result[ref] = path
+    return result
+
+
+def _integration_actions_by_ref(
+    implementation_contracts: List[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    result: Dict[str, List[Dict[str, Any]]] = {}
+    for contract in implementation_contracts:
+        if not isinstance(contract, dict):
+            continue
+        refs = [
+            ref
+            for ref in (contract.get("integration_refs") or [])
+            if isinstance(ref, str) and ref.strip()
+        ]
+        actions = [
+            item
+            for item in (contract.get("actions") or [])
+            if isinstance(item, dict)
+            and str(item.get("integration_ref") or "").strip()
+        ]
+        for ref in refs:
+            for action in actions:
+                if str(action.get("integration_ref") or "").strip() != ref:
+                    continue
+                result.setdefault(ref, []).append(dict(action))
+    return result
+
+
+def _build_endpoint_responsibilities(
+    *,
+    base: List[str],
+    implementation_contracts: List[Dict[str, Any]],
+    has_dedicated_integration_module: bool,
+) -> List[str]:
+    responsibilities = list(base)
+    responsibilities.extend(
+        [
+            "validar el request declarado",
+            "ejecutar todas las acciones requeridas",
+            "construir la respuesta declarada",
+            "mapear los errores declarados",
+            "no devolver éxito antes de ejecutar las acciones",
+        ]
+    )
+    if any(
+        (contract.get("integration_refs") or [])
+        or (contract.get("external_dependencies") or [])
+        for contract in implementation_contracts
+        if isinstance(contract, dict)
+    ):
+        responsibilities.append("invocar las integraciones referenciadas")
+    if has_dedicated_integration_module:
+        responsibilities.append(
+            "delegar SDK, autenticación, cliente y configuración al módulo interno de integración"
+        )
+    return _dedupe_strings(responsibilities)
+
+
+def _import_roots_for_integrations(
+    *,
+    integration_refs: List[str],
+    integrations_by_id: Dict[str, Dict[str, Any]],
+    technologies_by_name: Dict[str, Dict[str, Any]],
+) -> List[str]:
+    roots: List[str] = []
+    for ref in integration_refs:
+        integration = integrations_by_id.get(ref)
+        if not isinstance(integration, dict):
+            continue
+        for technology_ref in integration.get("technology_refs") or []:
+            technology = technologies_by_name.get(str(technology_ref or "").strip())
+            if not isinstance(technology, dict):
+                continue
+            import_roots = technology.get("import_roots") or []
+            if not isinstance(import_roots, list):
+                continue
+            for root in import_roots:
+                if isinstance(root, str) and root.strip():
+                    roots.append(root.strip())
+    return _dedupe_strings(roots)
+
+
+def _missing_import_root_notes(
+    *,
+    integration_refs: List[str],
+    integrations_by_id: Dict[str, Dict[str, Any]],
+    technologies_by_name: Dict[str, Dict[str, Any]],
+) -> List[str]:
+    notes: List[str] = []
+    for ref in integration_refs:
+        integration = integrations_by_id.get(ref)
+        if not isinstance(integration, dict):
+            continue
+        for technology_ref in integration.get("technology_refs") or []:
+            technology = technologies_by_name.get(str(technology_ref or "").strip())
+            if not isinstance(technology, dict):
+                continue
+            import_roots = technology.get("import_roots") or []
+            packages = technology.get("packages") or []
+            if isinstance(import_roots, list) and import_roots:
+                continue
+            if not isinstance(packages, list):
+                continue
+            for package in packages:
+                package_name = str(package or "").strip()
+                if not package_name:
+                    continue
+                notes.append(
+                    f"No import root was declared for package '{package_name}'; the generated code must use only imports supported by the integration contract or standard library."
+                )
+    return _dedupe_strings(notes)
+
+
+def _resolve_configuration(
+    *,
+    configuration_refs: List[str],
+    configuration_by_key: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    for ref in _dedupe_strings(configuration_refs):
+        conf = configuration_by_key.get(ref)
+        if isinstance(conf, dict):
+            result.append(dict(conf))
+    return result
+
+
+def _dedupe_contract_dicts(
+    contracts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    seen: Set[tuple[str, str, str]] = set()
+    for contract in contracts:
+        if not isinstance(contract, dict):
+            continue
+        key = (
+            str(contract.get("method") or "").strip().upper(),
+            str(contract.get("path") or "").strip(),
+            str(
+                contract.get("capability")
+                or contract.get("capability_id")
+                or contract.get("operation")
+                or ""
+            ).strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(dict(contract))
+    return result
+
+
+def _find_matching_endpoint(
+    *,
+    endpoints: List[Dict[str, Any]],
+    method: Any,
+    path: Any,
+) -> Dict[str, Any] | None:
+    target = _endpoint_key(method, path)
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        if _endpoint_key(endpoint.get("method"), endpoint.get("path")) == target:
+            return endpoint
+    return None
+
+
 def _module_from_endpoint_file(path: str) -> str:
-    """
-    Convierte un path de archivo endpoint a módulo importable.
-    Ej:
-      app/api/endpoints/productos.py -> app.api.endpoints.productos
-    """
     p = (path or "").replace("\\", "/").strip()
     if p.endswith(".py"):
         p = p[:-3]
     return p.replace("/", ".")
+
+
+def _technology_signals_for_integrations(
+    *,
+    integration_refs: List[str],
+    integrations_by_id: Dict[str, Dict[str, Any]],
+    technologies_by_name: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for ref in integration_refs:
+        integration = integrations_by_id.get(ref)
+        if not isinstance(integration, dict):
+            continue
+        for technology_ref in integration.get("technology_refs") or []:
+            key = str(technology_ref or "").strip()
+            if not key or key in seen:
+                continue
+            technology = technologies_by_name.get(key)
+            if not isinstance(technology, dict):
+                continue
+            seen.add(key)
+            result.append(dict(technology))
+    return result
+
+
+def _technology_signals_for_dependencies(
+    *,
+    dependencies: List[str],
+    technologies_by_name: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    normalized_dependencies = {
+        str(item or "").strip() for item in dependencies if str(item or "").strip()
+    }
+    result: List[Dict[str, Any]] = []
+    for technology in technologies_by_name.values():
+        packages = technology.get("packages") or technology.get("dependency_names") or []
+        if not isinstance(packages, list):
+            continue
+        if normalized_dependencies.intersection(
+            {str(item or "").strip() for item in packages if str(item or "").strip()}
+        ):
+            result.append(dict(technology))
+    return result
+
+
+def _build_config_must_implement(
+    configuration: List[Dict[str, Any]],
+) -> List[str]:
+    result: List[str] = []
+    for item in configuration:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        delivery = str(
+            item.get("delivery") or item.get("kind") or item.get("via") or "unspecified"
+        ).strip()
+        result.append(f"Declare configuration '{key}' using delivery '{delivery}'")
+        if bool(item.get("required")):
+            result.append(f"Expose required configuration '{key}'")
+        if bool(item.get("secret")):
+            result.append(
+                f"Treat configuration '{key}' as secret and never hard-code it"
+            )
+    return _dedupe_strings(result)
+
+
+def _endpoints_for_test_file(
+    *,
+    path: str,
+    endpoints: List[Any],
+) -> List[Dict[str, Any]]:
+    normalized_path = str(path or "").replace("\\", "/")
+    result: List[Dict[str, Any]] = []
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        endpoint_file = str(endpoint.get("file") or "").replace("\\", "/")
+        endpoint_name = endpoint_file.rsplit("/", 1)[-1].replace(".py", "")
+        if endpoint_name and endpoint_name in normalized_path:
+            result.append(dict(endpoint))
+    return result
+
+
+def _integration_external_dependencies(
+    *,
+    integration_ref: str,
+    integration: Dict[str, Any],
+    implementation_contracts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    groups: List[List[Dict[str, Any]]] = []
+    for contract in implementation_contracts:
+        if not isinstance(contract, dict):
+            continue
+        if integration_ref not in (contract.get("integration_refs") or []):
+            continue
+        groups.append(
+            [
+                item
+                for item in (contract.get("external_dependencies") or [])
+                if isinstance(item, dict)
+            ]
+        )
+    if isinstance(integration, dict) and integration_ref:
+        groups.append(
+            [
+                {
+                    "id": integration_ref,
+                    "name": integration.get("name") or integration_ref,
+                    "kind": integration.get("kind"),
+                    "configuration_refs": list(
+                        _dedupe_strings(integration.get("configuration_refs") or [])
+                    ),
+                }
+            ]
+        )
+    return _merge_external_dependencies(groups)
+
+
+def _integration_actions_for_ref(
+    *,
+    integration_ref: str,
+    endpoints: List[Any],
+    implementation_contracts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    groups: List[List[Dict[str, Any]]] = []
+    for contract in implementation_contracts:
+        if not isinstance(contract, dict):
+            continue
+        if integration_ref not in (contract.get("integration_refs") or []):
+            continue
+        groups.append(
+            [
+                item
+                for item in (contract.get("actions") or [])
+                if isinstance(item, dict)
+                and str(item.get("integration_ref") or "").strip() == integration_ref
+            ]
+        )
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        groups.append(
+            [
+                item
+                for item in (endpoint.get("actions") or [])
+                if isinstance(item, dict)
+                and str(item.get("integration_ref") or "").strip() == integration_ref
+            ]
+        )
+    return _merge_dict_lists(groups, identity_fields=("id",))
+
+
+def _is_health_endpoint(endpoints: List[Dict[str, Any]]) -> bool:
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        if str(endpoint.get("path") or "").strip() == "/health":
+            return True
+    return False
 
 
 def _infer_kind(path: str) -> str:
@@ -227,8 +1215,20 @@ def _infer_kind(path: str) -> str:
         return "docs"
     if p.startswith("tests/") or p.startswith("app/tests/"):
         return "test"
+    if p.startswith("app/integrations/") and p.endswith(".py"):
+        return "integration"
+    if p.startswith("app/services/") and p.endswith(".py"):
+        return "service"
+    if p.startswith("app/repositories/") and p.endswith(".py"):
+        return "repository"
     if p.startswith("app/api/endpoints/") and p.endswith(".py"):
         return "endpoint"
+    if p == "app/api/router.py":
+        return "router"
+    if p == "app/core/config.py":
+        return "config"
+    if p == "app/main.py":
+        return "main"
     if p.startswith("app/api/") and p.endswith(".py"):
         return "router"
     if p.startswith("app/core/") and p.endswith(".py"):
@@ -238,19 +1238,20 @@ def _infer_kind(path: str) -> str:
     return "unknown"
 
 
-def _validate_contracts_against_spec(*, spec_files: List[str], endpoints: List[Any], contracts: List[FileContract]) -> None:
-    # 1) Todo file en spec.files debe tener un FileContract
+def _validate_contracts_against_spec(
+    *,
+    spec_files: List[str],
+    endpoints: List[Any],
+    contracts: List[FileContract],
+) -> None:
     c_paths = [c.path for c in contracts]
     if set(c_paths) != set(spec_files):
         missing = sorted(list(set(spec_files) - set(c_paths)))
         extra = sorted(list(set(c_paths) - set(spec_files)))
         raise ValueError(f"file contracts mismatch. missing={missing} extra={extra}")
-
-    # 2) No duplicados por path
     if len(c_paths) != len(set(c_paths)):
         raise ValueError("duplicate file contracts by path")
 
-    # 3) Todo endpoint debe aparecer exactamente en un FileContract de kind endpoint
     ep_seen = 0
     for ep in endpoints:
         if not isinstance(ep, dict):
@@ -258,22 +1259,105 @@ def _validate_contracts_against_spec(*, spec_files: List[str], endpoints: List[A
         ep_file = str(ep.get("file") or "").replace("\\", "/")
         if not ep_file:
             continue
-
         if ep_file not in spec_files:
             raise ValueError(f"endpoint.file not present in spec.files: {ep_file}")
 
-        owners = [c for c in contracts if c.kind == "endpoint" and c.path == ep_file and ep in c.endpoints]
+        owners = [
+            c
+            for c in contracts
+            if c.kind == "endpoint" and c.path == ep_file and ep in c.endpoints
+        ]
         if len(owners) != 1:
-            raise ValueError(f"endpoint not owned by exactly 1 file contract: file={ep_file}")
+            raise ValueError(
+                f"endpoint not owned by exactly 1 file contract: file={ep_file}"
+            )
         ep_seen += 1
-
-        # endpoint.func debe aparecer en required_symbols del contrato de su archivo.
         fn = ep.get("func") or ep.get("function") or ep.get("handler")
         if isinstance(fn, str) and fn.strip():
             if fn.strip() not in owners[0].required_symbols:
-                raise ValueError(f"endpoint func not in required_symbols: {fn} file={ep_file}")
+                raise ValueError(
+                    f"endpoint func not in required_symbols: {fn} file={ep_file}"
+                )
 
-    # 4) No endpoints huérfanos: ep_seen debe ser igual al número de endpoints dict válidos con file.
-    ep_expected = len([ep for ep in endpoints if isinstance(ep, dict) and (ep.get("file") or "")])
+    ep_expected = len(
+        [ep for ep in endpoints if isinstance(ep, dict) and (ep.get("file") or "")]
+    )
     if ep_seen != ep_expected:
         raise ValueError("orphan endpoints detected")
+
+
+def _validate_implementation_assignment(
+    *,
+    endpoints: List[Any],
+    implementation_contracts: List[Dict[str, Any]],
+    file_contracts: List[FileContract],
+) -> None:
+    if not implementation_contracts:
+        return
+
+    endpoint_contracts = [
+        contract for contract in file_contracts if contract.kind == "endpoint"
+    ]
+    endpoint_keys_by_file = {
+        contract.path: {
+            _endpoint_key(endpoint.get("method"), endpoint.get("path"))
+            for endpoint in contract.endpoints
+            if isinstance(endpoint, dict)
+        }
+        for contract in endpoint_contracts
+    }
+
+    valid_endpoint_keys = {
+        _endpoint_key(endpoint.get("method"), endpoint.get("path"))
+        for endpoint in endpoints
+        if isinstance(endpoint, dict)
+        and _endpoint_key(endpoint.get("method"), endpoint.get("path"))[0]
+        and _endpoint_key(endpoint.get("method"), endpoint.get("path"))[1]
+    }
+
+    owners_by_contract_key: Dict[tuple[str, str, str], List[FileContract]] = {}
+
+    for contract in implementation_contracts:
+        if not isinstance(contract, dict):
+            continue
+        key = _endpoint_key(contract.get("method"), contract.get("path"))
+        if not key[0] or not key[1]:
+            continue
+        if key not in valid_endpoint_keys:
+            raise ValueError(
+                f"implementation contract endpoint not present in spec.endpoints: method={key[0]} path={key[1]}"
+            )
+        owners = [
+            file_contract
+            for file_contract in endpoint_contracts
+            if key in endpoint_keys_by_file.get(file_contract.path, set())
+            and any(
+                _endpoint_key(item.get("method"), item.get("path")) == key
+                for item in file_contract.implementation_contracts
+                if isinstance(item, dict)
+            )
+        ]
+        if len(owners) != 1:
+            raise ValueError(
+                f"implementation contract not owned by exactly 1 endpoint file contract: method={key[0]} path={key[1]}"
+            )
+
+        owner = owners[0]
+        contract_identity = (
+            key[0],
+            key[1],
+            str(
+                contract.get("capability")
+                or contract.get("capability_id")
+                or contract.get("operation")
+                or json.dumps(contract, ensure_ascii=False, sort_keys=True)
+            ),
+        )
+        owners_by_contract_key.setdefault(contract_identity, []).append(owner)
+
+    for contract_identity, owners in owners_by_contract_key.items():
+        if len(owners) != 1:
+            raise ValueError(
+                "implementation contract assigned to multiple file contracts: "
+                f"method={contract_identity[0]} path={contract_identity[1]}"
+            )
