@@ -42,7 +42,7 @@ except Exception:  # pragma: no cover
 from poc_it.orquestacion.pytest_llm_prompts import build_prompt_c1_harness_repair, build_prompt_c2_asserts_repair
 from poc_it.orquestacion.repair_trace import TraceEvent, append_trace_event, now_ts
 from poc_it.orquestacion.test_repair_context import TEST_REPAIR_CONTEXT_PATH, build_test_repair_context
-from poc_it.orquestacion.override_repair_llm import generate_or_repair_conftest_overrides_with_llm
+from poc_it.orquestacion.override_repair_llm import suggest_override_repairs
 
 logger = logging.getLogger(__name__)
 
@@ -1070,70 +1070,65 @@ def _ensure_base_conftest(
         logger.exception("[PYTEST-REPAIR] No se pudo provisionar tests/conftest.py base; se continúa.")
 
 
-def _maybe_repair_overrides_with_llm(
+_MISSING_OVERRIDE_IMPORT_RE = re.compile(
+    r"(?:Override/import FQNs not in allowed_dependency_overrides:\s*\[[^\]]*?:_import_callable\()(?P<fqn>[^)\]]+)",
+    re.IGNORECASE,
+)
+_MISSING_OVERRIDE_FQN_RE = re.compile(
+    r"(?:allowed_dependency_overrides|dependency_overrides)[^:\n]*[:\s](?P<fqn>app\.[A-Za-z_][\w\.]+)",
+    re.IGNORECASE,
+)
+
+
+def _extract_missing_override_candidates(pytest_output: str) -> List[str]:
+    if not pytest_output:
+        return []
+
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    for regex in (_MISSING_OVERRIDE_IMPORT_RE, _MISSING_OVERRIDE_FQN_RE):
+        for match in regex.finditer(pytest_output):
+            value = str(match.group("fqn") or "").strip().strip("'\"")
+            if value.startswith("app.") and value not in seen:
+                seen.add(value)
+                candidates.append(value)
+
+    return candidates
+
+
+def _suggest_override_repairs(
     *,
-    nombre_proyecto: str,
-    project_dir: str,
-    estructura: Dict[str, str],
-    current_tests: Dict[str, str],
+    plan: object,
+    runtime_contracts: dict,
     pytest_output: str,
-    runtime_contracts: Optional[dict],
-) -> bool:
-    """Intenta reparar el harness de overrides (tests/conftest.py) con una llamada LLM dedicada.
+) -> dict:
+    failure_context = {
+        "pytest_output": pytest_output,
+        "missing_overrides": _extract_missing_override_candidates(pytest_output),
+    }
 
-    Esto NO es "arreglar asserts": es corregir wiring para que:
-    - dependency_overrides use callables (no instancias)
-    - get_db sea generator/async generator
-    - stubs sean stateful
-    - hermeticidad
-
-    Retorna True si aplicó un patch (aunque luego pytest siga fallando).
-    """
-    try:
-        # stub_signatures es opcional; si existe ayuda a awaited/sync + chains.
-        stub_signatures = None
-        ss_path = os.path.join(project_dir, ".poc_it", "stub_signatures.json")
-        if os.path.exists(ss_path):
-            with open(ss_path, "r", encoding="utf-8") as f:
-                stub_signatures = json.load(f)
-
-        res = generate_or_repair_conftest_overrides_with_llm(
-            runtime_contracts=runtime_contracts or {},
-            stub_signatures=stub_signatures,
-            estructura=estructura or {},
-            pytest_output=pytest_output or "",
-            current_tests=current_tests or {},
+    suggestion = suggest_override_repairs(
+        plan=plan,
+        runtime_contracts=runtime_contracts,
+        failure_context=failure_context,
+    )
+    if isinstance(suggestion, dict):
+        suggestion.setdefault("action", "UPDATE_DEPENDENCY_BINDINGS")
+        suggestion.setdefault("edit_files_directly", False)
+        suggestion.setdefault("suggested_overrides", [])
+        suggestion.setdefault(
+            "reason",
+            "Detected dependency override mismatches from pytest failure context.",
         )
-        if not res.patched_files:
-            logger.info("[PYTEST-REPAIR][OVERRIDES] LLM no devolvió conftest.py reparado.")
-            return False
+        return suggestion
 
-        if not res.ok:
-            logger.info("[PYTEST-REPAIR][OVERRIDES] conftest generado no pasó verificador: %s", res.errors[:5])
-            return False
-
-        materializar_proyecto(
-            nombre_proyecto=nombre_proyecto,
-            estructura=res.patched_files,
-            limpiar_directorio=False,
-        )
-        estructura.update(res.patched_files)
-        current_tests.update(res.patched_files)
-        logger.info("[PYTEST-REPAIR][OVERRIDES] conftest.py reparado/aplicado por LLM.")
-        append_trace_event(
-            project_dir,
-            TraceEvent(
-                ts=now_ts(),
-                phase="C-OVERRIDES",
-                attempt=-1,
-                action="llm_patch",
-                files_changed=list(res.patched_files.keys()),
-            ),
-        )
-        return True
-    except Exception:
-        logger.exception("[PYTEST-REPAIR][OVERRIDES] Error inesperado; se continúa sin overrides repair.")
-        return False
+    return {
+        "action": "UPDATE_DEPENDENCY_BINDINGS",
+        "edit_files_directly": False,
+        "suggested_overrides": [],
+        "reason": "Override repair suggester returned a non-dict result.",
+    }
 
 
 def _filter_patch_for_phase(
@@ -1389,6 +1384,7 @@ def repair_tests_until_pytest_passes(
 
     last_out = ""
     patched_total: Dict[str, str] = {}
+    override_repair_suggestions: List[dict] = []
 
     # Métrica de progreso: (errors, failed) + fingerprint de error
     prev_err, prev_fail = 999, 999
@@ -1622,24 +1618,59 @@ def repair_tests_until_pytest_passes(
                 attempt += 1
                 continue
 
-        # --- Nueva fase: reparación de overrides/harness (anti-atasco C2) -----------------
+        # --- Nueva fase: sugerencia estructurada de overrides (sin editar conftest) -------
         # Heurística:
-        # - si hay 1 fallo recurrente tipo REQUEST_SHAPE (p.ej. POST esperado 201) en suite hermética,
-        #   suele ser wiring/overrides (dependency_overrides no-callable / get_db incorrecto) más que asserts.
-        # - intentamos una reparación dedicada de conftest antes de gastar iteraciones en C2.
+        # - si hay 1 fallo recurrente tipo REQUEST_SHAPE/RESPONSE_SHAPE, puede faltar wiring
+        #   en allowed_dependency_overrides.
+        # - solo generamos una sugerencia estructurada; no se materializan archivos.
         if cls.kind in ("REQUEST_SHAPE", "RESPONSE_SHAPE") and attempt in (0, 1):
-            applied = _maybe_repair_overrides_with_llm(
-                nombre_proyecto=nombre_proyecto,
-                project_dir=project_dir,
-                estructura=estructura,
-                current_tests=current_tests,
+            override_repair_suggestion = _suggest_override_repairs(
+                plan=test_ctx.get("plan"),
+                runtime_contracts=runtime_contracts or {},
                 pytest_output=out,
-                runtime_contracts=runtime_contracts,
             )
-            if applied:
-                # reintenta pytest inmediatamente sin consumir una iteración de LLM general
-                attempt += 1
-                continue
+            suggested_overrides = override_repair_suggestion.get("suggested_overrides") or []
+            if suggested_overrides:
+                logger.info(
+                    "[PYTEST-REPAIR][OVERRIDES] Suggested structured override repairs: %s",
+                    suggested_overrides,
+                )
+                override_repair_suggestions.append(override_repair_suggestion)
+                append_trace_event(
+                    project_dir,
+                    TraceEvent(
+                        ts=now_ts(),
+                        phase="C-OVERRIDES",
+                        attempt=attempt,
+                        action="suggest_override_repairs",
+                        detail=json.dumps(override_repair_suggestion, ensure_ascii=False)[:400],
+                    ),
+                )
+                try:
+                    estructura[".poc_it/override_repair_suggestion.json"] = (
+                        json.dumps(
+                            override_repair_suggestion,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        + "\n"
+                    )
+                    estructura[".poc_it/override_repair_suggestions.json"] = (
+                        json.dumps(
+                            {"suggestions": override_repair_suggestions},
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        + "\n"
+                    )
+                    patched_total[".poc_it/override_repair_suggestion.json"] = estructura[
+                        ".poc_it/override_repair_suggestion.json"
+                    ]
+                    patched_total[".poc_it/override_repair_suggestions.json"] = estructura[
+                        ".poc_it/override_repair_suggestions.json"
+                    ]
+                except Exception:
+                    pass
 
         # Nota: la degradación se evaluará DESPUÉS de intentar aplicar un patch.
 
@@ -1999,7 +2030,10 @@ def repair_tests_until_pytest_passes(
                 production_code_modified_by_test_repair=production_code_modified_by_test_repair,
                 rejected_patch_paths=rejected_patch_paths,
                 harness_strategy=harness_strategy,
-                extra={"aborted_reason": "production_code_modified_in_pipeline_c"},
+                extra={
+                    "aborted_reason": "production_code_modified_in_pipeline_c",
+                    "override_repair_suggestions": override_repair_suggestions,
+                },
             )
 
             return _mk_result(ok=False, attempts=attempt, last_output=out, patched_files=patched_total)
