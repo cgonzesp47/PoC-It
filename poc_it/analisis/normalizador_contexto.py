@@ -22,6 +22,8 @@ Cambio clave (refactor):
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -54,9 +56,13 @@ Devuelve ÚNICAMENTE JSON válido con la siguiente estructura:
       "required": true,
       "implementation_level": "fully_local | integration_skeleton | mocked | documentation_only",
       "authentication": {
-        "mechanism": "string o null",
+        "mechanism": "string",
+        "credential_source": "runtime | file | environment | request | unknown",
+        "allows_embedded_secret": false,
+        "allows_static_credential_file": true,
         "source": "explicit | inferred | default | unknown",
-        "evidence": "string"
+        "evidence": "string",
+        "assumption": "string"
       },
       "technology_refs": ["string"],
       "configuration_refs": ["string"],
@@ -144,6 +150,20 @@ Devuelve ÚNICAMENTE JSON válido con la siguiente estructura:
     }
   ],
 
+  "capability_coverage": [
+    {
+      "capability_id": "stable_identifier",
+      "capability": "descripción de la capacidad",
+      "contract_refs": ["POST /upload"],
+      "action_refs": ["POST /upload#external_action_id"],
+      "integration_refs": ["external_system"],
+      "status": "covered | partially_covered | uncovered | not_api_applicable",
+      "source": "explicit | inferred | unknown",
+      "evidence": "string",
+      "assumption": "string"
+    }
+  ],
+
   "persistence": {
     "required": false,
     "kind": null,
@@ -157,6 +177,8 @@ Devuelve ÚNICAMENTE JSON válido con la siguiente estructura:
     {
       "name": "string",
       "category": "framework | persistence | cache | queue | object_storage | search | external_api | auth | observability | runtime | library | unknown",
+      "packages": ["string"],
+      "import_roots": ["string"],
       "role": "string",
       "evidence": "cita literal",
       "confidence": "explicit | inferred | unknown"
@@ -209,6 +231,68 @@ Reglas:
 - evidence debe contener una cita o fragmento respaldado por la plantilla cuando source="explicit".
 - assumption debe explicar la inferencia cuando source!="explicit".
 
+Reglas de cobertura funcional y contratos API:
+- Analiza cada funcionalidad solicitada por el usuario de manera independiente.
+- Una misma plantilla puede contener una combinación de:
+  1. contratos API explícitos, con método y ruta literales;
+  2. funcionalidades que requieren una interfaz API, pero sin método o ruta literal.
+- Cuando aparezcan literalmente un método HTTP y una ruta, por ejemplo "POST /upload" o "GET /health", crea un contrato en contratos_api_explicitos y conserva como evidence el fragmento literal.
+- Cuando una funcionalidad obligatoria requiera una operación accesible a través de la API, pero el usuario no proporcione método o ruta, crea un contrato en contratos_api_propuestos. Elige un método y una ruta mínimos y coherentes, e incluye una assumption que explique exactamente la inferencia.
+- No descartes contratos propuestos porque existan contratos explícitos. contratos_api_explicitos y contratos_api_propuestos pueden contener elementos simultáneamente.
+- Cada funcionalidad obligatoria debe quedar vinculada, cuando corresponda, a: un contrato API, una acción dentro de un contrato o una integración.
+- No conviertas una funcionalidad en un endpoint cuando pueda implementarse únicamente como comportamiento interno de otro endpoint.
+- No inventes operaciones ajenas a las capacidades solicitadas.
+
+Ejemplo mixto:
+Entrada:
+"Debe exponer GET /health. Además, debe permitir almacenar un documento en un sistema externo mediante una integración autenticada."
+
+Salida conceptual:
+- GET /health → contratos_api_explicitos
+- POST /documents → contratos_api_propuestos
+- Acción external_call hacia la integración externa correspondiente
+- Integración externa correspondiente
+- Assumption que indique que POST /documents se propone porque el usuario pidió la capacidad, pero no especificó su interfaz.
+
+Reglas capability_coverage:
+- capability_id puede utilizarse como identificador descriptivo interno de la respuesta del normalizador, pero la aplicación asignará posteriormente el identificador canónico de cada capacidad durante la reconciliación.
+- No dependas de capability_id para expresar la relación entre una capacidad y sus contratos.
+- contract_refs, action_refs e integration_refs deben contener las referencias estructurales necesarias para vincular cada capacidad.
+- No marques covered sin referencias válidas.
+- Las referencias deben existir después de construir RequestIR.
+- Una capacidad de integración no está cubierta solo porque aparezca el nombre de una librería.
+- Una capacidad que requiera interactuar con un sistema externo debe referenciar una acción de tipo external_call y la integración correspondiente.
+- No determines que una capacidad es externa basándote únicamente en verbos como subir, enviar, guardar, publicar o consultar. Debes determinarlo por la participación real de una integración externa.
+- Ejemplo:
+  {
+    "funcionalidades_clave": [
+      "Enviar una notificación mediante POST /notifications"
+    ],
+    "capability_coverage": [
+      {
+        "capability_id": "send_notification",
+        "capability": "Enviar una notificación",
+        "contract_refs": [
+          "POST /notifications"
+        ],
+        "action_refs": [
+          "POST /notifications#send_notification"
+        ],
+        "integration_refs": [
+          "notification_provider"
+        ],
+        "status": "covered"
+      }
+    ]
+  }
+- Ejemplos:
+  - Enviar una notificación mediante un proveedor externo → requiere integración y external_call.
+  - Publicar un mensaje en un broker → requiere integración y external_call.
+  - Guardar un documento en un almacenamiento externo → requiere integración y external_call.
+  - Procesar internamente un fichero recibido → puede ser una acción interna sin integración externa.
+- El verbo utilizado no determina por sí mismo la externalidad.
+- GET /health no cubre otras capacidades por el mero hecho de garantizar arrancabilidad.
+
 Reglas persistence/state:
 - persistence.required=true SOLO si el usuario pide conservar estado de negocio durable entre peticiones/sesiones.
 - No activar persistence.required solo por mencionar una tecnología.
@@ -219,11 +303,73 @@ Reglas technology_signals:
 - Extrae tecnologías mencionadas explícitamente por el usuario (no inventar).
 - Cada señal debe incluir evidence literal y confidence.
 - Si no puedes clasificar con seguridad: category="unknown", confidence="unknown".
+- packages: lista de nombres de paquetes que deben instalarse mediante el package manager del lenguaje. Si la tecnología no corresponde a un paquete instalable, devolver [].
+- import_roots: lista de módulos/import roots que el código puede importar gracias a esos paquetes. Si no aplica, devolver [].
+- No deduzcas packages por category, por nombre ni por heurísticas de proveedor.
+
+Reglas authentication:
+- credential_source describe de dónde se obtienen las credenciales.
+- allows_embedded_secret indica si el requisito permite secretos literales en código.
+- allows_static_credential_file indica si el requisito permite depender de un fichero estático de credenciales.
+- No derives estas propiedades a partir del nombre del mecanismo; decláralas explícitamente.
+
+Ejemplos genéricos:
+- Librería instalable:
+  {
+    "name": "external-client-sdk",
+    "category": "library",
+    "packages": ["external-client-sdk"],
+    "import_roots": ["external_client"]
+  }
+- Mecanismo no instalable:
+  {
+    "name": "runtime identity",
+    "category": "auth",
+    "packages": [],
+    "import_roots": []
+  }
+- Runtime/plataforma no instalable:
+  {
+    "name": "serverless runtime",
+    "category": "runtime",
+    "packages": [],
+    "import_roots": []
+  }
 
 No hagas obligatorios integrations, configuration, actions, errors ni integration_refs: usa listas vacías cuando no apliquen.
 
 No añadas texto fuera del JSON.
 """
+
+_HTTP_METHOD_PATH_RE = re.compile(
+    r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/[A-Za-z0-9_./{}:-]*)",
+    re.IGNORECASE,
+)
+_HTTP_CONTRACT_RE = re.compile(
+    r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/[A-Za-z0-9_./{}:-]*)",
+    re.IGNORECASE,
+)
+_INTERNAL_NORMALIZER_KEYS = {
+    "_deprecated",
+    "_debug",
+}
+
+
+def prepare_contexto_normalizado_payload(
+    data: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Elimina metadatos internos de la salida del normalizador antes
+    de validarla mediante ContextoNormalizado.
+
+    No elimina campos funcionales desconocidos: esos deben seguir
+    provocando un error con extra='forbid'.
+    """
+    return {
+        key: value
+        for key, value in data.items()
+        if key not in _INTERNAL_NORMALIZER_KEYS
+    }
 
 
 def normalizar_plantilla(plantilla: PlantillaUsuario) -> Dict[str, Any]:
@@ -252,9 +398,11 @@ Tecnologías declaradas: {plantilla.tecnologias}
         prompt=prompt,
         system="Responde exclusivamente con JSON válido.",
         temperature=0.0,
-        max_tokens=2000,
+        max_tokens=4000,
         fase="normalizacion_contexto",
     )
+
+    _persist_debug_artifact_text("normalizer_raw_response", respuesta)
 
     try:
         data = json.loads(respuesta)
@@ -264,12 +412,46 @@ Tecnologías declaradas: {plantilla.tecnologias}
     if not isinstance(data, dict):
         data = {}
 
+    _persist_debug_artifact_json("normalizer_parsed", data)
+
     data = _ensure_normalized_shape(data, plantilla)
 
     _apply_deterministic_fallbacks(data, plantilla)
+    _persist_debug_artifact_json("normalizer_after_fallbacks", data)
 
     # Sanitización fuerte para invariantes explícito/propuesto
     _sanitize_contracts_inplace(data)
+    _reconcile_integrations_inplace(data, plantilla)
+    _reconcile_capability_coverage_inplace(data)
+
+    sanitized_signals: List[Dict[str, Any]] = []
+    for signal in _normalize_technology_signals(data.get("technology_signals")):
+        if str(signal.get("evidence") or "").strip():
+            sanitized_signals.append(signal)
+
+    technology_signals, technology_collisions = canonicalize_technology_signals(
+        sanitized_signals
+    )
+    integrations, technology_trace = canonicalize_integration_technology_refs(
+        data.get("integrations") or [],
+        technology_signals,
+    )
+    data["technology_signals"] = technology_signals
+    data["integrations"] = integrations
+
+    normalizer_debug = data.get("_debug") if isinstance(data.get("_debug"), dict) else {}
+    normalizer_debug["technology_ref_reconciliation"] = technology_trace
+    if technology_collisions:
+        normalizer_debug["technology_id_collisions"] = technology_collisions
+        for collision in technology_collisions:
+            _append_open_question(
+                data,
+                f"TECHNOLOGY_ID_COLLISION: {collision.get('technology_id', '')}",
+            )
+    data["_debug"] = normalizer_debug
+
+    _persist_debug_artifact_json("technology_ref_reconciliation", technology_trace)
+    _persist_debug_artifact_json("normalizer_sanitized", data)
 
     # Compatibilidad temporal (deprecated): contratos_api legacy SOLO explícitos
     data["contratos_api"] = list(data.get("contratos_api_explicitos") or [])
@@ -281,13 +463,11 @@ Tecnologías declaradas: {plantilla.tecnologias}
     )
     data["assumptions"] = _dedupe_str_list(list(data.get("assumptions") or []))
 
+    coverage_report = _build_capability_coverage_report(data)
+    _persist_debug_artifact_json("capability_coverage", coverage_report)
+
     _persist_debug_context(plantilla, data)
     return data
-
-
-# ---------------------------------------------------------------------
-# Helpers de fallback determinista (genéricos, sin heurísticas de dominio)
-# ---------------------------------------------------------------------
 
 
 def _apply_deterministic_fallbacks(data: Dict[str, Any], plantilla: PlantillaUsuario) -> None:
@@ -295,7 +475,7 @@ def _apply_deterministic_fallbacks(data: Dict[str, Any], plantilla: PlantillaUsu
     Fallback determinista mínimo para cuando el LLM devuelve JSON pobre/empty.
 
     Principios:
-    - NO inferir desde texto libre (sin keywords, sin heurísticas de dominio).
+    - NO inferir desde texto libre salvo extracción literal determinista de método+ruta.
     - Solo estructurar campos explícitos de la plantilla (funcionalidades/limites/tecnologias).
     - No activar persistencia ni proponer endpoints si no hay evidencia estructurada en el JSON del LLM.
     """
@@ -312,13 +492,148 @@ def _apply_deterministic_fallbacks(data: Dict[str, Any], plantilla: PlantillaUsu
     if not (isinstance(data.get("technology_signals"), list) and data.get("technology_signals")):
         data["technology_signals"] = _extract_technology_signals_from_template(plantilla)
 
-    # Persistencia: NO inferir por texto libre; si no vino estructurada, mantener required=false y marcar uncertainty.
     data["persistence"] = _extract_persistence_from_template(
         plantilla, existing=data.get("persistence"), technology_signals=data.get("technology_signals")
     )
 
-    # Endpoints: solo si hay evidencia estructurada (domain_entities + operation_groups).
+    recovered_explicit = _extract_explicit_api_contracts_from_template(plantilla)
+    current_explicit = (
+        data.get("contratos_api_explicitos")
+        if isinstance(data.get("contratos_api_explicitos"), list)
+        else []
+    )
+    data["contratos_api_explicitos"] = _merge_contract_dicts(
+        current_explicit,
+        recovered_explicit,
+    )
+
     _propose_api_contracts_from_crud_if_evidenced(data)
+
+
+def _extract_explicit_api_contracts_from_template(
+    plantilla: PlantillaUsuario,
+) -> List[Dict[str, Any]]:
+    sources = [
+        plantilla.problema or "",
+        plantilla.funcionalidades or "",
+        plantilla.limites or "",
+    ]
+
+    contracts: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for source_text in sources:
+        for match in _HTTP_METHOD_PATH_RE.finditer(source_text):
+            method = match.group(1).upper()
+            path = match.group(2).rstrip(".,;:)")
+            if not path.startswith("/"):
+                continue
+            key = (method, _normalize_path_key(path))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            evidence = match.group(0).strip()
+            contracts.append(
+                {
+                    "method": method,
+                    "path": path,
+                    "request": {
+                        "type": "none",
+                        "schema_hint": {},
+                        "evidence": evidence,
+                    },
+                    "response": {
+                        "json_example": {},
+                        "evidence": evidence,
+                    },
+                    "notes": (
+                        "Contrato recuperado determinísticamente desde "
+                        "método y ruta literales de la plantilla."
+                    ),
+                    "actions": [],
+                    "errors": [],
+                    "integration_refs": [],
+                }
+            )
+
+    return contracts
+
+
+def _merge_contract_dicts(
+    primary: List[Any],
+    secondary: List[Any],
+) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    index_by_key: Dict[Tuple[str, str], int] = {}
+
+    def _register(item: Any) -> None:
+        if not isinstance(item, dict):
+            return
+        normalized = _normalize_contract_shape(item)
+        method = str(normalized.get("method") or "").upper().strip()
+        path = _normalize_path_key(str(normalized.get("path") or ""))
+        if not method or not path:
+            return
+        key = (method, path)
+        if key not in index_by_key:
+            index_by_key[key] = len(merged)
+            merged.append(normalized)
+            return
+        merged[index_by_key[key]] = _merge_single_contract_dicts(
+            merged[index_by_key[key]],
+            normalized,
+        )
+
+    for item in primary or []:
+        _register(item)
+    for item in secondary or []:
+        _register(item)
+
+    return merged
+
+
+def _merge_single_contract_dicts(
+    preferred: Dict[str, Any],
+    fallback: Dict[str, Any],
+) -> Dict[str, Any]:
+    out = _normalize_contract_shape(preferred)
+    fb = _normalize_contract_shape(fallback)
+
+    req_out = out.get("request") if isinstance(out.get("request"), dict) else {}
+    req_fb = fb.get("request") if isinstance(fb.get("request"), dict) else {}
+    resp_out = out.get("response") if isinstance(out.get("response"), dict) else {}
+    resp_fb = fb.get("response") if isinstance(fb.get("response"), dict) else {}
+
+    if not _coalesce_str(req_out.get("evidence"), "") and _coalesce_str(req_fb.get("evidence"), ""):
+        req_out = dict(req_out)
+        req_out["evidence"] = _coalesce_str(req_fb.get("evidence"), "")
+    if not _coalesce_str(resp_out.get("evidence"), "") and _coalesce_str(resp_fb.get("evidence"), ""):
+        resp_out = dict(resp_out)
+        resp_out["evidence"] = _coalesce_str(resp_fb.get("evidence"), "")
+
+    if not isinstance(req_out.get("schema_hint"), dict) and isinstance(req_fb.get("schema_hint"), dict):
+        req_out = dict(req_out)
+        req_out["schema_hint"] = dict(req_fb.get("schema_hint") or {})
+    elif isinstance(req_out.get("schema_hint"), dict) and isinstance(req_fb.get("schema_hint"), dict):
+        merged_schema = dict(req_out.get("schema_hint") or {})
+        for key, value in dict(req_fb.get("schema_hint") or {}).items():
+            merged_schema.setdefault(key, value)
+        req_out = dict(req_out)
+        req_out["schema_hint"] = merged_schema
+
+    if not out.get("actions") and fb.get("actions"):
+        out["actions"] = list(fb.get("actions") or [])
+    if not out.get("errors") and fb.get("errors"):
+        out["errors"] = list(fb.get("errors") or [])
+    if not out.get("integration_refs") and fb.get("integration_refs"):
+        out["integration_refs"] = list(fb.get("integration_refs") or [])
+    if not _coalesce_str(out.get("notes"), "") and _coalesce_str(fb.get("notes"), ""):
+        out["notes"] = _coalesce_str(fb.get("notes"), "")
+
+    out["request"] = req_out
+    out["response"] = resp_out
+    return out
 
 
 def _extract_functionalities_from_template(plantilla: PlantillaUsuario, existing: Any) -> List[str]:
@@ -350,6 +665,8 @@ def _extract_technology_signals_from_template(plantilla: PlantillaUsuario) -> Li
             {
                 "name": name,
                 "category": "unknown",
+                "packages": [],
+                "import_roots": [],
                 "role": "",
                 "evidence": evidence,
                 "confidence": "explicit",
@@ -361,8 +678,6 @@ def _extract_technology_signals_from_template(plantilla: PlantillaUsuario) -> Li
 def _extract_persistence_from_template(
     plantilla: PlantillaUsuario, existing: Any, technology_signals: Any
 ) -> Dict[str, Any]:
-    # Fallback genérico: NO inferir persistencia desde texto libre.
-    # Solo respetamos persistencia si ya venía marcada como required con evidence.
     if isinstance(existing, dict) and existing.get("required") is True:
         ev = _ensure_list_of_str(existing.get("evidence"))
         if ev:
@@ -383,20 +698,12 @@ def _extract_persistence_from_template(
 
 
 def _propose_api_contracts_from_crud_if_evidenced(data: Dict[str, Any]) -> None:
-    """
-    Propuesta determinista y genérica de endpoints CRUD:
-
-    - NO usar texto libre.
-    - Requiere:
-      - operation_groups con type="crud" + evidence
-      - domain_entities con plural/name + evidence
-    """
     if not isinstance(data.get("contratos_api_explicitos"), list):
         data["contratos_api_explicitos"] = []
     if not isinstance(data.get("contratos_api_propuestos"), list):
         data["contratos_api_propuestos"] = []
 
-    if data["contratos_api_explicitos"] or data["contratos_api_propuestos"]:
+    if data["contratos_api_propuestos"]:
         return
 
     ops = data.get("operation_groups")
@@ -454,12 +761,7 @@ def _propose_api_contracts_from_crud_if_evidenced(data: Dict[str, Any]) -> None:
         assumption = f"Endpoints propuestos derivados de operation_groups(type=crud) para entidad '{slug_source}'."
         assumptions.append(assumption)
 
-        # CRUD completo:
-        # - Mantenerlos como propuestos (nunca explícitos)
-        # - Si el path contiene {id}, NO convertir a query params:
-        #   - GET/DELETE {id} => request.type="none" (+ opcional path_params via schema_hint)
-        #   - PUT/PATCH {id} => request.type="json"
-        data["contratos_api_propuestos"] = [
+        proposed = [
             {
                 "method": "POST",
                 "path": f"/{slug}",
@@ -521,18 +823,14 @@ def _propose_api_contracts_from_crud_if_evidenced(data: Dict[str, Any]) -> None:
                 "integration_refs": [],
             },
         ]
+        data["contratos_api_propuestos"] = _merge_contract_dicts(
+            data.get("contratos_api_propuestos") or [],
+            proposed,
+        )
         return
 
 
-# ---------------------------------------------------------------------
-# Helpers de forma (robustos a LLM parcial)
-# ---------------------------------------------------------------------
-
-
 def _ensure_normalized_shape(data: Dict[str, Any], plantilla: PlantillaUsuario) -> Dict[str, Any]:
-    """
-    Garantiza shape mínimo aunque el LLM devuelva JSON parcial o con claves legacy.
-    """
     base: Dict[str, Any] = {
         "objetivo_tecnico": plantilla.problema,
         "actores_principales": [],
@@ -546,6 +844,7 @@ def _ensure_normalized_shape(data: Dict[str, Any], plantilla: PlantillaUsuario) 
         "configuration": [],
         "contratos_api_explicitos": [],
         "contratos_api_propuestos": [],
+        "capability_coverage": [],
         "persistence": {
             "required": False,
             "kind": None,
@@ -565,7 +864,6 @@ def _ensure_normalized_shape(data: Dict[str, Any], plantilla: PlantillaUsuario) 
     out: Dict[str, Any] = dict(base)
     out.update({k: v for k, v in data.items() if k in out})
 
-    # tolerar legacy "contratos_api": se clasifica, pero NUNCA se trata como explícito por defecto
     legacy_contracts = data.get("contratos_api")
     if isinstance(legacy_contracts, list) and legacy_contracts:
         exp, prop, extra_assumptions, extra_evidence = _split_contracts_legacy(legacy_contracts)
@@ -574,7 +872,6 @@ def _ensure_normalized_shape(data: Dict[str, Any], plantilla: PlantillaUsuario) 
         out["assumptions"] = list(out.get("assumptions") or []) + extra_assumptions
         out["evidence"] = list(out.get("evidence") or []) + extra_evidence
 
-    # normalizar listas de strings simples
     for k in (
         "actores_principales",
         "funcionalidades_clave",
@@ -587,12 +884,14 @@ def _ensure_normalized_shape(data: Dict[str, Any], plantilla: PlantillaUsuario) 
     ):
         out[k] = _ensure_list_of_str(out.get(k))
 
-    # asegurar listas de contratos
     out["contratos_api_explicitos"] = (
         out.get("contratos_api_explicitos") if isinstance(out.get("contratos_api_explicitos"), list) else []
     )
     out["contratos_api_propuestos"] = (
         out.get("contratos_api_propuestos") if isinstance(out.get("contratos_api_propuestos"), list) else []
+    )
+    out["capability_coverage"] = (
+        out.get("capability_coverage") if isinstance(out.get("capability_coverage"), list) else []
     )
 
     if not isinstance(out.get("integrations"), list):
@@ -607,6 +906,7 @@ def _ensure_normalized_shape(data: Dict[str, Any], plantilla: PlantillaUsuario) 
     out["domain_entities"] = _normalize_domain_entities(out.get("domain_entities"))
     out["operation_groups"] = _normalize_operation_groups(out.get("operation_groups"))
     out["state_requirements"] = _normalize_state_requirements(out.get("state_requirements"))
+    out["capability_coverage"] = _normalize_capability_coverage(out.get("capability_coverage"))
 
     return out
 
@@ -614,11 +914,6 @@ def _ensure_normalized_shape(data: Dict[str, Any], plantilla: PlantillaUsuario) 
 def _split_contracts_legacy(
     items: List[Any],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str], List[str]]:
-    """
-    Toma legacy contratos_api y los separa por invariantes:
-    - explícito: evidence presente (en request.evidence o response.evidence)
-    - propuesto: sin evidence => debe llevar assumption; si no lo trae, se añade.
-    """
     explicit: List[Dict[str, Any]] = []
     proposed: List[Dict[str, Any]] = []
     assumptions: List[str] = []
@@ -643,7 +938,6 @@ def _split_contracts_legacy(
             if (ev_resp or "").strip():
                 evidence.append(ev_resp.strip())
         else:
-            # propuesto: exigir assumption
             req_norm = (
                 normalized_contract.get("request")
                 if isinstance(normalized_contract.get("request"), dict)
@@ -663,12 +957,6 @@ def _split_contracts_legacy(
 
 
 def _sanitize_contracts_inplace(data: Dict[str, Any]) -> None:
-    """
-    Enforce invariantes:
-    - explícitos: deben tener evidence literal (request.evidence y/o response.evidence)
-    - propuestos: deben tener assumption (request.assumption)
-    - nunca mezclar (si algo está mal clasificado, se mueve a propuestos)
-    """
     explicitos = data.get("contratos_api_explicitos")
     propuestos = data.get("contratos_api_propuestos")
 
@@ -701,7 +989,6 @@ def _sanitize_contracts_inplace(data: Dict[str, Any]) -> None:
             if (ev_resp or "").strip():
                 evidence.append(ev_resp.strip())
         else:
-            # estaba mal clasificado: mover a propuestos y exigir assumption
             req2 = dict(req)
             if not isinstance(req2.get("assumption"), str) or not req2.get("assumption", "").strip():
                 req2["assumption"] = (
@@ -712,7 +999,6 @@ def _sanitize_contracts_inplace(data: Dict[str, Any]) -> None:
             moved_to_propuestos.append(moved_contract)
             assumptions.append(req2["assumption"])
 
-    # propuestos: asegurar assumption
     fixed_propuestos: List[Dict[str, Any]] = []
     for it in list(propuestos) + moved_to_propuestos:
         if not isinstance(it, dict):
@@ -726,12 +1012,11 @@ def _sanitize_contracts_inplace(data: Dict[str, Any]) -> None:
         normalized_contract["request"] = req2
         fixed_propuestos.append(normalized_contract)
 
-    data["contratos_api_explicitos"] = fixed_explicitos
-    data["contratos_api_propuestos"] = fixed_propuestos
+    data["contratos_api_explicitos"] = _merge_contract_dicts([], fixed_explicitos)
+    data["contratos_api_propuestos"] = _merge_contract_dicts([], fixed_propuestos)
     data["assumptions"] = _dedupe_str_list(assumptions)
     data["evidence"] = _dedupe_str_list(evidence)
 
-    # persistence / technology / state sanitization
     data["integrations"] = _normalize_integrations(data.get("integrations"))
     data["configuration"] = _normalize_configuration(data.get("configuration"))
     data["persistence"] = _normalize_persistence(
@@ -742,9 +1027,991 @@ def _sanitize_contracts_inplace(data: Dict[str, Any]) -> None:
     data["domain_entities"] = _normalize_domain_entities(data.get("domain_entities"))
     data["operation_groups"] = _normalize_operation_groups(data.get("operation_groups"))
     data["state_requirements"] = _normalize_state_requirements(data.get("state_requirements"))
+    data["capability_coverage"] = _normalize_capability_coverage(data.get("capability_coverage"))
 
     _reconcile_persistence_and_state_requirements(data)
     data["assumptions"] = _dedupe_str_list(list(data.get("assumptions") or []))
+
+
+def _reconcile_integrations_inplace(data: Dict[str, Any], plantilla: PlantillaUsuario) -> None:
+    integrations = _normalize_integrations(data.get("integrations"))
+    technology_signals = _normalize_technology_signals(data.get("technology_signals"))
+
+    mentions = _collect_external_mentions(data, plantilla)
+    seen_ids = {str(item.get("id") or "").strip().lower(): item for item in integrations}
+
+    for mention in mentions:
+        integration_id = str(mention["id"]).strip().lower()
+        if integration_id in seen_ids:
+            existing = seen_ids[integration_id]
+            if not existing.get("technology_refs") and mention.get("technology_ref"):
+                existing["technology_refs"] = [mention["technology_ref"]]
+            continue
+        minimal = _build_minimal_integration_from_mention(mention)
+        integrations.append(minimal)
+        seen_ids[integration_id] = minimal
+
+    integration_ids = {str(item.get("id") or "").strip().lower() for item in integrations}
+    open_questions = list(data.get("open_questions") or [])
+    assumptions = list(data.get("assumptions") or [])
+
+    for contracts_key in ("contratos_api_explicitos", "contratos_api_propuestos"):
+        contracts = data.get(contracts_key)
+        if not isinstance(contracts, list):
+            continue
+        for contract in contracts:
+            if not isinstance(contract, dict):
+                continue
+            for action in contract.get("actions") or []:
+                if not isinstance(action, dict):
+                    continue
+                if str(action.get("kind") or "").strip().lower() != "external_call":
+                    continue
+                ref = _coalesce_str(action.get("integration_ref"), "")
+                if ref and ref.strip().lower() not in integration_ids:
+                    open_questions.append(
+                        f"external_call referencia integración inexistente: {ref}"
+                    )
+            for ref in _ensure_list_of_str(contract.get("integration_refs")):
+                if ref.strip().lower() not in integration_ids:
+                    open_questions.append(
+                        f"Contrato referencia integración inexistente: {ref}"
+                    )
+
+    external_integrations = _ensure_list_of_str(data.get("integraciones_externas"))
+    for raw_name in external_integrations:
+        stable_id = _stable_snake_case_id(raw_name)
+        if stable_id.lower() not in integration_ids:
+            mention = {
+                "id": stable_id,
+                "name": raw_name,
+                "kind": "other",
+                "source": "explicit",
+                "evidence": raw_name,
+                "technology_ref": "",
+            }
+            minimal = _build_minimal_integration_from_mention(mention)
+            integrations.append(minimal)
+            integration_ids.add(stable_id.lower())
+            assumptions.append(
+                "Se añadió integración mínima para preservar trazabilidad desde integraciones_externas."
+            )
+
+    data["integrations"] = _normalize_integrations(integrations)
+
+    technology_trace = (
+        data.get("_debug", {}).get("technology_ref_reconciliation")
+        if isinstance(data.get("_debug"), dict)
+        else None
+    )
+    for error in _build_technology_ref_open_questions(technology_trace):
+        _append_open_question(data, error)
+
+    data["open_questions"] = _dedupe_str_list(open_questions + list(data.get("open_questions") or []))
+    data["assumptions"] = _dedupe_str_list(assumptions)
+
+
+def stable_identifier(
+    value: str,
+) -> str:
+    normalized = unicodedata.normalize(
+        "NFKD",
+        str(value or ""),
+    )
+    normalized = "".join(
+        char
+        for char in normalized
+        if not unicodedata.combining(char)
+    )
+    normalized = normalized.casefold()
+    normalized = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        normalized,
+    )
+    return normalized.strip("_")
+
+
+def canonical_technology_id(
+    signal: dict,
+) -> str:
+    name = str(signal.get("name") or "").strip()
+    if name:
+        return stable_identifier(name)
+
+    raw_id = str(signal.get("id") or "").strip()
+    return stable_identifier(raw_id)
+
+
+def normalize_alias(
+    value: str,
+) -> str:
+    return str(value or "").strip().casefold()
+
+
+def canonicalize_technology_signals(
+    signals: List[dict],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    result: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    collisions: List[Dict[str, Any]] = []
+
+    for raw in signals:
+        if not isinstance(raw, dict):
+            continue
+
+        item = dict(raw)
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+
+        canonical_id = canonical_technology_id(item)
+        if not canonical_id:
+            continue
+
+        if canonical_id in seen_ids:
+            collisions.append(
+                {
+                    "code": "TECHNOLOGY_ID_COLLISION",
+                    "technology_id": canonical_id,
+                    "name": name,
+                }
+            )
+            continue
+
+        seen_ids.add(canonical_id)
+        item["id"] = canonical_id
+        item["packages"] = [
+            str(value).strip()
+            for value in (item.get("packages") or [])
+            if str(value).strip()
+        ]
+        item["import_roots"] = [
+            str(value).strip()
+            for value in (item.get("import_roots") or [])
+            if str(value).strip()
+        ]
+        result.append(item)
+
+    return result, collisions
+
+
+def build_technology_alias_index(
+    signals: List[dict],
+) -> Tuple[Dict[str, str], set[str]]:
+    index: Dict[str, str] = {}
+    ambiguous: set[str] = set()
+
+    for signal in signals:
+        signal_id = str(signal.get("id") or "").strip()
+        if not signal_id:
+            continue
+
+        aliases: List[str] = [
+            signal_id,
+            str(signal.get("name") or "").strip(),
+        ]
+        aliases.extend(
+            str(value).strip()
+            for value in (signal.get("packages") or [])
+            if str(value).strip()
+        )
+        aliases.extend(
+            str(value).strip()
+            for value in (signal.get("import_roots") or [])
+            if str(value).strip()
+        )
+
+        for raw_alias in aliases:
+            alias = normalize_alias(raw_alias)
+            if not alias:
+                continue
+            if alias in ambiguous:
+                continue
+
+            existing = index.get(alias)
+            if existing is not None and existing != signal_id:
+                index.pop(alias, None)
+                ambiguous.add(alias)
+                continue
+
+            index[alias] = signal_id
+
+    return index, ambiguous
+
+
+def resolve_technology_ref(
+    raw_ref: str,
+    *,
+    alias_index: Dict[str, str],
+    ambiguous_aliases: set[str],
+) -> Tuple[str | None, str]:
+    alias = normalize_alias(raw_ref)
+    if not alias:
+        return None, "empty"
+    if alias in ambiguous_aliases:
+        return None, "ambiguous"
+
+    canonical_id = alias_index.get(alias)
+    if canonical_id is None:
+        return None, "unresolved"
+    return canonical_id, "resolved"
+
+
+def canonicalize_integration_technology_refs(
+    integrations: List[dict],
+    technology_signals: List[dict],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    alias_index, ambiguous = build_technology_alias_index(technology_signals)
+
+    result: List[Dict[str, Any]] = []
+    trace: List[Dict[str, Any]] = []
+
+    for raw_integration in integrations:
+        if not isinstance(raw_integration, dict):
+            continue
+
+        integration = dict(raw_integration)
+        canonical_refs: List[str] = []
+
+        for raw_ref in integration.get("technology_refs") or []:
+            canonical_id, status = resolve_technology_ref(
+                str(raw_ref),
+                alias_index=alias_index,
+                ambiguous_aliases=ambiguous,
+            )
+            trace.append(
+                {
+                    "integration_id": integration.get("id"),
+                    "input_ref": raw_ref,
+                    "canonical_id": canonical_id,
+                    "status": status,
+                }
+            )
+            if canonical_id is None:
+                continue
+            if canonical_id not in canonical_refs:
+                canonical_refs.append(canonical_id)
+
+        integration["technology_refs"] = canonical_refs
+        result.append(integration)
+
+    return result, trace
+
+
+def _build_technology_signal_index(
+    technology_signals: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    canonical_signals, _ = canonicalize_technology_signals(
+        _normalize_technology_signals(technology_signals)
+    )
+    index: Dict[str, Dict[str, Any]] = {}
+    for signal in canonical_signals:
+        signal_id = str(signal.get("id") or "").strip()
+        if signal_id:
+            index[signal_id] = signal
+    return index
+
+
+def _technology_identity(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    base = re.sub(r"\s*\([^)]*\)\s*$", "", raw).strip()
+    return stable_identifier(base or raw)
+
+
+def _build_technology_ref_open_questions(
+    trace: Any,
+) -> List[str]:
+    if not isinstance(trace, list):
+        return []
+
+    messages: List[str] = []
+    for item in trace:
+        if not isinstance(item, dict):
+            continue
+
+        status = str(item.get("status") or "").strip().lower()
+        if status not in {"unresolved", "ambiguous"}:
+            continue
+
+        integration_id = str(item.get("integration_id") or "").strip() or "<unknown_integration>"
+        input_ref = str(item.get("input_ref") or "").strip() or "<empty_ref>"
+
+        if status == "ambiguous":
+            messages.append(
+                "Integración "
+                f"{integration_id} referencia alias tecnológico ambiguo: {input_ref}"
+            )
+            continue
+
+        messages.append(
+            "Integración "
+            f"{integration_id} referencia tecnología no resuelta: {input_ref}"
+        )
+
+    return _dedupe_str_list(messages)
+
+
+def _validate_integration_technology_refs(
+    technology_signals: List[Dict[str, Any]],
+    integrations: List[Dict[str, Any]],
+) -> List[str]:
+    canonical_signals, _ = canonicalize_technology_signals(
+        _normalize_technology_signals(technology_signals)
+    )
+    alias_index, ambiguous_aliases = build_technology_alias_index(canonical_signals)
+
+    errors: List[str] = []
+
+    for integration in integrations:
+        if not isinstance(integration, dict):
+            continue
+
+        integration_id = str(integration.get("id") or "").strip() or "<unknown_integration>"
+        for raw_ref in integration.get("technology_refs") or []:
+            canonical_id, status = resolve_technology_ref(
+                str(raw_ref),
+                alias_index=alias_index,
+                ambiguous_aliases=ambiguous_aliases,
+            )
+            if status == "resolved" and canonical_id is not None:
+                continue
+            if status == "ambiguous":
+                errors.append(
+                    f"Integración {integration_id} referencia alias tecnológico ambiguo: {raw_ref}"
+                )
+                continue
+            if status == "empty":
+                errors.append(
+                    f"Integración {integration_id} referencia tecnología vacía."
+                )
+                continue
+            errors.append(
+                f"Integración {integration_id} referencia tecnología inexistente: {raw_ref}"
+            )
+
+    return _dedupe_str_list(errors)
+
+
+def _collect_external_mentions(data: Dict[str, Any], plantilla: PlantillaUsuario) -> List[Dict[str, Any]]:
+    mentions: List[Dict[str, Any]] = []
+
+    canonical_signals, _ = canonicalize_technology_signals(
+        _normalize_technology_signals(data.get("technology_signals"))
+    )
+
+    structured_integrations = _normalize_integrations(data.get("integrations"))
+    if structured_integrations:
+        return []
+
+    for raw_name in _ensure_list_of_str(data.get("integraciones_externas")):
+        mentions.append(
+            {
+                "id": _stable_snake_case_id(raw_name),
+                "name": raw_name,
+                "kind": "other",
+                "source": "explicit",
+                "evidence": raw_name,
+                "technology_ref": "",
+            }
+        )
+
+    inferable_categories = {"external_api"}
+    alias_index, ambiguous_aliases = build_technology_alias_index(canonical_signals)
+
+    for signal in canonical_signals:
+        category = str(signal.get("category") or "").strip().lower()
+        signal_id = str(signal.get("id") or "").strip()
+        if category not in inferable_categories or not signal_id:
+            continue
+
+        resolved_id, status = resolve_technology_ref(
+            signal_id,
+            alias_index=alias_index,
+            ambiguous_aliases=ambiguous_aliases,
+        )
+        if status != "resolved" or resolved_id is None:
+            continue
+
+        mentions.append(
+            {
+                "id": signal_id,
+                "name": str(signal.get("name") or "").strip() or signal_id,
+                "kind": category,
+                "source": "explicit"
+                if str(signal.get("confidence") or "").strip() == "explicit"
+                else "inferred",
+                "evidence": str(signal.get("evidence") or "").strip(),
+                "technology_ref": resolved_id,
+            }
+        )
+
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for mention in mentions:
+        key = str(mention.get("id") or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(mention)
+    return deduped
+
+
+def _build_minimal_integration_from_mention(mention: Dict[str, Any]) -> Dict[str, Any]:
+    source = mention.get("source") if isinstance(mention.get("source"), str) else "inferred"
+    evidence = mention.get("evidence") if isinstance(mention.get("evidence"), str) else ""
+    technology_ref = mention.get("technology_ref") if isinstance(mention.get("technology_ref"), str) else ""
+    return {
+        "id": _stable_snake_case_id(str(mention.get("id") or mention.get("name") or "")),
+        "name": str(mention.get("name") or "").strip(),
+        "kind": str(mention.get("kind") or "other").strip() or "other",
+        "role": "Integración necesaria para una capacidad solicitada.",
+        "required": True,
+        "implementation_level": "integration_skeleton",
+        "authentication": {
+            "mechanism": "",
+            "credential_source": "unknown",
+            "allows_embedded_secret": False,
+            "allows_static_credential_file": True,
+            "source": "unknown",
+            "evidence": "",
+            "assumption": "",
+        },
+        "technology_refs": [technology_ref] if technology_ref else [],
+        "configuration_refs": [],
+        "source": source if source in {"explicit", "inferred"} else "inferred",
+        "evidence": evidence,
+        "assumption": (
+            ""
+            if source == "explicit" and evidence
+            else "Integración inferida a partir de una capacidad o tecnología externa declarada por el usuario."
+        ),
+    }
+
+
+def _normalize_capability_coverage(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+
+    allowed_status = {"covered", "partially_covered", "uncovered", "not_api_applicable"}
+    allowed_source = {"explicit", "inferred", "unknown", "derived"}
+
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        capability = _coalesce_str(item.get("capability"), "")
+        if not capability:
+            continue
+        capability_id = _coalesce_str(item.get("capability_id"), "")
+        status = str(item.get("status") or "uncovered").strip()
+        if status not in allowed_status:
+            status = "uncovered"
+        source = str(item.get("source") or "unknown").strip()
+        if source not in allowed_source:
+            source = "unknown"
+        dedupe_key = capability_id.lower() or f"text::{_normalize_text(capability)}::{index}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        out.append(
+            {
+                "capability_id": capability_id,
+                "capability": capability,
+                "contract_refs": _dedupe_str_list(_ensure_list_of_str(item.get("contract_refs"))),
+                "action_refs": _dedupe_str_list(_ensure_list_of_str(item.get("action_refs"))),
+                "integration_refs": _dedupe_str_list(_ensure_list_of_str(item.get("integration_refs"))),
+                "status": status,
+                "source": source,
+                "evidence": _coalesce_str(item.get("evidence"), ""),
+                "assumption": _coalesce_str(item.get("assumption"), ""),
+            }
+        )
+    return out
+
+
+def _stable_capability_id(capability: str, index: int) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", (capability or "").strip().lower())
+    normalized = normalized.strip("_")
+    if not normalized:
+        normalized = f"capability_{index + 1}"
+    return normalized[:80]
+
+
+def _assign_capability_ids(capabilities: List[str]) -> List[Dict[str, str]]:
+    assigned: List[Dict[str, str]] = []
+    counts: Dict[str, int] = {}
+
+    for index, capability in enumerate(capabilities):
+        base_id = _stable_capability_id(capability, index)
+        counts[base_id] = counts.get(base_id, 0) + 1
+        count = counts[base_id]
+        capability_id = base_id if count == 1 else f"{base_id}_{count}"
+        assigned.append({"id": capability_id, "description": capability})
+
+    return assigned
+
+
+def _normalize_text(value: str) -> str:
+    return " ".join((value or "").strip().lower().split())
+
+
+def _extract_contract_refs_from_capability(
+    capability: str,
+) -> List[str]:
+    refs: List[str] = []
+
+    for match in _HTTP_CONTRACT_RE.finditer(capability or ""):
+        method = match.group(1).upper()
+        path = match.group(2).rstrip(".,;:)")
+        ref = f"{method} {path}"
+        if ref not in refs:
+            refs.append(ref)
+
+    return refs
+
+
+def _find_exact_text_coverage(
+    capability: str,
+    candidates: List[Dict[str, Any]],
+) -> Dict[str, Any] | None:
+    expected = _normalize_text(capability)
+    matches = [
+        candidate
+        for candidate in candidates
+        if _normalize_text(str(candidate.get("capability") or "")) == expected
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _find_coverage_by_contract_refs(
+    capability: str,
+    candidates: List[Dict[str, Any]],
+) -> Dict[str, Any] | None:
+    expected_refs = set(_extract_contract_refs_from_capability(capability))
+
+    if not expected_refs:
+        return None
+
+    matches: List[Dict[str, Any]] = []
+
+    for candidate in candidates:
+        candidate_refs = {
+            str(ref).strip()
+            for ref in candidate.get("contract_refs", [])
+            if str(ref).strip()
+        }
+        if expected_refs & candidate_refs:
+            matches.append(candidate)
+
+    if len(matches) == 1:
+        return matches[0]
+
+    return None
+
+
+def _coverage_valid_reference_count(
+    coverage: Dict[str, Any],
+    contract_index: Dict[str, Any],
+    action_index: Dict[str, Any],
+) -> int:
+    count = 0
+    for ref in coverage.get("contract_refs", []):
+        if ref in contract_index:
+            count += 1
+    for ref in coverage.get("action_refs", []):
+        if ref in action_index:
+            count += 1
+    return count
+
+
+def _find_unique_structural_coverage(
+    capability: str,
+    candidates: List[Dict[str, Any]],
+    contract_index: Dict[str, Any],
+    action_index: Dict[str, Any],
+) -> Dict[str, Any] | None:
+    if _extract_contract_refs_from_capability(capability):
+        return None
+
+    valid_candidates = [
+        candidate
+        for candidate in candidates
+        if _coverage_valid_reference_count(candidate, contract_index, action_index) > 0
+    ]
+
+    if len(valid_candidates) == 1:
+        return valid_candidates[0]
+
+    return None
+
+
+def _build_direct_contract_coverage(
+    *,
+    capability_id: str,
+    capability: str,
+    contract_refs: List[str],
+    contract_index: Dict[str, Any],
+) -> Dict[str, Any] | None:
+    if not contract_refs:
+        return None
+
+    valid_refs = [
+        ref
+        for ref in _dedupe_str_list(contract_refs)
+        if ref in contract_index
+    ]
+
+    if len(valid_refs) != len(_dedupe_str_list(contract_refs)):
+        return None
+
+    return {
+        "capability_id": capability_id,
+        "capability": capability,
+        "contract_refs": valid_refs,
+        "action_refs": [],
+        "integration_refs": [],
+        "status": "covered",
+        "source": "derived",
+        "evidence": ", ".join(valid_refs),
+        "assumption": "",
+    }
+
+
+def _reconcile_single_coverage(
+    coverage: Dict[str, Any],
+    *,
+    contract_index: Dict[str, Dict[str, Any]],
+    action_index: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]],
+) -> Dict[str, Any]:
+    contract_refs = _dedupe_str_list(_ensure_list_of_str(coverage.get("contract_refs")))
+    action_refs = _dedupe_str_list(_ensure_list_of_str(coverage.get("action_refs")))
+    integration_refs = _dedupe_str_list(_ensure_list_of_str(coverage.get("integration_refs")))
+
+    for action_ref in action_refs:
+        indexed = action_index.get(action_ref)
+        if indexed is None:
+            continue
+        action = indexed[1]
+        if (
+            str(action.get("kind") or "").strip().lower() == "external_call"
+            and isinstance(action.get("integration_ref"), str)
+            and action.get("integration_ref", "").strip()
+            and action["integration_ref"] not in integration_refs
+        ):
+            integration_refs.append(action["integration_ref"])
+
+    for contract_ref in contract_refs:
+        contract = contract_index.get(contract_ref)
+        if not contract:
+            continue
+
+        matching_actions: List[Dict[str, Any]] = []
+        for action in contract.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            if str(action.get("kind") or "").strip().lower() != "external_call":
+                continue
+            action_integration = _coalesce_str(action.get("integration_ref"), "")
+            if integration_refs and action_integration not in integration_refs:
+                continue
+            matching_actions.append(action)
+
+        if len(matching_actions) == 1:
+            action = matching_actions[0]
+            action_ref = f"{contract_ref}#{str(action.get('id') or '').strip()}"
+            if action_ref not in action_refs:
+                action_refs.append(action_ref)
+
+    return {
+        "capability_id": _coalesce_str(coverage.get("capability_id"), ""),
+        "capability": _coalesce_str(coverage.get("capability"), ""),
+        "contract_refs": contract_refs,
+        "action_refs": action_refs,
+        "integration_refs": integration_refs,
+        "status": str(coverage.get("status") or "uncovered").strip() or "uncovered",
+        "source": str(coverage.get("source") or "unknown").strip() or "unknown",
+        "evidence": _coalesce_str(coverage.get("evidence"), ""),
+        "assumption": _coalesce_str(coverage.get("assumption"), ""),
+    }
+
+
+def _dedupe_capability_coverage(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for index, item in enumerate(items):
+        capability_id = _coalesce_str(item.get("capability_id"), "")
+        capability = _coalesce_str(item.get("capability"), "")
+        key = capability_id.lower() or f"text::{_normalize_text(capability)}::{index}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _append_open_question(data: Dict[str, Any], message: str) -> None:
+    open_questions = list(data.get("open_questions") or [])
+    open_questions.append(message)
+    data["open_questions"] = _dedupe_str_list(open_questions)
+
+
+def _reconcile_capability_coverage_inplace(data: Dict[str, Any]) -> None:
+    capabilities = _ensure_list_of_str(data.get("funcionalidades_clave"))
+    existing = _normalize_capability_coverage(data.get("capability_coverage"))
+    original_coverage_was_present = bool(existing)
+
+    if capabilities and not existing:
+        _append_open_question(
+            data,
+            "Existen capacidades funcionales, pero el normalizador no produjo capability_coverage.",
+        )
+        data["capability_coverage"] = []
+        return
+
+    capability_entries = _assign_capability_ids(capabilities)
+    unmatched = list(existing)
+    reconciled: List[Dict[str, Any]] = []
+    unresolved_capabilities: List[str] = []
+    links: List[Dict[str, Any]] = []
+
+    contract_index = _build_contract_index(data)
+    action_index = _build_action_index(data)
+
+    for capability_entry in capability_entries:
+        capability_id = capability_entry["id"]
+        capability_text = capability_entry["description"]
+        current = _find_exact_text_coverage(
+            capability_text,
+            unmatched,
+        )
+        match_type = None
+
+        if current is not None:
+            match_type = "exact_text"
+
+        if current is None:
+            current = _find_coverage_by_contract_refs(
+                capability_text,
+                unmatched,
+            )
+            if current is not None:
+                match_type = "contract_ref"
+
+        explicit_contract_refs = _extract_contract_refs_from_capability(
+            capability_text
+        )
+
+        if current is None and explicit_contract_refs:
+            direct_coverage = _build_direct_contract_coverage(
+                capability_id=capability_id,
+                capability=capability_text,
+                contract_refs=explicit_contract_refs,
+                contract_index=contract_index,
+            )
+            if direct_coverage is not None:
+                reconciled.append(direct_coverage)
+                links.append(
+                    {
+                        "capability": capability_text,
+                        "capability_id": capability_id,
+                        "coverage_capability": "",
+                        "match_type": "direct_contract",
+                        "contract_refs": explicit_contract_refs,
+                    }
+                )
+                continue
+
+        if current is None and not explicit_contract_refs:
+            current = _find_unique_structural_coverage(
+                capability=capability_text,
+                candidates=unmatched,
+                contract_index=contract_index,
+                action_index=action_index,
+            )
+            if current is not None:
+                match_type = "unique_structural"
+
+        if current is None:
+            unresolved_capabilities.append(capability_text)
+            links.append(
+                {
+                    "capability": capability_text,
+                    "capability_id": capability_id,
+                    "coverage_capability": "",
+                    "match_type": "unresolved",
+                    "contract_refs": explicit_contract_refs,
+                }
+            )
+            continue
+
+        if current in unmatched:
+            unmatched.remove(current)
+
+        normalized = _reconcile_single_coverage(
+            current,
+            contract_index=contract_index,
+            action_index=action_index,
+        )
+        normalized["capability_id"] = capability_id
+        normalized["capability"] = capability_text
+        reconciled.append(normalized)
+        links.append(
+            {
+                "capability": capability_text,
+                "capability_id": capability_id,
+                "coverage_capability": _coalesce_str(current.get("capability"), ""),
+                "match_type": match_type,
+            }
+        )
+
+    for coverage in unmatched:
+        normalized = _reconcile_single_coverage(
+            coverage,
+            contract_index=contract_index,
+            action_index=action_index,
+        )
+        reconciled.append(normalized)
+        _append_open_question(
+            data,
+            "Capability coverage producida pero no vinculada a funcionalidades_clave: "
+            f"{coverage.get('capability', '')}",
+        )
+
+    if unresolved_capabilities:
+        _append_open_question(
+            data,
+            "No se pudo vincular inequívocamente capability_coverage con funcionalidades_clave.",
+        )
+
+    for capability in unresolved_capabilities:
+        _append_open_question(
+            data,
+            f"Capacidad obligatoria sin cobertura vinculada: {capability}",
+        )
+
+    data["capability_coverage"] = _dedupe_capability_coverage(reconciled)
+
+    if original_coverage_was_present and not data["capability_coverage"]:
+        _append_open_question(
+            data,
+            "La reconciliación eliminó todas las coberturas producidas por el normalizador.",
+        )
+
+    _persist_debug_artifact_json(
+        "capability_coverage_before_reconciliation",
+        {"before": existing},
+    )
+    data["_debug"] = {
+        "links": links,
+        "unresolved_capabilities": list(unresolved_capabilities),
+        "unmatched_coverages": [
+            {
+                "capability_id": _coalesce_str(item.get("capability_id"), ""),
+                "capability": _coalesce_str(item.get("capability"), ""),
+            }
+            for item in unmatched
+        ],
+    }
+
+    _persist_debug_artifact_json(
+        "capability_coverage_after_reconciliation",
+        {
+            "before": existing,
+            "after": data["capability_coverage"],
+            "links": links,
+            "unresolved_capabilities": unresolved_capabilities,
+            "unmatched_coverages": [
+                {
+                    "capability_id": _coalesce_str(item.get("capability_id"), ""),
+                    "capability": _coalesce_str(item.get("capability"), ""),
+                }
+                for item in unmatched
+            ],
+        },
+    )
+
+
+def _build_contract_index(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    index: Dict[str, Dict[str, Any]] = {}
+    for key in ("contratos_api_explicitos", "contratos_api_propuestos"):
+        for contract in data.get(key) or []:
+            if not isinstance(contract, dict):
+                continue
+            method = str(contract.get("method") or "").upper().strip()
+            path = _normalize_path_key(str(contract.get("path") or ""))
+            if not method or not path:
+                continue
+            index[f"{method} {path}"] = contract
+    return index
+
+
+def _build_action_index(data: Dict[str, Any]) -> Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]]:
+    index: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    for contract_ref, contract in _build_contract_index(data).items():
+        for action in contract.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            action_id = str(action.get("id") or "").strip()
+            if not action_id:
+                continue
+            index[f"{contract_ref}#{action_id}"] = (contract, action)
+    return index
+
+
+def _action_ref_exists(contract_index: Dict[str, Dict[str, Any]], action_ref: str) -> bool:
+    if "#" not in action_ref:
+        return False
+    contract_ref, action_id = action_ref.split("#", 1)
+    contract = contract_index.get(contract_ref.strip())
+    if not contract:
+        return False
+    for action in contract.get("actions") or []:
+        if isinstance(action, dict) and str(action.get("id") or "").strip() == action_id.strip():
+            return True
+    return False
+
+
+def _build_capability_coverage_report(data: Dict[str, Any]) -> Dict[str, Any]:
+    coverage = _normalize_capability_coverage(data.get("capability_coverage"))
+    capabilities = _ensure_list_of_str(data.get("funcionalidades_clave"))
+    missing_coverage = bool(capabilities and not coverage)
+    return {
+        "capabilities": capabilities,
+        "missing_capability_coverage": missing_coverage,
+        "missing_capability_coverage_error": (
+            "Existen capacidades funcionales, pero el normalizador no produjo capability_coverage."
+            if missing_coverage
+            else ""
+        ),
+        "covered": [item["capability"] for item in coverage if item.get("status") == "covered"],
+        "partially_covered": [
+            item["capability"] for item in coverage if item.get("status") == "partially_covered"
+        ],
+        "uncovered": [item["capability"] for item in coverage if item.get("status") == "uncovered"],
+        "contracts": {
+            "explicit": [
+                f"{str(c.get('method') or '').upper().strip()} {_normalize_path_key(str(c.get('path') or ''))}"
+                for c in data.get("contratos_api_explicitos") or []
+                if isinstance(c, dict)
+            ],
+            "proposed": [
+                f"{str(c.get('method') or '').upper().strip()} {_normalize_path_key(str(c.get('path') or ''))}"
+                for c in data.get("contratos_api_propuestos") or []
+                if isinstance(c, dict)
+            ],
+        },
+        "integrations": [
+            str(item.get("id") or "").strip()
+            for item in data.get("integrations") or []
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ],
+    }
 
 
 def _ensure_list_of_str(v: Any) -> List[str]:
@@ -774,9 +2041,6 @@ def _dedupe_str_list(items: Any) -> List[str]:
 
 
 def _template_evidence_lines(plantilla: PlantillaUsuario) -> List[str]:
-    """
-    Evidence global trazable a campos del usuario. No infiere, solo serializa.
-    """
     out: List[str] = []
     if plantilla.problema:
         out.append(f"Problema: {plantilla.problema}")
@@ -851,11 +2115,16 @@ def _normalize_integrations(raw: Any) -> List[Dict[str, Any]]:
         required = bool(item.get("required")) if "required" in item else False
 
         auth_raw = item.get("authentication") if isinstance(item.get("authentication"), dict) else {}
-        auth_mechanism = auth_raw.get("mechanism")
-        if not (isinstance(auth_mechanism, str) and auth_mechanism.strip()):
-            auth_mechanism = None
+        auth_mechanism = (
+            auth_raw.get("mechanism").strip()
+            if isinstance(auth_raw.get("mechanism"), str) and auth_raw.get("mechanism").strip()
+            else ""
+        )
         auth_source = _normalize_source(auth_raw.get("source"))
         auth_evidence = auth_raw.get("evidence") if isinstance(auth_raw.get("evidence"), str) else ""
+        auth_assumption = (
+            auth_raw.get("assumption") if isinstance(auth_raw.get("assumption"), str) else ""
+        )
 
         source, evidence, assumption = _sanitize_source_evidence_assumption(
             source=source,
@@ -863,10 +2132,10 @@ def _normalize_integrations(raw: Any) -> List[Dict[str, Any]]:
             assumption=assumption,
             missing_evidence_assumption="Se degradó source=explicit a inferred por falta de evidencia literal suficiente.",
         )
-        auth_source, auth_evidence, _ = _sanitize_source_evidence_assumption(
+        auth_source, auth_evidence, auth_assumption = _sanitize_source_evidence_assumption(
             source=auth_source,
             evidence=auth_evidence,
-            assumption="",
+            assumption=auth_assumption,
             missing_evidence_assumption="Se degradó authentication.source=explicit a inferred por falta de evidencia literal suficiente.",
         )
 
@@ -879,8 +2148,16 @@ def _normalize_integrations(raw: Any) -> List[Dict[str, Any]]:
             "implementation_level": _normalize_implementation_level(item.get("implementation_level")),
             "authentication": {
                 "mechanism": auth_mechanism,
+                "credential_source": _normalize_credential_source(auth_raw.get("credential_source")),
+                "allows_embedded_secret": bool(auth_raw.get("allows_embedded_secret"))
+                if "allows_embedded_secret" in auth_raw
+                else False,
+                "allows_static_credential_file": bool(auth_raw.get("allows_static_credential_file"))
+                if "allows_static_credential_file" in auth_raw
+                else True,
                 "source": auth_source,
                 "evidence": auth_evidence.strip(),
+                "assumption": auth_assumption.strip(),
             },
             "technology_refs": _dedupe_str_list(_ensure_list_of_str(item.get("technology_refs"))),
             "configuration_refs": _dedupe_str_list(_ensure_list_of_str(item.get("configuration_refs"))),
@@ -934,6 +2211,7 @@ def _normalize_configuration(raw: Any) -> List[Dict[str, Any]]:
             "source": source,
             "evidence": evidence.strip(),
             "assumption": assumption.strip(),
+            "delivery": _normalize_configuration_delivery(item.get("delivery")),
         }
 
         dedupe_key = normalized["key"].lower()
@@ -1077,6 +2355,8 @@ def _normalize_contract_shape(contract: Dict[str, Any]) -> Dict[str, Any]:
     request = out.get("request") if isinstance(out.get("request"), dict) else {}
     response = out.get("response") if isinstance(out.get("response"), dict) else {}
 
+    out["method"] = str(out.get("method") or "").upper().strip()
+    out["path"] = _normalize_path_key(str(out.get("path") or ""))
     out["request"] = dict(request)
     out["response"] = dict(response)
     out["actions"] = _normalize_contract_actions(out.get("actions"))
@@ -1127,7 +2407,6 @@ def _normalize_persistence(p: Any, assumptions_sink: List[str] | None = None) ->
     ):
         kind_norm = kind.strip()
     else:
-        # si llega vendor/valor no permitido, degradar a unknown si required, sino None
         kind_norm = "unknown" if required else None
         if required and sink is not None:
             sink.append("persistence.kind no era válido/no permitido; se degradó a 'unknown'.")
@@ -1137,7 +2416,6 @@ def _normalize_persistence(p: Any, assumptions_sink: List[str] | None = None) ->
     uncertainty = p.get("uncertainty") if isinstance(p.get("uncertainty"), str) else ""
     uncertainty = uncertainty.strip()
 
-    # durable_state=True sin evidence NO debe activar persistencia
     if durable_state and not evidence:
         if sink is not None:
             sink.append("durable_state_without_evidence")
@@ -1165,7 +2443,6 @@ def _normalize_persistence(p: Any, assumptions_sink: List[str] | None = None) ->
             "uncertainty": uncertainty,
         }
 
-    # required=True
     if not evidence and sink is not None:
         sink.append(
             "Persistencia marcada como requerida pero falta evidence; revisar/confirmar necesidad de estado durable."
@@ -1181,6 +2458,18 @@ def _normalize_persistence(p: Any, assumptions_sink: List[str] | None = None) ->
         "evidence": evidence,
         "uncertainty": uncertainty,
     }
+
+
+def _normalize_credential_source(value: Any) -> str:
+    allowed = {"runtime", "file", "environment", "request", "unknown"}
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in allowed else "unknown"
+
+
+def _normalize_configuration_delivery(value: Any) -> str:
+    allowed = {"env", "file", "argument", "runtime", "unknown"}
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in allowed else "env"
 
 
 def _normalize_technology_signals(raw: Any) -> List[Dict[str, Any]]:
@@ -1211,10 +2500,6 @@ def _normalize_technology_signals(raw: Any) -> List[Dict[str, Any]]:
         evidence = it.get("evidence") if isinstance(it.get("evidence"), str) else ""
         if not name.strip():
             continue
-        if not evidence.strip():
-            # sin evidencia, degradar: no es señal confiable
-            continue
-
         category = it.get("category") if isinstance(it.get("category"), str) else "unknown"
         category = category.strip() if category.strip() in allowed_categories else "unknown"
 
@@ -1224,17 +2509,24 @@ def _normalize_technology_signals(raw: Any) -> List[Dict[str, Any]]:
         confidence = it.get("confidence") if isinstance(it.get("confidence"), str) else "unknown"
         confidence = confidence.strip() if confidence.strip() in allowed_confidence else "unknown"
 
+        packages = _dedupe_str_list(_ensure_list_of_str(it.get("packages")))
+        legacy_package = str(it.get("package") or "").strip()
+        if legacy_package and legacy_package not in packages:
+            packages.append(legacy_package)
+
         out.append(
             {
+                "id": str(it.get("id") or "").strip(),
                 "name": name.strip(),
                 "category": category,
+                "packages": packages,
+                "import_roots": _dedupe_str_list(_ensure_list_of_str(it.get("import_roots"))),
                 "role": role,
                 "evidence": evidence.strip(),
                 "confidence": confidence,
             }
         )
 
-    # dedupe estable por (name, category, role)
     seen = set()
     deduped: List[Dict[str, Any]] = []
     for it in out:
@@ -1282,7 +2574,6 @@ def _normalize_domain_entities(raw: Any) -> List[Dict[str, Any]]:
             }
         )
 
-    # dedupe estable por slug/name
     seen = set()
     deduped: List[Dict[str, Any]] = []
     for it in out:
@@ -1353,13 +2644,6 @@ def _normalize_state_requirements(raw: Any) -> Dict[str, Any]:
 
 
 def _reconcile_persistence_and_state_requirements(data: Dict[str, Any]) -> None:
-    """
-    Reconciliación conservadora basada en evidence.
-
-    Preferencias:
-    - Si hay contradicción sin evidence suficiente, degradar a required=False (stateless por defecto).
-    - Nunca activar persistencia sólo por flags (ej. durable_state) sin evidence.
-    """
     if not isinstance(data, dict):
         return
 
@@ -1377,7 +2661,6 @@ def _reconcile_persistence_and_state_requirements(data: Dict[str, Any]) -> None:
     s_durable = bool(s.get("durable")) if "durable" in s else False
     s_evidence = _ensure_list_of_str(s.get("evidence"))
 
-    # 1) persistence.required=True pero state.durable=False
     if p_required and not s_durable:
         if p_evidence:
             s["durable"] = True
@@ -1398,11 +2681,9 @@ def _reconcile_persistence_and_state_requirements(data: Dict[str, Any]) -> None:
                 "uncertainty": p.get("uncertainty") or "contradiction_without_evidence",
             }
 
-    # refrescar p/s tras posible degradación
     p = data.get("persistence") if isinstance(data.get("persistence"), dict) else p
     p_required = bool(p.get("required")) if "required" in p else False
 
-    # 2) state.durable=True pero persistence.required=False
     if s_durable and not p_required:
         if s_evidence:
             data["persistence"] = {
@@ -1421,7 +2702,6 @@ def _reconcile_persistence_and_state_requirements(data: Dict[str, Any]) -> None:
             s["entities"] = []
             s["evidence"] = []
 
-    # 3) ambos true => dedupe
     p = data.get("persistence") if isinstance(data.get("persistence"), dict) else p
     s = data.get("state_requirements") if isinstance(data.get("state_requirements"), dict) else s
     if bool(p.get("required")) and bool(s.get("durable")):
@@ -1432,6 +2712,32 @@ def _reconcile_persistence_and_state_requirements(data: Dict[str, Any]) -> None:
 
     data["persistence"] = p
     data["state_requirements"] = s
+
+
+def _persist_debug_artifact_text(prefix: str, content: str) -> None:
+    try:
+        debug_dir = Path("output/_debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        (debug_dir / f"{prefix}_{ts}.txt").write_text(
+            content if isinstance(content, str) else str(content),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _persist_debug_artifact_json(prefix: str, payload: Any) -> None:
+    try:
+        debug_dir = Path("output/_debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        (debug_dir / f"{prefix}_{ts}.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 def _persist_debug_context(plantilla: PlantillaUsuario, data: Dict[str, Any]) -> None:
@@ -1460,3 +2766,24 @@ def _persist_debug_context(plantilla: PlantillaUsuario, data: Dict[str, Any]) ->
         )
     except Exception:
         pass
+
+
+def _stable_snake_case_id(value: str) -> str:
+    base = re.sub(r"[^A-Za-z0-9]+", "_", (value or "").strip().lower()).strip("_")
+    return base or "external_system"
+
+
+def _normalize_path_key(path: str) -> str:
+    p = str(path or "").strip()
+    if not p:
+        return ""
+    if not p.startswith("/"):
+        p = "/" + p
+    return p.rstrip("/") if p != "/" else p
+
+
+def _coalesce_str(*vals: Any) -> str:
+    for value in vals:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""

@@ -6,7 +6,8 @@ Responsabilidad única: estructuras de datos.
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class PlantillaUsuario(BaseModel):
@@ -32,12 +33,91 @@ class ContratoAPIResponse(BaseModel):
     evidence: str = ""
 
 
+class ContratoAPIAction(BaseModel):
+    id: str
+    kind: str = "other"
+    description: str = ""
+    required: bool = False
+    integration_ref: Optional[str] = None
+    source: str = "unknown"
+    evidence: str = ""
+    assumption: str = ""
+
+
+class ContratoAPIError(BaseModel):
+    status_code: Optional[int] = None
+    code: str
+    description: str = ""
+    required: bool = False
+    source: str = "unknown"
+    evidence: str = ""
+    assumption: str = ""
+
+
 class ContratoAPI(BaseModel):
     method: str
     path: str
     request: ContratoAPIRequest = Field(default_factory=ContratoAPIRequest)
     response: ContratoAPIResponse = Field(default_factory=ContratoAPIResponse)
     notes: str = ""
+    actions: List[ContratoAPIAction] = Field(default_factory=list)
+    errors: List[ContratoAPIError] = Field(default_factory=list)
+    integration_refs: List[str] = Field(default_factory=list)
+
+
+class IntegrationAuthenticationModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mechanism: str = ""
+    credential_source: str = "unknown"
+    allows_embedded_secret: bool = False
+    allows_static_credential_file: bool = True
+    source: str = "unknown"
+    evidence: str = ""
+    assumption: str = ""
+
+
+class IntegrationModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    name: str
+    kind: str = "other"
+    role: str = ""
+    required: bool = False
+    implementation_level: str = "integration_skeleton"
+    authentication: IntegrationAuthenticationModel = Field(
+        default_factory=IntegrationAuthenticationModel
+    )
+    technology_refs: List[str] = Field(default_factory=list)
+    configuration_refs: List[str] = Field(default_factory=list)
+    source: str = "unknown"
+    evidence: str = ""
+    assumption: str = ""
+
+
+class ConfigurationItemModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    purpose: str = ""
+    required: bool = False
+    secret: bool = False
+    source: str = "unknown"
+    evidence: str = ""
+    assumption: str = ""
+    delivery: str = "env"
+
+
+class CapabilityCoverageModel(BaseModel):
+    capability_id: str = ""
+    capability: str = ""
+    contract_refs: List[str] = Field(default_factory=list)
+    action_refs: List[str] = Field(default_factory=list)
+    integration_refs: List[str] = Field(default_factory=list)
+    status: str = "uncovered"
+    source: str = "unknown"
+    evidence: str = ""
+    assumption: str = ""
 
 
 class PersistenceModel(BaseModel):
@@ -50,8 +130,13 @@ class PersistenceModel(BaseModel):
 
 
 class TechnologySignalModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = ""
     name: str
     category: str = "unknown"
+    packages: List[str] = Field(default_factory=list)
+    import_roots: List[str] = Field(default_factory=list)
     role: str = ""
     evidence: str = ""
     confidence: str = "unknown"
@@ -80,6 +165,7 @@ class StateRequirementsModel(BaseModel):
 
 
 class ContextoNormalizado(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     """
     Representa el contexto técnico estructurado derivado de la plantilla.
     Es la versión formal y normalizada que utilizará el sistema.
@@ -104,6 +190,11 @@ class ContextoNormalizado(BaseModel):
 
     # Legacy (deprecated): solo explícitos
     contratos_api: List[ContratoAPI] = Field(default_factory=list)
+
+    integrations: List[IntegrationModel] = Field(default_factory=list)
+    configuration: List[ConfigurationItemModel] = Field(default_factory=list)
+    capability_coverage: List[CapabilityCoverageModel] = Field(default_factory=list)
+    open_questions: List[str] = Field(default_factory=list)
 
     persistence: PersistenceModel = Field(default_factory=PersistenceModel)
     technology_signals: List[TechnologySignalModel] = Field(default_factory=list)

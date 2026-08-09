@@ -25,10 +25,17 @@ from typing import Any, Dict, Tuple
 from poc_it.entrada.demo_progress import demo_progress, is_demo_mode
 
 from poc_it.analisis.clasificador import clasificar_viabilidad
-from poc_it.materializacion.generador_artefactos import generar_proyecto_completo, generar_proyecto_desde_spec
+from poc_it.materializacion.generador_artefactos import (
+    finalize_codegen_classification,
+    generar_proyecto_completo,
+    generar_proyecto_desde_spec,
+)
 from poc_it.materializacion.materializador_archivos import materializar_proyecto
 from poc_it.modulos.models import ContextoNormalizado, ModoGeneracion, PlantillaUsuario, ProjectContext
-from poc_it.analisis.normalizador_contexto import normalizar_plantilla
+from poc_it.analisis.normalizador_contexto import (
+    normalizar_plantilla,
+    prepare_contexto_normalizado_payload,
+)
 from poc_it.orquestacion.generacion_documentacion import generar_documentacion
 from poc_it.orquestacion.persistencia_spec import persist_spec_json
 from poc_it.orquestacion.postprocesado_alineacion import postprocesar_alineacion_por_pytest
@@ -54,6 +61,25 @@ from poc_it.runtime.runtime_facts import (
 ContextoNormalizadoCache = ContextoNormalizado | None
 
 logger = logging.getLogger(__name__)
+
+
+def _assert_preserved_context_fields(
+    original: Dict[str, Any],
+    serialized: Dict[str, Any],
+    fields: list[str],
+) -> None:
+    lost_fields: list[str] = []
+
+    for field_name in fields:
+        original_value = original.get(field_name)
+        if original_value and not serialized.get(field_name):
+            lost_fields.append(field_name)
+
+    if lost_fields:
+        raise RuntimeError(
+            "ContextoNormalizado perdió campos: "
+            + ", ".join(lost_fields)
+        )
 
 
 class OrquestadorParcial:
@@ -123,9 +149,24 @@ Descripción:
 
     def _normalizar_contexto(self, context: ProjectContext) -> None:
         contexto_dict = normalizar_plantilla(self.plantilla)
+        contexto_payload = prepare_contexto_normalizado_payload(
+            contexto_dict
+        )
 
         try:
-            contexto_normalizado = ContextoNormalizado(**contexto_dict)
+            contexto_normalizado = ContextoNormalizado(**contexto_payload)
+            contexto_serializado = contexto_normalizado.model_dump(mode="json")
+            _assert_preserved_context_fields(
+                original=contexto_payload,
+                serialized=contexto_serializado,
+                fields=[
+                    "capability_coverage",
+                    "integrations",
+                    "configuration",
+                    "open_questions",
+                ],
+            )
+
             context.contexto_normalizado = contexto_normalizado
             self._contexto_normalizado = contexto_normalizado
             context.registrar_modelo("normalizacion_contexto", "chat_completion_json")
@@ -358,7 +399,7 @@ Descripción:
             t_pocit_fin = 0.0
 
             codegen_status = (resultado.get("codegen_status") or "unknown") if isinstance(resultado, dict) else "unknown"
-            if codegen_status != "valid":
+            if codegen_status == "invalid":
                 logger.warning("[PIPELINE] codegen_status=%s; se omite runtime/tests loop.", codegen_status)
                 if isinstance(resultado, dict):
                     resultado["pytest_ok"] = False
@@ -390,7 +431,7 @@ Descripción:
                 # para alinear la generación de tests con el wiring/DI realmente materializado.
                 #
                 # Política: solo tiene sentido si el codegen fue VALID.
-                if codegen_status == "valid":
+                if codegen_status != "invalid":
                     try:
                         facts = extract_poc_facts_from_structure(estructura).to_dict()
                         endpoints: list[EndpointRuntimeFacts] = []
@@ -528,7 +569,7 @@ Descripción:
                             "No se pudo persistir runtime_facts; se continúa sin artefacto intermedio."
                         )
 
-                if codegen_status == "valid":
+                if codegen_status != "invalid":
                     # NUEVO FLUJO (separación estricta de responsabilidades)
                     # Fase A: code correctness loop (solo código, import-time + wiring mínimo)
                     # Fase B: generación de tests (LLM)
@@ -643,9 +684,13 @@ Descripción:
                     )
 
                 if isinstance(resultado, dict):
+                    resultado = finalize_codegen_classification(
+                        preliminary_result=resultado,
+                        runtime_tests_passed=bool(run_result.pytest_ok),
+                    )
                     resultado["pytest_ok"] = bool(run_result.pytest_ok)
                     resultado["estado_final"] = run_result.status
-                    resultado["publishable"] = bool(run_result.publishable)
+                    resultado["publishable"] = bool(run_result.publishable) and bool(resultado.get("materializable"))
                     resultado["run_reasons"] = list(run_result.reasons)
                     resultado["degraded"] = bool(run_result.degraded) if run_result.degraded is not None else None
                     resultado["degrade_type"] = run_result.degrade_type

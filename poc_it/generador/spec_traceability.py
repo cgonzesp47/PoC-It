@@ -100,16 +100,20 @@ def validate_request_ir_to_spec_traceability(
         if isinstance(dep, str) and str(dep).strip()
     }
     for signal in ir.technology_signals or []:
-        package = str(getattr(signal, "package", "") or "").strip()
         confidence = str(getattr(signal, "confidence", "") or "").strip().lower()
-        if confidence == "explicit" and package and package.lower() not in dependencies:
-            errors.append(
-                TraceabilityError(
-                    code="TRACE_DEPENDENCY_LOST",
-                    path="$.dependencies",
-                    message=f"No se preservó dependency explícita: {package}",
+        if confidence != "explicit":
+            continue
+
+        for package in getattr(signal, "packages", []) or []:
+            package_name = str(package or "").strip()
+            if package_name and package_name.lower() not in dependencies:
+                errors.append(
+                    TraceabilityError(
+                        code="TRACE_DEPENDENCY_LOST",
+                        path="$.dependencies",
+                        message=f"No se preservó dependency explícita: {package_name}",
+                    )
                 )
-            )
 
     endpoints = spec.get("endpoints")
     spec_endpoints_by_key = {

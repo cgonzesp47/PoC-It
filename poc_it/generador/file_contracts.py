@@ -4,6 +4,11 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set
 
+from poc_it.generador.utils_python_names import (
+    module_path_from_file_path,
+    safe_python_identifier,
+)
+
 
 @dataclass(frozen=True)
 class FileContract:
@@ -14,6 +19,7 @@ class FileContract:
     allowed_imports: List[str] = field(default_factory=list)
     forbidden_imports: List[str] = field(default_factory=list)
     endpoints: List[Dict[str, Any]] = field(default_factory=list)
+    endpoint_contracts: List[Dict[str, Any]] = field(default_factory=list)
     dependencies: List[str] = field(default_factory=list)
     env: List[Any] = field(default_factory=list)
     persistence: Dict[str, Any] = field(default_factory=dict)
@@ -30,6 +36,16 @@ class FileContract:
     external_dependencies: List[Dict[str, Any]] = field(default_factory=list)
     implementation_levels: List[str] = field(default_factory=list)
     configuration: List[Dict[str, Any]] = field(default_factory=list)
+    configuration_access: Dict[str, Any] = field(default_factory=dict)
+    authentication_constraints: Dict[str, Any] = field(default_factory=dict)
+    authentication_runtime_contract: Dict[str, Any] = field(default_factory=dict)
+    provided_interfaces: List[Dict[str, Any]] = field(default_factory=list)
+    required_internal_calls: List[Dict[str, Any]] = field(default_factory=list)
+    included_routers: List[Dict[str, Any]] = field(default_factory=list)
+    routing_convention: Dict[str, Any] = field(default_factory=dict)
+    owned_action_refs: List[str] = field(default_factory=list)
+    data_contracts: Dict[str, Any] = field(default_factory=dict)
+    data_flows: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def file_contracts_to_dict(contracts: List[FileContract]) -> List[dict]:
@@ -42,6 +58,7 @@ def file_contracts_to_dict(contracts: List[FileContract]) -> List[dict]:
             "allowed_imports": list(c.allowed_imports),
             "forbidden_imports": list(c.forbidden_imports),
             "endpoints": list(c.endpoints),
+            "endpoint_contracts": list(c.endpoint_contracts),
             "dependencies": list(c.dependencies),
             "env": list(c.env),
             "persistence": dict(c.persistence),
@@ -58,6 +75,18 @@ def file_contracts_to_dict(contracts: List[FileContract]) -> List[dict]:
             "external_dependencies": list(c.external_dependencies),
             "implementation_levels": list(c.implementation_levels),
             "configuration": list(c.configuration),
+            "configuration_access": dict(c.configuration_access),
+            "authentication_constraints": dict(c.authentication_constraints),
+            "authentication_runtime_contract": dict(
+                c.authentication_runtime_contract
+            ),
+            "provided_interfaces": list(c.provided_interfaces),
+            "required_internal_calls": list(c.required_internal_calls),
+            "included_routers": list(c.included_routers),
+            "routing_convention": dict(c.routing_convention),
+            "owned_action_refs": list(c.owned_action_refs),
+            "data_contracts": dict(c.data_contracts),
+            "data_flows": list(c.data_flows),
         }
         for c in contracts
     ]
@@ -95,7 +124,6 @@ def build_file_contracts_from_spec(
     configuration_by_key = _configuration_by_key(spec)
     integrations_by_id = _integrations_by_id(spec)
     technologies_by_name = _technology_signals_by_name(spec)
-    env_by_name = _env_by_name(spec)
     implementation_files = spec.get("implementation_files", []) or []
 
     endpoints_by_file: Dict[str, List[Dict[str, Any]]] = {}
@@ -110,15 +138,8 @@ def build_file_contracts_from_spec(
     implementation_by_endpoint = _implementation_contracts_by_endpoint(
         implementation_contracts
     )
-    implementation_files_by_path = _implementation_files_by_path(
-        implementation_files
-    )
-    integration_module_by_ref = _integration_module_by_ref(
-        implementation_files
-    )
-    integration_actions_by_ref = _integration_actions_by_ref(
-        implementation_contracts
-    )
+    implementation_files_by_path = _implementation_files_by_path(implementation_files)
+    integration_module_by_ref = _integration_module_by_ref(implementation_files)
 
     contracts: List[FileContract] = []
     seen: Set[str] = set()
@@ -126,7 +147,7 @@ def build_file_contracts_from_spec(
     endpoint_files = sorted([f for f in endpoints_by_file.keys() if f])
     endpoint_files_in_spec = [f for f in endpoint_files if f in spec_files]
     endpoint_modules_in_spec = [
-        _module_from_endpoint_file(f) for f in endpoint_files_in_spec
+        module_path_from_file_path(f) for f in endpoint_files_in_spec
     ]
 
     for path in spec_files:
@@ -152,6 +173,17 @@ def build_file_contracts_from_spec(
         external_dependencies: List[Dict[str, Any]] = []
         implementation_levels: List[str] = []
         configuration: List[Dict[str, Any]] = []
+        endpoint_contracts: List[Dict[str, Any]] = []
+        configuration_access: Dict[str, Any] = {}
+        authentication_constraints: Dict[str, Any] = {}
+        authentication_runtime_contract: Dict[str, Any] = {}
+        provided_interfaces: List[Dict[str, Any]] = []
+        required_internal_calls: List[Dict[str, Any]] = []
+        included_routers: List[Dict[str, Any]] = []
+        routing_convention: Dict[str, Any] = {}
+        owned_action_refs: List[str] = []
+        data_contracts: Dict[str, Any] = {}
+        data_flows: List[Dict[str, Any]] = []
 
         notes: List[str] = []
         file_source: Dict[str, Any] = {}
@@ -177,6 +209,17 @@ def build_file_contracts_from_spec(
                 "no contener lógica de negocio",
             ]
             allowed_imports = ["fastapi"] + endpoint_modules_in_spec
+            included_routers = [
+                {
+                    "module": module_path_from_file_path(f),
+                    "prefix": "",
+                }
+                for f in endpoint_files_in_spec
+            ]
+            routing_convention = {
+                "endpoint_owns_full_path": True,
+                "router_prefix_policy": "empty_prefix_for_included_endpoint_routers",
+            }
             notes.append("Debe incluir routers de todos los endpoint files del SPEC")
             file_source = dict(source)
         elif kind == "endpoint":
@@ -204,6 +247,11 @@ def build_file_contracts_from_spec(
                 implementation_for_file.extend(implementation_by_endpoint.get(key, []))
 
             implementation_for_file = _dedupe_contract_dicts(implementation_for_file)
+            endpoint_contracts = [
+                _endpoint_contract_from_endpoint(endpoint)
+                for endpoint in eps_for_file
+                if isinstance(endpoint, dict)
+            ]
 
             must_implement = _dedupe_strings(
                 [
@@ -325,6 +373,14 @@ def build_file_contracts_from_spec(
                     for ref in (dependency.get("configuration_refs") or [])
                 ]
             )
+            for endpoint in eps_for_file:
+                configuration_refs.extend(
+                    [
+                        conf_ref
+                        for conf_ref in _endpoint_configuration_refs(endpoint)
+                        if isinstance(conf_ref, str)
+                    ]
+                )
             for ref in integration_refs:
                 integration = integrations_by_id.get(ref)
                 if not isinstance(integration, dict):
@@ -340,6 +396,11 @@ def build_file_contracts_from_spec(
             configuration = _resolve_configuration(
                 configuration_refs=configuration_refs,
                 configuration_by_key=configuration_by_key,
+            )
+            configuration_access = _build_configuration_access(
+                path=path,
+                kind=kind,
+                configuration=configuration,
             )
             configuration_names = {
                 str(item.get("key") or "").strip()
@@ -368,6 +429,19 @@ def build_file_contracts_from_spec(
                 notes.append(
                     "Implementar provisionalmente la integración en este archivo, sin conexiones en import-time y manteniendo la construcción del cliente en una función lazy."
                 )
+            if any(
+                bool(item.get("required"))
+                and str(item.get("delivery") or "env").strip() == "env"
+                for item in configuration
+                if isinstance(item, dict)
+            ):
+                must_not.append(
+                    "Do not instantiate required environment-backed settings at import time."
+                )
+            routing_convention = {
+                "endpoint_owns_full_path": True,
+                "router_prefix_policy": "empty_prefix_for_included_endpoint_routers",
+            }
 
             endpoint_specific_obligations: List[str] = []
             should_add_generic_obligations = (
@@ -428,7 +502,7 @@ def build_file_contracts_from_spec(
             if dedicated_modules:
                 allowed_imports.extend(
                     [
-                        _module_from_endpoint_file(module_path)
+                        module_path_from_file_path(module_path)
                         for module_path in dedicated_modules
                     ]
                 )
@@ -479,6 +553,26 @@ def build_file_contracts_from_spec(
                 "traducir excepciones del proveedor a errores internos",
                 "no ejecutar llamadas externas en import-time",
             ]
+            authentication = (
+                dict(integration.get("authentication") or {})
+                if isinstance(integration, dict)
+                else {}
+            )
+            authentication_constraints = _build_authentication_constraints(authentication)
+            authentication_runtime_contract = _build_authentication_runtime_contract(
+                authentication_constraints
+            )
+            if authentication:
+                if not bool(authentication.get("allows_embedded_secret")):
+                    must_not.append("No almacenar secretos embebidos en código.")
+                if not bool(authentication.get("allows_static_credential_file", True)):
+                    must_not.append("No depender de un fichero estático de credenciales.")
+                credential_source = str(authentication.get("credential_source") or "").strip()
+                if credential_source and credential_source != "unknown":
+                    responsibilities.append(
+                        "Obtener credenciales desde la fuente declarada por el contrato: "
+                        f"{credential_source}."
+                    )
             integration_refs = [integration_ref] if integration_ref else []
             external_dependencies = _integration_external_dependencies(
                 integration_ref=integration_ref,
@@ -493,15 +587,18 @@ def build_file_contracts_from_spec(
                     and integration_ref in (contract.get("integration_refs") or [])
                     for item in (contract.get("implementation_levels") or [])
                 ]
-                + [
-                    str(integration.get("implementation_level") or "").strip()
-                ]
+                + [str(integration.get("implementation_level") or "").strip()]
             )
             configuration = _resolve_configuration(
                 configuration_refs=_dedupe_strings(
                     integration.get("configuration_refs") or []
                 ),
                 configuration_by_key=configuration_by_key,
+            )
+            configuration_access = _build_configuration_access(
+                path=path,
+                kind=kind,
+                configuration=configuration,
             )
             configuration_names = {
                 str(item.get("key") or "").strip()
@@ -578,6 +675,20 @@ def build_file_contracts_from_spec(
                 dict(item)
                 for item in (spec.get("configuration") or [])
                 if isinstance(item, dict) and str(item.get("key") or "").strip()
+            ]
+            configuration_access = _build_configuration_access(
+                path=path,
+                kind=kind,
+                configuration=configuration,
+            )
+            provided_interfaces = [
+                {
+                    "symbol": "get_settings",
+                    "kind": "function",
+                    "parameters": [],
+                    "interface_ref": "app.core.config:get_settings",
+                    "return_hint": "Settings",
+                }
             ]
             file_env = list(env)
             must_implement = _build_config_must_implement(configuration)
@@ -684,6 +795,7 @@ def build_file_contracts_from_spec(
                 allowed_imports=_dedupe_strings(allowed_imports),
                 forbidden_imports=forbidden_imports,
                 endpoints=list(eps_for_file),
+                endpoint_contracts=list(endpoint_contracts),
                 dependencies=list(file_dependencies),
                 env=list(file_env),
                 persistence=dict(file_persistence),
@@ -700,8 +812,26 @@ def build_file_contracts_from_spec(
                 external_dependencies=list(external_dependencies),
                 implementation_levels=list(implementation_levels),
                 configuration=list(configuration),
+                configuration_access=dict(configuration_access),
+                authentication_constraints=dict(authentication_constraints),
+                authentication_runtime_contract=dict(
+                    authentication_runtime_contract
+                ),
+                provided_interfaces=list(provided_interfaces),
+                required_internal_calls=list(required_internal_calls),
+                included_routers=list(included_routers),
+                routing_convention=dict(routing_convention),
+                owned_action_refs=list(owned_action_refs),
+                data_contracts=dict(data_contracts),
+                data_flows=list(data_flows),
             )
         )
+
+    contracts = _apply_interfaces_to_contracts(
+        spec=spec,
+        contracts=contracts,
+        integration_path_by_ref=integration_module_by_ref,
+    )
 
     _validate_contracts_against_spec(
         spec_files=spec_files,
@@ -828,18 +958,6 @@ def _technology_signals_by_name(
     return result
 
 
-def _env_by_name(spec: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    result: Dict[str, Dict[str, Any]] = {}
-    for item in spec.get("env") or []:
-        if not isinstance(item, dict):
-            continue
-        key = str(item.get("name") or "").strip()
-        if not key:
-            continue
-        result[key] = dict(item)
-    return result
-
-
 def _implementation_files_by_path(
     implementation_files: List[Any],
 ) -> Dict[str, Dict[str, Any]]:
@@ -867,32 +985,6 @@ def _integration_module_by_ref(
         path = str(item.get("path") or "").replace("\\", "/").strip()
         if ref and path:
             result[ref] = path
-    return result
-
-
-def _integration_actions_by_ref(
-    implementation_contracts: List[Dict[str, Any]],
-) -> Dict[str, List[Dict[str, Any]]]:
-    result: Dict[str, List[Dict[str, Any]]] = {}
-    for contract in implementation_contracts:
-        if not isinstance(contract, dict):
-            continue
-        refs = [
-            ref
-            for ref in (contract.get("integration_refs") or [])
-            if isinstance(ref, str) and ref.strip()
-        ]
-        actions = [
-            item
-            for item in (contract.get("actions") or [])
-            if isinstance(item, dict)
-            and str(item.get("integration_ref") or "").strip()
-        ]
-        for ref in refs:
-            for action in actions:
-                if str(action.get("integration_ref") or "").strip() != ref:
-                    continue
-                result.setdefault(ref, []).append(dict(action))
     return result
 
 
@@ -1034,13 +1126,6 @@ def _find_matching_endpoint(
     return None
 
 
-def _module_from_endpoint_file(path: str) -> str:
-    p = (path or "").replace("\\", "/").strip()
-    if p.endswith(".py"):
-        p = p[:-3]
-    return p.replace("/", ".")
-
-
 def _technology_signals_for_integrations(
     *,
     integration_refs: List[str],
@@ -1154,6 +1239,7 @@ def _integration_external_dependencies(
                     "configuration_refs": list(
                         _dedupe_strings(integration.get("configuration_refs") or [])
                     ),
+                    "authentication": dict(integration.get("authentication") or {}),
                 }
             ]
         )
@@ -1236,6 +1322,571 @@ def _infer_kind(path: str) -> str:
     if p.startswith("app/") and p.endswith(".py"):
         return "unknown"
     return "unknown"
+
+
+def _apply_interfaces_to_contracts(
+    *,
+    spec: Dict[str, Any],
+    contracts: List[FileContract],
+    integration_path_by_ref: Dict[str, str],
+) -> List[FileContract]:
+    mutable_by_path: Dict[str, Dict[str, Any]] = {
+        contract.path: {
+            "path": contract.path,
+            "kind": contract.kind,
+            "responsibilities": list(contract.responsibilities),
+            "required_symbols": list(contract.required_symbols),
+            "allowed_imports": list(contract.allowed_imports),
+            "forbidden_imports": list(contract.forbidden_imports),
+            "endpoints": list(contract.endpoints),
+            "endpoint_contracts": list(contract.endpoint_contracts),
+            "dependencies": list(contract.dependencies),
+            "env": list(contract.env),
+            "persistence": dict(contract.persistence),
+            "test_strategy": dict(contract.test_strategy),
+            "source": dict(contract.source),
+            "notes": list(contract.notes),
+            "implementation_contracts": list(contract.implementation_contracts),
+            "must_implement": list(contract.must_implement),
+            "must_not": list(contract.must_not),
+            "implementation_plan": list(contract.implementation_plan),
+            "actions": list(contract.actions),
+            "errors": list(contract.errors),
+            "integration_refs": list(contract.integration_refs),
+            "external_dependencies": list(contract.external_dependencies),
+            "implementation_levels": list(contract.implementation_levels),
+            "configuration": list(contract.configuration),
+            "configuration_access": dict(contract.configuration_access),
+            "authentication_constraints": dict(contract.authentication_constraints),
+            "authentication_runtime_contract": dict(
+                contract.authentication_runtime_contract
+            ),
+            "provided_interfaces": list(contract.provided_interfaces),
+            "required_internal_calls": list(contract.required_internal_calls),
+            "included_routers": list(contract.included_routers),
+            "routing_convention": dict(contract.routing_convention),
+            "owned_action_refs": list(contract.owned_action_refs),
+            "data_contracts": dict(contract.data_contracts),
+            "data_flows": list(contract.data_flows),
+        }
+        for contract in contracts
+    }
+
+    endpoint_paths_with_repository = {
+        str(endpoint.get("file") or "").replace("\\", "/")
+        for endpoint in (spec.get("endpoints") or [])
+        if isinstance(endpoint, dict)
+        and any(
+            str(path or "").replace("\\", "/").startswith("app/repositories/")
+            for path in (spec.get("files") or [])
+        )
+    }
+
+    for endpoint in spec.get("endpoints") or []:
+        if not isinstance(endpoint, dict):
+            continue
+        endpoint_path = str(endpoint.get("file") or "").replace("\\", "/").strip()
+        if endpoint_path not in mutable_by_path:
+            continue
+
+        symbol_by_action_ref: Dict[str, str] = {}
+        for action in endpoint.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            if not bool(action.get("required", True)):
+                continue
+            action_id = str(action.get("id") or "").strip()
+            if not action_id:
+                continue
+            symbol = _symbol_for_action(action)
+            other_action_ref = next(
+                (
+                    ref
+                    for ref, existing_symbol in symbol_by_action_ref.items()
+                    if existing_symbol == symbol and ref != action_id
+                ),
+                None,
+            )
+            if other_action_ref is not None:
+                raise ValueError(
+                    "FILE_INTERFACE_SYMBOL_COLLISION: "
+                    f"path={endpoint_path} symbol={symbol} actions={other_action_ref},{action_id}"
+                )
+            symbol_by_action_ref[action_id] = symbol
+
+        endpoint_data_contracts = _data_contracts_for_endpoint(endpoint)
+        if endpoint_data_contracts:
+            existing = mutable_by_path[endpoint_path].get("data_contracts") or {}
+            existing.update(endpoint_data_contracts)
+            mutable_by_path[endpoint_path]["data_contracts"] = existing
+
+        for action in endpoint.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            if not bool(action.get("required", True)):
+                continue
+
+            action_id = str(action.get("id") or "").strip()
+            if not action_id:
+                continue
+
+            owner_path = _resolve_action_owner_path(
+                action=action,
+                endpoint_file=endpoint_path,
+                integration_path_by_ref=integration_path_by_ref,
+                repository_paths=[
+                    path
+                    for path in mutable_by_path
+                    if path.startswith("app/repositories/")
+                ]
+                if endpoint_path in endpoint_paths_with_repository
+                else [],
+            )
+            symbol = symbol_by_action_ref[action_id]
+            owner_contract = mutable_by_path.get(owner_path)
+            if owner_contract is None:
+                continue
+
+            data_contract_ref = _data_contract_ref_for_action(action)
+            owner_contract["owned_action_refs"] = _dedupe_strings(
+                list(owner_contract.get("owned_action_refs") or []) + [action_id]
+            )
+            interface_required = owner_path != endpoint_path
+            owner_contract["provided_interfaces"].append(
+                {
+                    "symbol": symbol,
+                    "kind": "function",
+                    "action_ref": action.get("id"),
+                    "parameters": _parameters_for_action(
+                        action=action,
+                        endpoint=endpoint,
+                    ),
+                    "returns": _returns_for_action(
+                        action=action,
+                        endpoint=endpoint,
+                    ),
+                    "returns_ref": data_contract_ref or "",
+                    "return_hint": _return_hint_for_action(action),
+                    "purpose": str(action.get("description") or "").strip(),
+                    "interface_ref": f"{module_path_from_file_path(owner_path)}:{symbol}",
+                    "interface_required": interface_required,
+                    "owner_path": owner_path,
+                    "consumer_path": endpoint_path,
+                }
+            )
+
+            if owner_path == endpoint_path:
+                continue
+
+            endpoint_contract = mutable_by_path[endpoint_path]
+            endpoint_contract["required_internal_calls"].append(
+                {
+                    "module": module_path_from_file_path(owner_path),
+                    "symbol": symbol,
+                    "action_ref": action.get("id"),
+                    "required": action.get("required", True),
+                    "interface_ref": f"{module_path_from_file_path(owner_path)}:{symbol}",
+                    "parameters": _parameters_for_action(
+                        action=action,
+                        endpoint=endpoint,
+                    ),
+                    "arguments_ref": data_contract_ref or "",
+                }
+            )
+            endpoint_contract["allowed_imports"] = _dedupe_strings(
+                list(endpoint_contract.get("allowed_imports") or [])
+                + [module_path_from_file_path(owner_path)]
+            )
+    for contract in mutable_by_path.values():
+        contract["provided_interfaces"] = _dedupe_interface_items(
+            contract.get("provided_interfaces") or []
+        )
+        contract["required_internal_calls"] = _dedupe_internal_call_items(
+            contract.get("required_internal_calls") or []
+        )
+        provided_symbols = [
+            str(item.get("symbol") or "").strip()
+            for item in (contract.get("provided_interfaces") or [])
+            if isinstance(item, dict)
+            and bool(item.get("interface_required"))
+            and str(item.get("symbol") or "").strip()
+        ]
+        contract["required_symbols"] = _dedupe_strings(
+            list(contract.get("required_symbols") or []) + provided_symbols
+        )
+        contract["allowed_imports"] = _dedupe_strings(contract.get("allowed_imports") or [])
+        contract["owned_action_refs"] = _dedupe_strings(contract.get("owned_action_refs") or [])
+
+    result: List[FileContract] = []
+    for original in contracts:
+        updated = mutable_by_path[original.path]
+        result.append(
+            FileContract(
+                path=updated["path"],
+                kind=updated["kind"],
+                responsibilities=list(updated["responsibilities"]),
+                required_symbols=list(updated["required_symbols"]),
+                allowed_imports=list(updated["allowed_imports"]),
+                forbidden_imports=list(updated["forbidden_imports"]),
+                endpoints=list(updated["endpoints"]),
+                endpoint_contracts=list(updated["endpoint_contracts"]),
+                dependencies=list(updated["dependencies"]),
+                env=list(updated["env"]),
+                persistence=dict(updated["persistence"]),
+                test_strategy=dict(updated["test_strategy"]),
+                source=dict(updated["source"]),
+                notes=list(updated["notes"]),
+                implementation_contracts=list(updated["implementation_contracts"]),
+                must_implement=list(updated["must_implement"]),
+                must_not=list(updated["must_not"]),
+                implementation_plan=list(updated["implementation_plan"]),
+                actions=list(updated["actions"]),
+                errors=list(updated["errors"]),
+                integration_refs=list(updated["integration_refs"]),
+                external_dependencies=list(updated["external_dependencies"]),
+                implementation_levels=list(updated["implementation_levels"]),
+                configuration=list(updated["configuration"]),
+                configuration_access=dict(updated["configuration_access"]),
+                authentication_constraints=dict(updated["authentication_constraints"]),
+                authentication_runtime_contract=dict(
+                    updated["authentication_runtime_contract"]
+                ),
+                provided_interfaces=list(updated["provided_interfaces"]),
+                required_internal_calls=list(updated["required_internal_calls"]),
+                included_routers=list(updated["included_routers"]),
+                routing_convention=dict(updated["routing_convention"]),
+                owned_action_refs=list(updated["owned_action_refs"]),
+                data_contracts=dict(updated["data_contracts"]),
+                data_flows=list(updated.get("data_flows") or []),
+            )
+        )
+    return result
+
+
+def _symbol_for_action(action: Dict[str, Any]) -> str:
+    action_id = action.get("id")
+    return safe_python_identifier(
+        action_id,
+        fallback="execute_action",
+    )
+
+
+def _resolve_action_owner_path(
+    *,
+    action: Dict[str, Any],
+    endpoint_file: str,
+    integration_path_by_ref: Dict[str, str],
+    repository_paths: List[str] | None = None,
+) -> str:
+    kind = str(action.get("kind") or "").strip()
+    integration_ref = str(action.get("integration_ref") or "").strip()
+
+    if kind in {"external_call", "notification"}:
+        integration_path = integration_path_by_ref.get(integration_ref)
+        if integration_path:
+            return integration_path
+
+    if kind == "persistence":
+        repository_paths = repository_paths or []
+        if repository_paths:
+            return sorted(repository_paths)[0]
+
+    return endpoint_file
+
+
+def _parameters_for_action(
+    *,
+    action: Dict[str, Any],
+    endpoint: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    request = endpoint.get("request") or {}
+    request_type = str(request.get("type") or "").strip().lower()
+    schema = request.get("schema") or request.get("schema_hint") or {}
+
+    if request_type == "none" and not schema:
+        return []
+
+    result: List[Dict[str, Any]] = []
+
+    if isinstance(schema, dict):
+        for name, definition in schema.items():
+            lowered = str(name or "").strip().lower()
+            if any(
+                token in lowered
+                for token in ("config", "secret", "credential", "token", "password")
+            ):
+                continue
+            identifier = safe_python_identifier(
+                name,
+                fallback="value",
+            )
+            result.append(
+                {
+                    "name": identifier,
+                    "required": True,
+                    "type": _schema_type_name(definition),
+                }
+            )
+
+    if not result:
+        result.append(
+            {
+                "name": "payload",
+                "required": True,
+                "type": "object",
+            }
+        )
+
+    return result
+
+
+def _returns_for_action(
+    *,
+    action: Dict[str, Any],
+    endpoint: Dict[str, Any],
+) -> Dict[str, Any]:
+    explicit_output = (
+        action.get("output_contract")
+        or action.get("returns")
+        or action.get("return_contract")
+        or action.get("output_shape")
+    )
+    if isinstance(explicit_output, dict):
+        return _normalize_shape_contract(explicit_output)
+
+    data_contract_ref = _data_contract_ref_for_action(action)
+    endpoint_data_contracts = _data_contracts_for_endpoint(endpoint)
+    if data_contract_ref:
+        referenced_contract = endpoint_data_contracts.get(data_contract_ref)
+        if isinstance(referenced_contract, dict):
+            return _normalize_shape_contract(referenced_contract)
+
+    return {"kind": "unknown"}
+
+
+def _return_hint_for_action(action: Dict[str, Any]) -> str:
+    kind = str(action.get("kind") or "").strip()
+    if kind in {"validation", "internal_processing", "transformation"}:
+        return "dict"
+    if kind in {"external_call", "notification", "persistence"}:
+        return "dict"
+    return "Any"
+
+
+def _dedupe_interface_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    seen: Set[tuple[str, str, str]] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            str(item.get("symbol") or "").strip(),
+            str(item.get("kind") or "").strip(),
+            str(item.get("action_ref") or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(dict(item))
+    return result
+
+
+def _dedupe_internal_call_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    seen: Set[tuple[str, str, str]] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            str(item.get("module") or "").strip(),
+            str(item.get("symbol") or "").strip(),
+            str(item.get("action_ref") or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(dict(item))
+    return result
+
+
+def _endpoint_contract_from_endpoint(endpoint: Dict[str, Any]) -> Dict[str, Any]:
+    request = endpoint.get("request") or {}
+    schema = request.get("schema") or request.get("schema_hint") or {}
+    return {
+        "method": str(endpoint.get("method") or "").strip().upper(),
+        "path": str(endpoint.get("path") or "").strip(),
+        "request_type": str(request.get("type") or "none").strip().lower(),
+        "request_schema": dict(schema) if isinstance(schema, dict) else {},
+        "request": dict(request) if isinstance(request, dict) else {},
+        "response": dict(endpoint.get("response") or {})
+        if isinstance(endpoint.get("response"), dict)
+        else {},
+        "errors": [
+            dict(item)
+            for item in (endpoint.get("errors") or [])
+            if isinstance(item, dict)
+        ],
+        "integration_refs": [
+            str(item).strip()
+            for item in (endpoint.get("integration_refs") or [])
+            if str(item).strip()
+        ],
+        "configuration_refs": _endpoint_configuration_refs(endpoint),
+    }
+
+
+def _build_configuration_access(
+    *,
+    path: str,
+    kind: str,
+    configuration: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    allowed_fields = [
+        str(item.get("key") or "").strip()
+        for item in configuration
+        if isinstance(item, dict) and str(item.get("key") or "").strip()
+    ]
+    if not allowed_fields:
+        return {}
+    return {
+        "provider_module": "app.core.config",
+        "provider_symbol": "get_settings",
+        "allowed_fields": allowed_fields,
+        "access_mode": "lazy" if kind in {"endpoint", "integration", "service", "repository"} else "direct",
+        "consumer_path": path,
+    }
+
+
+def _build_authentication_constraints(
+    authentication: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not isinstance(authentication, dict) or not authentication:
+        return {}
+    return {
+        "credential_source": str(authentication.get("credential_source") or "").strip()
+        or "unknown",
+        "allows_embedded_secret": bool(authentication.get("allows_embedded_secret")),
+        "allows_static_credential_file": bool(
+            authentication.get("allows_static_credential_file", True)
+        ),
+    }
+
+
+def _build_authentication_runtime_contract(
+    authentication: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    if not isinstance(authentication, dict):
+        return {}
+
+    credential_source = str(authentication.get("credential_source") or "").strip()
+    allows_static_file = bool(
+        authentication.get("allows_static_credential_file", True)
+    )
+    allows_embedded_secret = bool(authentication.get("allows_embedded_secret", True))
+
+    if not credential_source:
+        return {}
+
+    return {
+        "discovery": (
+            "ambient" if credential_source == "runtime" else "contract_defined"
+        ),
+        "requires_configuration_field": (
+            False if credential_source == "runtime" else None
+        ),
+        "requires_static_credential_file": allows_static_file,
+        "requires_embedded_secret": allows_embedded_secret,
+    }
+
+
+def _endpoint_configuration_refs(endpoint: Dict[str, Any]) -> List[str]:
+    refs: List[str] = []
+    request = endpoint.get("request") or {}
+    for key in ("configuration_refs", "config_refs"):
+        for ref in request.get(key) or []:
+            normalized = str(ref or "").strip()
+            if normalized:
+                refs.append(normalized)
+    for key in ("configuration_refs", "config_refs"):
+        for ref in endpoint.get(key) or []:
+            normalized = str(ref or "").strip()
+            if normalized:
+                refs.append(normalized)
+    return _dedupe_strings(refs)
+
+
+def _schema_type_name(definition: Any) -> str:
+    if isinstance(definition, dict):
+        candidate = (
+            definition.get("type")
+            or definition.get("format")
+            or definition.get("kind")
+            or "object"
+        )
+        return str(candidate or "object").strip()
+    if isinstance(definition, str):
+        normalized = definition.strip()
+        return normalized or "string"
+    return "string"
+
+
+def _data_contract_ref_for_action(action: Dict[str, Any]) -> str:
+    explicit = str(action.get("data_contract_ref") or "").strip()
+    if explicit:
+        return explicit
+    kind = str(action.get("kind") or "").strip()
+    if kind in {"internal_processing", "transformation", "persistence", "external_call", "notification"}:
+        action_id = str(action.get("id") or "").strip()
+        if action_id:
+            return f"{safe_python_identifier(action_id, fallback='data')}_payload"
+    return ""
+
+
+def _data_contracts_for_endpoint(endpoint: Dict[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    request_contract = _endpoint_request_data_contract(endpoint)
+    if request_contract:
+        result["request_payload"] = request_contract
+
+    for action in endpoint.get("actions") or []:
+        if not isinstance(action, dict) or not bool(action.get("required", True)):
+            continue
+        ref = _data_contract_ref_for_action(action)
+        explicit_contract = (
+            action.get("input_contract")
+            or action.get("output_contract")
+            or action.get("data_contract")
+        )
+        if ref and isinstance(explicit_contract, dict):
+            result[ref] = _normalize_shape_contract(explicit_contract)
+    return result
+
+
+def _endpoint_request_data_contract(endpoint: Dict[str, Any]) -> Dict[str, Any]:
+    request = endpoint.get("request") or {}
+    schema = request.get("schema") or request.get("schema_hint") or {}
+    if not isinstance(schema, dict) or not schema:
+        return {}
+    return {
+        "kind": "object",
+        "fields": {
+            safe_python_identifier(name, fallback="value"): _schema_type_name(definition)
+            for name, definition in schema.items()
+        },
+    }
+
+
+def _normalize_shape_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
+    kind = str(contract.get("kind") or contract.get("type") or "unknown").strip().lower() or "unknown"
+    normalized: Dict[str, Any] = {"kind": kind}
+    fields = contract.get("fields")
+    if isinstance(fields, dict):
+        normalized["fields"] = {
+            str(name).strip(): str(field_type).strip().lower()
+            for name, field_type in fields.items()
+            if str(name).strip() and str(field_type).strip()
+        }
+    return normalized
 
 
 def _validate_contracts_against_spec(

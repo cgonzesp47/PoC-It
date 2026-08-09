@@ -31,6 +31,10 @@ def build_spec_from_request_ir(ir: RequestIR) -> Dict[str, Any]:
     if not isinstance(ir, RequestIR):
         raise TypeError("ir debe ser RequestIR")
 
+    package_errors = validate_technology_packages(ir.technology_signals or [])
+    if package_errors:
+        raise ValueError("; ".join(package_errors))
+
     assumptions: List[str] = []
 
     endpoints, ep_assumptions = _build_endpoints(ir)
@@ -92,21 +96,97 @@ def _default_dependencies() -> List[str]:
     return ["fastapi", "uvicorn"]
 
 
-def _build_dependencies(ir: RequestIR) -> List[str]:
-    candidates: List[str] = _default_dependencies()
+def _normalize_identity(value: str) -> str:
+    return str(value or "").strip().casefold()
 
-    for signal in ir.technology_signals or []:
-        package = str(getattr(signal, "package", "") or "").strip()
+
+def _dedupe_stable_casefold(values: List[str]) -> List[str]:
+    seen: set[str] = set()
+    result: List[str] = []
+
+    for raw in values:
+        value = str(raw or "").strip()
+        if not value:
+            continue
+
+        identity = value.casefold()
+        if identity in seen:
+            continue
+
+        seen.add(identity)
+        result.append(value)
+
+    return result
+
+
+def validate_technology_packages(signals: List[Any]) -> List[str]:
+    errors: List[str] = []
+
+    for signal in signals:
+        for package in getattr(signal, "packages", []) or []:
+            if not isinstance(package, str) or not package.strip():
+                errors.append(
+                    "TechnologySignal "
+                    f"{getattr(signal, 'name', '')!r} "
+                    "contiene package vacío."
+                )
+
+        for import_root in getattr(signal, "import_roots", []) or []:
+            if not isinstance(import_root, str) or not import_root.strip():
+                errors.append(
+                    "TechnologySignal "
+                    f"{getattr(signal, 'name', '')!r} "
+                    "contiene import_root vacío."
+                )
+
+    return errors
+
+
+def _extend_packages(target: List[str], packages: Any) -> None:
+    if not packages:
+        return
+
+    if isinstance(packages, (str, bytes)):
+        values = [packages]
+    else:
+        values = packages
+
+    for raw in values:
+        package = str(raw or "").strip()
         if package:
-            candidates.append(package)
+            target.append(package)
 
-    for integration in ir.integrations or []:
-        for package in getattr(integration, "packages", []) or []:
-            normalized = str(package or "").strip()
-            if normalized:
-                candidates.append(normalized)
 
-    return _dedupe_stable_case_insensitive(candidates)
+def _build_dependencies(ir: RequestIR) -> List[str]:
+    dependencies = list(_default_dependencies())
+
+    signals_by_id = {
+        str(signal.id).strip(): signal
+        for signal in ir.technology_signals
+        if str(signal.id or "").strip()
+    }
+
+    for signal in ir.technology_signals:
+        confidence = str(signal.confidence or "").strip().casefold()
+        if confidence != "explicit":
+            continue
+        _extend_packages(dependencies, signal.packages)
+
+    for integration in ir.integrations:
+        for raw_ref in (integration.technology_refs or ()):
+            technology_id = str(raw_ref or "").strip()
+            if not technology_id:
+                continue
+
+            signal = signals_by_id.get(technology_id)
+            if signal is None:
+                continue
+
+            _extend_packages(dependencies, signal.packages)
+
+        _extend_packages(dependencies, integration.packages)
+
+    return _dedupe_stable_casefold(dependencies)
 
 
 def _default_dev_dependencies() -> List[str]:
@@ -142,34 +222,39 @@ def _bundle_files_base() -> List[str]:
 def _build_endpoints(ir: RequestIR) -> Tuple[List[Dict[str, Any]], List[str]]:
     assumptions: List[str] = []
 
-    selected, source_type = _select_contracts(ir)
+    selected = _select_contracts(ir)
     if not selected:
-        selected = [_default_health_contract()]
-        source_type = "builder_default"
+        if ir.product_capabilities:
+            raise ValueError(
+                "Existen capacidades funcionales, pero no hay contratos API explícitos ni propuestos."
+            )
+        selected = [(_default_health_contract(), "builder_default")]
         assumptions.append("No había contratos en RequestIR; se añadió GET /health como endpoint mínimo.")
 
     endpoints: List[Dict[str, Any]] = []
-    for c in selected:
+    has_proposed = False
+    for c, source_type in selected:
         ep, ep_assumptions = _contract_to_endpoint(c, source_type=source_type)
         endpoints.append(ep)
         assumptions.extend(ep_assumptions)
+        if source_type == "proposed":
+            has_proposed = True
 
     endpoints = _dedupe_endpoints_by_method_path(endpoints)
 
-    if source_type == "proposed":
+    if has_proposed:
         assumptions.append(
-            "Los endpoints provienen de contratos propuestos (sin evidencia literal); deben confirmarse con el usuario."
+            "Parte de los endpoints provienen de contratos propuestos sin método/ruta literales y requieren confirmación del usuario."
         )
 
     return endpoints, _dedupe_stable(assumptions)
 
 
-def _select_contracts(ir: RequestIR) -> Tuple[List[ApiContractIR], str]:
-    if ir.explicit_api_contracts:
-        return list(ir.explicit_api_contracts), "explicit"
-    if ir.proposed_api_contracts:
-        return list(ir.proposed_api_contracts), "proposed"
-    return [], "builder_default"
+def _select_contracts(ir: RequestIR) -> List[Tuple[ApiContractIR, str]]:
+    selected: List[Tuple[ApiContractIR, str]] = []
+    selected.extend((contract, "explicit") for contract in (ir.explicit_api_contracts or []))
+    selected.extend((contract, "proposed") for contract in (ir.proposed_api_contracts or []))
+    return _dedupe_selected_contracts(selected)
 
 
 def _default_health_contract() -> ApiContractIR:
@@ -448,10 +533,36 @@ def _dedupe_endpoints_by_method_path(endpoints: Sequence[Dict[str, Any]]) -> Lis
             str(ep.get("path") or "").strip(),
         )
         if k in seen:
-            out[seen[k]] = ep
+            out[seen[k]] = _merge_endpoint_dicts(out[seen[k]], ep)
         else:
             seen[k] = len(out)
             out.append(ep)
+    return out
+
+
+def _dedupe_selected_contracts(
+    selected: Sequence[Tuple[ApiContractIR, str]],
+) -> List[Tuple[ApiContractIR, str]]:
+    precedence = {"builder_default": 0, "proposed": 1, "explicit": 2}
+    out: List[Tuple[ApiContractIR, str]] = []
+    seen: Dict[Tuple[str, str], int] = {}
+
+    for contract, source_type in selected:
+        key = (str(contract.method or "").upper().strip(), str(contract.path or "").strip())
+        if key not in seen:
+            seen[key] = len(out)
+            out.append((contract, source_type))
+            continue
+
+        idx = seen[key]
+        existing_contract, existing_source = out[idx]
+        if precedence.get(source_type, -1) > precedence.get(existing_source, -1):
+            merged = _merge_contract_ir(contract, existing_contract)
+            out[idx] = (merged, source_type)
+        else:
+            merged = _merge_contract_ir(existing_contract, contract)
+            out[idx] = (merged, existing_source)
+
     return out
 
 
@@ -672,6 +783,143 @@ def _infer_path_params_from_schema_hint(schema_hint: Any) -> Dict[str, str]:
     return {"id": "string"}
 
 
+def _merge_contract_ir(preferred: ApiContractIR, fallback: ApiContractIR) -> ApiContractIR:
+    preferred_request_type = preferred.request_type
+    fallback_request_type = fallback.request_type
+    merged_request_type = preferred_request_type
+    if preferred_request_type in ("none", "", None) and fallback_request_type not in ("none", "", None):
+        merged_request_type = fallback_request_type
+
+    request_schema_hint = dict(preferred.request_schema_hint or {})
+    if not request_schema_hint and isinstance(fallback.request_schema_hint, dict):
+        request_schema_hint = dict(fallback.request_schema_hint or {})
+    else:
+        for key, value in dict(fallback.request_schema_hint or {}).items():
+            request_schema_hint.setdefault(key, value)
+
+    actions = list(preferred.actions or [])
+    seen_action_ids = {getattr(action, "id", "").strip().lower() for action in actions}
+    for action in fallback.actions or []:
+        action_id = getattr(action, "id", "").strip().lower()
+        if action_id and action_id not in seen_action_ids:
+            actions.append(action)
+            seen_action_ids.add(action_id)
+
+    errors = list(preferred.errors or [])
+    seen_errors = {
+        (getattr(error, "status_code", None), getattr(error, "code", "").strip().lower())
+        for error in errors
+    }
+    for error in fallback.errors or []:
+        key = (getattr(error, "status_code", None), getattr(error, "code", "").strip().lower())
+        if key not in seen_errors:
+            errors.append(error)
+            seen_errors.add(key)
+
+    integration_refs = _dedupe_stable(
+        list(preferred.integration_refs or []) + list(fallback.integration_refs or [])
+    )
+
+    description = str(preferred.description or "").strip() or str(fallback.description or "").strip()
+    evidence = str(preferred.evidence or "").strip() or str(fallback.evidence or "").strip()
+    assumption = str(preferred.assumption or "").strip() or str(fallback.assumption or "").strip()
+
+    response_example = preferred.response_example
+    if response_example in ({}, [], None, ""):
+        response_example = fallback.response_example
+
+    return ApiContractIR(
+        method=str(preferred.method or fallback.method).upper().strip(),
+        path=str(preferred.path or fallback.path).strip(),
+        description=description,
+        request_type=merged_request_type,
+        request_schema_hint=request_schema_hint,
+        response_example=response_example,
+        evidence=evidence,
+        assumption=assumption,
+        actions=actions,
+        errors=errors,
+        integration_refs=integration_refs,
+    )
+
+
+def _merge_endpoint_dicts(preferred: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
+    precedence = {"builder_default": 0, "proposed": 1, "explicit": 2}
+    preferred_type = str((preferred.get("source") or {}).get("type") or "")
+    fallback_type = str((fallback.get("source") or {}).get("type") or "")
+
+    if precedence.get(fallback_type, -1) > precedence.get(preferred_type, -1):
+        preferred, fallback = fallback, preferred
+        preferred_type, fallback_type = fallback_type, preferred_type
+
+    merged = dict(preferred)
+
+    pref_request = dict(preferred.get("request") or {})
+    fall_request = dict(fallback.get("request") or {})
+    if pref_request.get("type") == "none" and fall_request.get("type") not in (None, "none"):
+        pref_request["type"] = fall_request.get("type")
+    if not isinstance(pref_request.get("schema"), dict) and isinstance(fall_request.get("schema"), dict):
+        pref_request["schema"] = dict(fall_request.get("schema") or {})
+    elif isinstance(pref_request.get("schema"), dict) and isinstance(fall_request.get("schema"), dict):
+        schema = dict(pref_request.get("schema") or {})
+        for key, value in dict(fall_request.get("schema") or {}).items():
+            schema.setdefault(key, value)
+        pref_request["schema"] = schema
+    if "path_params" not in pref_request and "path_params" in fall_request:
+        pref_request["path_params"] = fall_request.get("path_params")
+    merged["request"] = pref_request
+
+    pref_response = dict(preferred.get("response") or {})
+    fall_response = dict(fallback.get("response") or {})
+    if not pref_response.get("json_example") and fall_response.get("json_example") is not None:
+        pref_response["json_example"] = fall_response.get("json_example")
+    merged["response"] = pref_response
+
+    pref_actions = list(preferred.get("actions") or [])
+    seen_actions = {str(item.get("id") or "").strip().lower() for item in pref_actions if isinstance(item, dict)}
+    for item in fallback.get("actions") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("id") or "").strip().lower()
+        if key and key not in seen_actions:
+            pref_actions.append(item)
+            seen_actions.add(key)
+    merged["actions"] = pref_actions
+
+    pref_errors = list(preferred.get("errors") or [])
+    seen_errors = {
+        (item.get("status_code"), str(item.get("code") or "").strip().lower())
+        for item in pref_errors
+        if isinstance(item, dict)
+    }
+    for item in fallback.get("errors") or []:
+        if not isinstance(item, dict):
+            continue
+        key = (item.get("status_code"), str(item.get("code") or "").strip().lower())
+        if key not in seen_errors:
+            pref_errors.append(item)
+            seen_errors.add(key)
+    merged["errors"] = pref_errors
+
+    merged["integration_refs"] = _dedupe_stable(
+        list(preferred.get("integration_refs") or []) + list(fallback.get("integration_refs") or [])
+    )
+    merged["bundle_files"] = list(dict.fromkeys(
+        list(preferred.get("bundle_files") or []) + list(fallback.get("bundle_files") or [])
+    ).keys())
+
+    pref_source = dict(preferred.get("source") or {})
+    fall_source = dict(fallback.get("source") or {})
+    if not pref_source.get("evidence") and fall_source.get("evidence"):
+        pref_source["evidence"] = fall_source.get("evidence")
+    if not pref_source.get("assumption") and fall_source.get("assumption"):
+        pref_source["assumption"] = fall_source.get("assumption")
+    pref_source["type"] = preferred_type
+    merged["source"] = pref_source
+
+    return merged
+
+
 def _default_errors_for_endpoint(*, method: str, path: str) -> List[Dict[str, Any]]:
     if "{id}" in path and method in ("GET", "PUT", "PATCH", "DELETE"):
         return [
@@ -705,19 +953,6 @@ def _dedupe_stable(items: Sequence[str]) -> List[str]:
         if not s or s in seen:
             continue
         seen.add(s)
-        out.append(s)
-    return out
-
-
-def _dedupe_stable_case_insensitive(items: Sequence[str]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for x in items:
-        s = str(x).strip()
-        key = s.lower()
-        if not s or key in seen:
-            continue
-        seen.add(key)
         out.append(s)
     return out
 

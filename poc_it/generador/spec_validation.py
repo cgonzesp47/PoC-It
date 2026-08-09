@@ -941,7 +941,7 @@ def _validate_integrations(spec: Dict[str, Any]) -> List[SpecValidationError]:
 
     e: List[SpecValidationError] = []
     seen_ids: Set[str] = set()
-    technology_names = _technology_signal_names(spec)
+    technology_ids = _technology_signal_ids(spec)
     configuration_keys = _configuration_keys(spec)
 
     for i, item in enumerate(integrations):
@@ -1029,15 +1029,16 @@ def _validate_integrations(spec: Dict[str, Any]) -> List[SpecValidationError]:
                 )
 
         for j, ref in enumerate(item.get("technology_refs") or []):
-            if not isinstance(ref, str) or not ref.strip():
+            normalized_ref = str(ref or "").strip()
+            if not normalized_ref:
                 continue
-            if ref.strip().lower() not in technology_names:
+            if normalized_ref not in technology_ids:
                 e.append(
                     SpecValidationError(
                         code="SPEC_INTEGRATION_REF_UNKNOWN",
                         severity="fatal",
                         path=f"$.integrations[{i}].technology_refs[{j}]",
-                        message=f"technology_ref inexistente: {ref}",
+                        message=f"technology_ref inexistente: {normalized_ref}",
                     )
                 )
 
@@ -1802,7 +1803,7 @@ def _integration_ids(spec: Dict[str, Any]) -> Set[str]:
     return out
 
 
-def _technology_signal_names(spec: Dict[str, Any]) -> Set[str]:
+def _technology_signal_ids(spec: Dict[str, Any]) -> Set[str]:
     items = spec.get("technology_signals")
     if not isinstance(items, list):
         return set()
@@ -1810,9 +1811,9 @@ def _technology_signal_names(spec: Dict[str, Any]) -> Set[str]:
     for item in items:
         if not isinstance(item, dict):
             continue
-        name = str(item.get("name") or "").strip()
-        if name:
-            out.add(name.lower())
+        technology_id = str(item.get("id") or "").strip()
+        if technology_id:
+            out.add(technology_id)
     return out
 
 

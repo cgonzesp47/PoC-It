@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
+from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, List, Set, Tuple
+
+from poc_it.materializacion.codegen.incomplete_code import detect_incomplete_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +79,35 @@ def seleccionar_error_bloqueante(errores: List[str]) -> Tuple[str, str] | None:
     for p, msgs in by_file.items():
         return p, msgs[0]
     return None
+
+
+_HARDCODED_CREDENTIAL_PATTERNS = (
+    "private_key",
+    "client_secret",
+    "-----begin private key-----",
+    '"type": "service_account"',
+)
+
+def _contains_sensitive_literal_assignment(src: str) -> bool:
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        lowered_src = src.lower()
+        return any(pattern in lowered_src for pattern in _HARDCODED_CREDENTIAL_PATTERNS)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        value = node.value
+        if isinstance(value, ast.Dict):
+            literal_blob = ast.unparse(value).lower()
+            if any(pattern in literal_blob for pattern in _HARDCODED_CREDENTIAL_PATTERNS):
+                return True
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            lowered_value = value.value.lower()
+            if any(pattern in lowered_value for pattern in _HARDCODED_CREDENTIAL_PATTERNS):
+                return True
+    return False
 
 
 def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> GuardrailsResult:
@@ -196,6 +229,39 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
                     "requirements.txt incluye python-multipart pero el SPEC no declara endpoints multipart."
                 )
                 reparar.add("requirements.txt")
+
+    # --- 2.5) Placeholder y credenciales hardcodeadas ---
+    for p, src in by_path.items():
+        if not p.endswith(".py"):
+            continue
+        if detect_incomplete_code(p, src):
+            errores.append(f"{p}: CODEGEN_PLACEHOLDER_CONTENT")
+            reparar.add(p)
+        if _contains_sensitive_literal_assignment(src):
+            errores.append(f"{p}: HARDCODED_CREDENTIALS_LITERAL")
+            reparar.add(p)
+
+    # --- 2.6) Duplicación de rutas ---
+    router_src = by_path.get("app/api/router.py", "")
+    if router_src:
+        prefix_matches = {
+            ref: prefix
+            for ref, prefix in re.findall(
+                r"include_router\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*,\s*prefix\s*=\s*[\"']([^\"']+)[\"']",
+                router_src,
+                flags=re.MULTILINE,
+            )
+        }
+        for endpoint_file in expected_ep_files:
+            src = by_path.get(endpoint_file, "")
+            if not src:
+                continue
+            router_var = Path(endpoint_file).stem + "_router"
+            for route_path in re.findall(r"@router\.(?:get|post|put|patch|delete)\(\s*[\"']([^\"']+)[\"']", src):
+                prefix = prefix_matches.get(router_var)
+                if prefix and prefix.rstrip("/") == route_path.rstrip("/"):
+                    errores.append(f"app/api/router.py: ROUTE_PREFIX_DUPLICATION")
+                    reparar.add("app/api/router.py")
 
     # --- 3) Logging obligatorio: except Exception -> logger.exception ---
     # Punto medio: WARNING por defecto; BLOCK solo en endpoints/servicios donde la trazabilidad es crítica.
