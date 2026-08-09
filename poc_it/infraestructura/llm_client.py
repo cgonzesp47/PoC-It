@@ -101,6 +101,26 @@ class LLMError(Exception):
     """Error genérico de llamadas LLM."""
 
 
+class LLMTruncatedResponseError(LLMError):
+    def __init__(
+        self,
+        *,
+        provider: str,
+        model: Optional[str],
+        finish_reason: str,
+        partial_content: str,
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self.finish_reason = finish_reason
+        self.partial_content = partial_content
+        super().__init__(
+            "Respuesta LLM truncada "
+            f"(provider={provider}, model={model}, "
+            f"finish_reason={finish_reason}, chars={len(partial_content)})"
+        )
+
+
 # ==========================================================
 # MÉTRICAS DE EJECUCIÓN (observabilidad básica)
 # ==========================================================
@@ -122,16 +142,36 @@ LLM_METRICS = {
 # ==========================================================
 
 # Política por fase usando ALIAS del proxy (ver litellm_config.yaml)
+CODEGEN_ALIAS = "code-gen"
+
 LLM_POLICY: Dict[str, str] = {
     "normalizacion_contexto": "ctx-json",
     "clasificacion": "cls-json",
-    "generacion_codigo": "code-gen",
+    "generacion_codigo": CODEGEN_ALIAS,
     "documentacion": "docs",
     "estimacion": "estimate",
 }
 
 # Si no hay hint, este alias suele ser un buen “generalista” barato
 FALLBACK_PROVIDER = "docs"
+
+PHASE_ALIAS_FALLBACKS: Dict[str, List[str]] = {
+    "normalizacion_contexto": ["ctx-json"],
+    "clasificacion": ["cls-json"],
+    "documentacion": ["docs"],
+    "estimacion": ["estimate"],
+    "generacion_codigo": [CODEGEN_ALIAS],
+}
+
+DIRECT_CHAIN_BY_ALIAS: Dict[str, List[str]] = {
+    "ctx-json": ["mistral", "groq", "gemini", "openrouter"],
+    "cls-json": ["mistral", "groq", "gemini", "openrouter"],
+    CODEGEN_ALIAS: ["mistral", "cerebras"],
+    "docs": ["openrouter", "gemini", "groq", "cerebras", "mistral"],
+    "estimate": ["cerebras", "gemini", "groq", "openrouter"],
+}
+
+DEFAULT_DIRECT_CHAIN = ["groq", "gemini", "mistral", "cerebras", "openrouter", "ollama"]
 
 # ==========================================================
 # CIRCUIT BREAKER SIMPLE POR PROVEEDOR
@@ -159,10 +199,50 @@ SESSION_PROVIDER_DISABLED: Dict[str, bool] = {}
 POCIT_INSECURE_SSL = os.getenv("POCIT_INSECURE_SSL", "0").strip() in ("1", "true", "True", "yes", "YES")
 
 
+_TRUNCATED_FINISH_REASONS = {
+    "length",
+    "max_tokens",
+}
+
+
 def _requests_verify() -> bool:
     # Solo para diagnóstico / entornos controlados.
     # NO recomendable para producción: desactiva la verificación TLS.
     return not POCIT_INSECURE_SSL
+
+
+def _extract_openai_compatible_content(
+    data: Dict[str, Any],
+    *,
+    provider: str,
+    model: Optional[str] = None,
+) -> str:
+    try:
+        choice = data["choices"][0]
+        message = choice["message"]
+        content = message["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise LLMError(
+            f"Respuesta inesperada de {provider}: faltan choices/message/content"
+        ) from exc
+
+    finish_reason = str(choice.get("finish_reason") or "").strip().lower()
+
+    if content is None or not isinstance(content, str) or not content.strip():
+        raise LLMError(
+            f"{provider} devolvió contenido vacío"
+            + (f" (model={model})" if model else "")
+        )
+
+    if finish_reason in _TRUNCATED_FINISH_REASONS:
+        raise LLMTruncatedResponseError(
+            provider=provider,
+            model=model,
+            finish_reason=finish_reason,
+            partial_content=content,
+        )
+
+    return content
 
 
 def _call_groq(
@@ -211,10 +291,98 @@ def _call_groq(
         raise LLMError("Groq failed after retries (rate limit).")
 
     data = resp.json()
+    return _extract_openai_compatible_content(
+        data,
+        provider="groq",
+        model=payload["model"],
+    )
+
+
+def _extract_gemini_content(
+    data: Dict[str, Any],
+    *,
+    model: Optional[str] = None,
+) -> str:
     try:
-        return data["choices"][0]["message"]["content"]
-    except Exception as exc:  # pragma: no cover - fallback defensivo
-        raise LLMError(f"Respuesta Groq inesperada: {data}") from exc
+        candidate = data["candidates"][0]
+        parts = candidate.get("content", {}).get("parts", [])
+        text = "".join(
+            str(part.get("text") or "")
+            for part in parts
+            if isinstance(part, dict)
+        )
+    except (IndexError, TypeError, AttributeError, KeyError) as exc:
+        raise LLMError("Respuesta Gemini inesperada") from exc
+
+    finish_reason = str(
+        candidate.get("finishReason")
+        or candidate.get("finish_reason")
+        or ""
+    ).strip().upper()
+
+    if not text.strip():
+        raise LLMError("Gemini devolvió contenido vacío")
+
+    if finish_reason in {"MAX_TOKENS", "LENGTH"}:
+        raise LLMTruncatedResponseError(
+            provider="gemini",
+            model=model,
+            finish_reason=finish_reason,
+            partial_content=text,
+        )
+
+    return text
+
+
+def _resolve_policy_phase(fase: Optional[str]) -> Optional[str]:
+    if not fase:
+        return None
+
+    normalized = fase.strip()
+    if normalized.startswith("generacion_codigo"):
+        return "generacion_codigo"
+    return normalized
+
+
+def _resolve_effective_alias(
+    *,
+    fase: Optional[str],
+    provider_hint: Optional[str],
+) -> Optional[str]:
+    if provider_hint and provider_hint.strip():
+        return provider_hint.strip()
+
+    resolved_phase = _resolve_policy_phase(fase)
+    if not resolved_phase:
+        return None
+
+    return LLM_POLICY.get(resolved_phase)
+
+
+def _dedupe_stable(values: List[str]) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _resolve_direct_chain(
+    *,
+    fase: Optional[str],
+    provider_hint: Optional[str],
+) -> List[str]:
+    effective_alias = _resolve_effective_alias(
+        fase=fase,
+        provider_hint=provider_hint,
+    )
+    return DIRECT_CHAIN_BY_ALIAS.get(
+        effective_alias or "",
+        DEFAULT_DIRECT_CHAIN,
+    )
 
 
 def _call_gemini(
@@ -252,10 +420,10 @@ def _call_gemini(
         raise LLMError(f"Error Gemini {resp.status_code}: {resp.text}")
 
     data = resp.json()
-    try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as exc:
-        raise LLMError(f"Respuesta Gemini inesperada: {data}") from exc
+    return _extract_gemini_content(
+        data,
+        model=model or GEMINI_MODEL,
+    )
 
 
 def _call_mistral(
@@ -290,10 +458,11 @@ def _call_mistral(
         raise LLMError(f"Error Mistral {resp.status_code}: {resp.text}")
 
     data = resp.json()
-    try:
-        return data["choices"][0]["message"]["content"]
-    except Exception as exc:
-        raise LLMError(f"Respuesta Mistral inesperada: {data}") from exc
+    return _extract_openai_compatible_content(
+        data,
+        provider="mistral",
+        model=payload["model"],
+    )
 
 
 def _call_openai(*args: Any, **kwargs: Any) -> str:
@@ -332,7 +501,11 @@ def _call_cerebras(
         raise LLMError(f"Error Cerebras {resp.status_code}: {resp.text}")
 
     data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    return _extract_openai_compatible_content(
+        data,
+        provider="cerebras",
+        model=payload["model"],
+    )
 
 
 def _call_openrouter(
@@ -383,10 +556,11 @@ def _call_openrouter(
         raise LLMError("OpenRouter failed after retries (rate limit).")
 
     data = resp.json()
-    try:
-        return data["choices"][0]["message"]["content"]
-    except Exception as exc:  # pragma: no cover - fallback defensivo
-        raise LLMError(f"Respuesta OpenRouter inesperada: {data}") from exc
+    return _extract_openai_compatible_content(
+        data,
+        provider="openrouter",
+        model=payload["model"],
+    )
 
 
 def _call_litellm_proxy(
@@ -487,18 +661,11 @@ def _call_litellm_proxy(
             raise LLMError(f"Error LiteLLM Proxy {resp.status_code}: {body}")
 
         data = resp.json()
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except Exception as exc:
-            raise LLMError(f"Respuesta LiteLLM Proxy inesperada: {data}") from exc
-
-        # Si el proxy responde 200 pero el content viene vacío/None, lo tratamos como fallo
-        # para permitir fallback (suele pasar si el upstream devolvió respuesta sin texto).
-        if content is None or (isinstance(content, str) and not content.strip()):
-            alias = model or FALLBACK_PROVIDER
-            raise LLMError(f"LiteLLM Proxy empty content (alias={alias})")
-
-        return content
+        return _extract_openai_compatible_content(
+            data,
+            provider="litellm_proxy",
+            model=payload["model"],
+        )
 
     raise LLMError("LiteLLM Proxy failed after retries (rate limit).")
 
@@ -565,63 +732,52 @@ def solicitarRespuestaTextual(
     - Si falla y hay API key de OpenRouter, usa OpenRouter como fallback.
     """
 
-    # Si el caller nos pasa una fase, resolvemos el alias del proxy por política multi-modelo.
-    # Esto evita que todo caiga en el alias FALLBACK_PROVIDER="docs".
-    if fase and not provider_hint:
-        provider_hint = LLM_POLICY.get(fase)
+    resolved_phase = _resolve_policy_phase(fase)
+    effective_alias = _resolve_effective_alias(
+        fase=fase,
+        provider_hint=provider_hint,
+    )
 
-    # ----------------------------------------------------------
-    # Fallbacks por fase (punto medio):
-    #
-    # Queremos que el PROXY haga el routing/fallback principal (por model group alias),
-    # y mantener un fallback manual a proveedores directos solo como último recurso.
-    #
-    # Por eso aquí SOLO probamos el alias de GRUPO (ctx-json/cls-json/docs/estimate/code-gen)
-    # dentro del proxy, dejando que `router_settings.fallbacks` del proxy elija
-    # docs-gemini/docs-cerebras/docs-groq, etc.
-    #
-    # Esto mejora trazabilidad (un solo alias por fase) y evita solapar el fallback del proxy
-    # con el fallback manual del cliente.
-    # ----------------------------------------------------------
-    PHASE_ALIAS_FALLBACKS: Dict[str, List[str]] = {
-        "normalizacion_contexto": ["ctx-json"],
-        "clasificacion": ["cls-json"],
-        "documentacion": ["docs"],
-        "estimacion": ["estimate"],
-        "generacion_codigo": ["code-gen"],
-    }
-
-    # Si estamos usando el proxy, construimos una lista de aliases a intentar
-    # en el propio proxy (reintentos "horizontales" por alias).
     proxy_aliases: List[Optional[str]] = []
-    if fase:
-        candidates = PHASE_ALIAS_FALLBACKS.get(fase, [])
-        if provider_hint:
-            # Prioriza el alias pedido (si es un alias)
-            if provider_hint in candidates:
-                proxy_aliases = [provider_hint] + [c for c in candidates if c != provider_hint]
+    if resolved_phase:
+        candidates = PHASE_ALIAS_FALLBACKS.get(resolved_phase, [])
+        if effective_alias:
+            if effective_alias in candidates:
+                proxy_aliases = [effective_alias] + [c for c in candidates if c != effective_alias]
             else:
-                proxy_aliases = [provider_hint] + candidates
+                proxy_aliases = [effective_alias] + candidates
         else:
             proxy_aliases = candidates
     else:
-        proxy_aliases = [provider_hint] if provider_hint else []
+        proxy_aliases = [effective_alias] if effective_alias else []
 
-    # Si no se pasan fase/candidates pero se pasa provider_hint con un alias "principal",
-    # inferimos fase para aplicar el set completo de fallbacks de ese grupo.
-    if not fase and provider_hint:
+    if not resolved_phase and effective_alias:
         inferred = {
             "docs": "documentacion",
             "ctx-json": "normalizacion_contexto",
             "cls-json": "clasificacion",
             "estimate": "estimacion",
-            "code-gen": "generacion_codigo",
-        }.get(provider_hint)
+            CODEGEN_ALIAS: "generacion_codigo",
+        }.get(effective_alias)
         if inferred:
+            resolved_phase = inferred
             candidates = PHASE_ALIAS_FALLBACKS.get(inferred, [])
             if candidates:
-                proxy_aliases = [provider_hint] + [c for c in candidates if c != provider_hint]
-                fase = inferred
+                proxy_aliases = [effective_alias] + [c for c in candidates if c != effective_alias]
+
+    direct_chain = _resolve_direct_chain(
+        fase=fase,
+        provider_hint=provider_hint,
+    )
+
+    logger.debug(
+        "[LLM-ROUTING] fase=%s resolved_phase=%s provider_hint=%s effective_alias=%s direct_chain=%s",
+        fase,
+        resolved_phase,
+        provider_hint,
+        effective_alias,
+        direct_chain,
+    )
 
     messages = _build_messages(prompt, system)
 
@@ -637,44 +793,16 @@ def solicitarRespuestaTextual(
     #   activamos un fallback manual de ÚLTIMO RECURSO a proveedores directos.
     default_chain = ["litellm_proxy"]
 
-    # En modo directo replicamos 1:1 el orden del proxy (litellm_config.yaml):
-    # - Alias primario por fase: LLM_POLICY (ctx-json/cls-json/code-gen/docs/estimate)
-    # - Fallbacks por alias: router_settings.fallbacks
-    #
-    # Traducción alias -> provider directo:
-    # - *-groq => groq
-    # - *-gemini => gemini
-    # - *-openrouter => openrouter
-    # - *-mistral => mistral
-    # - *-cerebras / code-gen-fallback => cerebras
-    DIRECT_CHAIN_BY_ALIAS: Dict[str, List[str]] = {
-        # ctx-json primary: mistral/codestral
-        "ctx-json": ["mistral", "groq", "gemini", "openrouter"],
-        # cls-json primary: mistral/codestral
-        "cls-json": ["mistral", "groq", "gemini", "openrouter"],
-        # code-gen primary: mistral/codestral; fallback: cerebras
-        "code-gen": ["mistral", "cerebras"],
-        # docs primary: openrouter; fallbacks listados en YAML (en el orden configurado allí)
-        "docs": ["openrouter", "gemini", "groq", "cerebras", "mistral"],
-        # estimate primary: cerebras; fallbacks listados en YAML
-        "estimate": ["cerebras", "gemini", "groq", "openrouter"],
-    }
-
-    # Cadena directa por defecto si no hay fase/alias resoluble.
-    DEFAULT_DIRECT_CHAIN = ["groq", "gemini", "mistral", "cerebras", "openrouter", "ollama"]
-
     # IMPORTANTE:
     # - Fallback manual SOLO tras fallo del proxy (salvo LLM_DIRECT_ONLY).
     # - Si quieres desactivar completamente llamadas directas, exporta LITELLM_PROXY_ONLY=1.
     # - Si quieres saltarte el proxy y usar SOLO llamadas directas, exporta LLM_DIRECT_ONLY=1.
     if LLM_DIRECT_ONLY:
-        # Resolver alias del “proxy” para esta fase (misma policy), pero ejecutando directo.
-        alias = provider_hint or (LLM_POLICY.get(fase) if fase else None) or None
-        providers = DIRECT_CHAIN_BY_ALIAS.get(alias or "", DEFAULT_DIRECT_CHAIN)
+        providers = _dedupe_stable(direct_chain)
     elif LITELLM_PROXY_ONLY:
         providers = default_chain
     else:
-        providers = default_chain + DEFAULT_DIRECT_CHAIN
+        providers = _dedupe_stable(default_chain + direct_chain)
 
     LLM_METRICS["total_calls"] += 1
 
@@ -712,7 +840,7 @@ def solicitarRespuestaTextual(
                 # no llega a ejecutar fallbacks antes de que el cliente corte.
                 #
                 # NOTA: sólo aplica a documentación, porque es donde más se observan timeouts.
-                if fase == "documentacion":
+                if resolved_phase == "documentacion":
                     extra_doc_aliases = ["docs-gemini", "docs-cerebras", "docs-groq"]
                     for a in extra_doc_aliases:
                         if a not in aliases_to_try:
