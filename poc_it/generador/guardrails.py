@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
+from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, List, Set, Tuple
+
+from poc_it.materializacion.codegen.incomplete_code import detect_incomplete_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,18 +40,36 @@ def seleccionar_error_bloqueante(errores: List[str]) -> Tuple[str, str] | None:
     """
     Selecciona un único error "prioritario" para reparación atómica.
     Devuelve (path, mensaje) si puede; si no, None.
+
+    Arquitectura preferida (nuevo estándar):
+    - app/core/config.py
+    - app/api/endpoints/*.py
+    - app/api/router.py
+    - app/main.py
+
+    Compat opcional (legacy):
+    - app/config/*
+    - app/endpoints/*
     """
     by_file = extraer_errores_por_archivo(errores)
 
-    # Heurística simple y estable:
-    # - priorizar archivos de config/DB (suelen disparar security/env)
-    # - luego endpoints/services
+    preferred_exact = (
+        "app/core/config.py",
+        "app/api/router.py",
+        "app/main.py",
+    )
+    for p0 in preferred_exact:
+        if p0 in by_file and by_file[p0]:
+            return p0, by_file[p0][0]
+
     preferred_prefixes = (
-        "app/config/",
-        "app/db",
-        "app/settings",
-        "app/endpoints/",
+        "app/core/",
+        "app/api/endpoints/",
+        "app/api/",
         "app/services/",
+        # legacy (no preferente)
+        "app/config/",
+        "app/endpoints/",
     )
     for pref in preferred_prefixes:
         for p, msgs in by_file.items():
@@ -57,6 +79,35 @@ def seleccionar_error_bloqueante(errores: List[str]) -> Tuple[str, str] | None:
     for p, msgs in by_file.items():
         return p, msgs[0]
     return None
+
+
+_HARDCODED_CREDENTIAL_PATTERNS = (
+    "private_key",
+    "client_secret",
+    "-----begin private key-----",
+    '"type": "service_account"',
+)
+
+def _contains_sensitive_literal_assignment(src: str) -> bool:
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        lowered_src = src.lower()
+        return any(pattern in lowered_src for pattern in _HARDCODED_CREDENTIAL_PATTERNS)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        value = node.value
+        if isinstance(value, ast.Dict):
+            literal_blob = ast.unparse(value).lower()
+            if any(pattern in literal_blob for pattern in _HARDCODED_CREDENTIAL_PATTERNS):
+                return True
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            lowered_value = value.value.lower()
+            if any(pattern in lowered_value for pattern in _HARDCODED_CREDENTIAL_PATTERNS):
+                return True
+    return False
 
 
 def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> GuardrailsResult:
@@ -116,10 +167,17 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
                 if isinstance(resp, dict) and "json_example" in resp:
                     response_example_by_path[path] = resp.get("json_example")
 
-    # --- 1) main.py: include_router debe incluir SOLO routers de endpoints listados ---
+    # --- 1) main.py: imports de endpoints deben corresponder al SPEC ---
     main_src = by_path.get("app/main.py", "")
     if main_src:
-        # Heurística: si main.py importa app.endpoints.X y X.py no está en spec -> error
+        # Preferido: app.api.endpoints.<name>
+        for m in re.findall(r"from\s+app\.api\.endpoints\.([a-zA-Z0-9_]+)\s+import\s+router", main_src):
+            f = f"app/api/endpoints/{m}.py"
+            if expected_ep_files and f not in expected_ep_files:
+                errores.append(f"Endpoint extra no listado en SPEC (importado en main.py): {f}")
+                reparar.add("app/main.py")
+
+        # Compat legacy: app.endpoints.<name>
         for m in re.findall(
             r"from\s+app\.endpoints\.([a-zA-Z0-9_]+)\s+import\s+router",
             main_src,
@@ -145,7 +203,10 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
 
         if any_json_endpoint:
             for p, src in by_path.items():
-                if not p.startswith("app/endpoints/") or not p.endswith(".py"):
+                if not p.endswith(".py"):
+                    continue
+                is_endpoint_file = p.startswith("app/api/endpoints/") or p.startswith("app/endpoints/")
+                if not is_endpoint_file:
                     continue
                 uses_uploadfile = "UploadFile" in src or "File(" in src
                 if uses_uploadfile and not any_multipart_endpoint:
@@ -169,6 +230,39 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
                 )
                 reparar.add("requirements.txt")
 
+    # --- 2.5) Placeholder y credenciales hardcodeadas ---
+    for p, src in by_path.items():
+        if not p.endswith(".py"):
+            continue
+        if detect_incomplete_code(p, src):
+            errores.append(f"{p}: CODEGEN_PLACEHOLDER_CONTENT")
+            reparar.add(p)
+        if _contains_sensitive_literal_assignment(src):
+            errores.append(f"{p}: HARDCODED_CREDENTIALS_LITERAL")
+            reparar.add(p)
+
+    # --- 2.6) Duplicación de rutas ---
+    router_src = by_path.get("app/api/router.py", "")
+    if router_src:
+        prefix_matches = {
+            ref: prefix
+            for ref, prefix in re.findall(
+                r"include_router\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*,\s*prefix\s*=\s*[\"']([^\"']+)[\"']",
+                router_src,
+                flags=re.MULTILINE,
+            )
+        }
+        for endpoint_file in expected_ep_files:
+            src = by_path.get(endpoint_file, "")
+            if not src:
+                continue
+            router_var = Path(endpoint_file).stem + "_router"
+            for route_path in re.findall(r"@router\.(?:get|post|put|patch|delete)\(\s*[\"']([^\"']+)[\"']", src):
+                prefix = prefix_matches.get(router_var)
+                if prefix and prefix.rstrip("/") == route_path.rstrip("/"):
+                    errores.append(f"app/api/router.py: ROUTE_PREFIX_DUPLICATION")
+                    reparar.add("app/api/router.py")
+
     # --- 3) Logging obligatorio: except Exception -> logger.exception ---
     # Punto medio: WARNING por defecto; BLOCK solo en endpoints/servicios donde la trazabilidad es crítica.
     for p, src in by_path.items():
@@ -176,7 +270,7 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
             continue
         if "except Exception" in src and "logger.exception" not in src:
             msg = f"Falta logging obligatorio (logger.exception) en: {p}"
-            if p.startswith(("app/endpoints/", "app/services/")):
+            if p.startswith(("app/api/endpoints/", "app/endpoints/", "app/services/")):
                 errores.append(msg)
                 reparar.add(p)
             else:
@@ -193,7 +287,9 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
         expected_keys = [str(k) for k in json_example.keys()]
 
         for file_path, source_code in by_path.items():
-            if not file_path.startswith("app/endpoints/") or not file_path.endswith(".py"):
+            if not file_path.endswith(".py"):
+                continue
+            if not (file_path.startswith("app/api/endpoints/") or file_path.startswith("app/endpoints/")):
                 continue
             if path not in source_code or "@router" not in source_code:
                 continue

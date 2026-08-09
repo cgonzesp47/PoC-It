@@ -17,7 +17,10 @@ Diseñado específicamente para LLM local 7B.
 from __future__ import annotations
 
 from poc_it.analisis.clasificador import clasificar_viabilidad
-from poc_it.analisis.normalizador_contexto import normalizar_plantilla
+from poc_it.analisis.normalizador_contexto import (
+    normalizar_plantilla,
+    prepare_contexto_normalizado_payload,
+)
 from poc_it.modulos.arquitectura import generar_arquitectura
 from poc_it.modulos.fases import FaseProyecto, detectar_fase
 from poc_it.modulos.models import (
@@ -60,7 +63,10 @@ async def analizar_viabilidad(datos: PlantillaUsuario) -> ResultadoViabilidad:
     context = ProjectContext(plantilla=datos)
 
     contexto_dict = normalizar_plantilla(datos)
-    context.contexto_normalizado = ContextoNormalizado(**contexto_dict)
+    contexto_payload = prepare_contexto_normalizado_payload(
+        contexto_dict
+    )
+    context.contexto_normalizado = ContextoNormalizado(**contexto_payload)
 
     t_clasificacion_inicio = time.perf_counter()
     context = clasificar_viabilidad(context)

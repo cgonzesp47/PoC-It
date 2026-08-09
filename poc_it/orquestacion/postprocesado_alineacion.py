@@ -11,7 +11,7 @@ from typing import Any, Dict
 
 from poc_it.materializacion.materializador_archivos import materializar_proyecto
 from poc_it.orquestacion.pytest_fixers import apply_first_matching_fixer
-from poc_it.orquestacion.tests_sanitizer import sanitize_tests
+from poc_it.orquestacion.tests_sanitizer import sanitize_generated_tests
 from poc_it.materializacion.postprocesador_alineacion import AlignmentIssue, postprocesar_alineacion_llm
 from poc_it.runtime.runtime_contracts import load_runtime_contracts_from_structure
 
@@ -243,16 +243,19 @@ def postprocesar_alineacion_por_pytest(
                                 [os.path.join(project_dir, p.replace("/", os.sep)) for p in fx.patched_files.keys()]
                             )
 
-                            sr = sanitize_tests(estructura=estructura)
-                            if sr.patched_files:
+                            sanitized = sanitize_generated_tests(estructura)
+                            if sanitized != estructura:
+                                patched_files = {
+                                    path: content for path, content in sanitized.items() if estructura.get(path) != content
+                                }
                                 materializar_proyecto(
                                     nombre_proyecto=nombre_proyecto,
-                                    estructura=sr.patched_files,
+                                    estructura=patched_files,
                                     limpiar_directorio=False,
                                 )
-                                estructura.update(sr.patched_files)
+                                estructura.update(patched_files)
                                 archivos_creados.extend(
-                                    [os.path.join(project_dir, p.replace("/", os.sep)) for p in sr.patched_files.keys()]
+                                    [os.path.join(project_dir, p.replace("/", os.sep)) for p in patched_files.keys()]
                                 )
 
                             try:
@@ -413,16 +416,19 @@ def postprocesar_alineacion_por_pytest(
             )
 
             # Sanitizar tests tras patch del LLM (si aplica).
-            sr = sanitize_tests(estructura=estructura)
-            if sr.patched_files:
+            sanitized = sanitize_generated_tests(estructura)
+            if sanitized != estructura:
+                patched_files = {
+                    path: content for path, content in sanitized.items() if estructura.get(path) != content
+                }
                 materializar_proyecto(
                     nombre_proyecto=nombre_proyecto,
-                    estructura=sr.patched_files,
+                    estructura=patched_files,
                     limpiar_directorio=False,
                 )
-                estructura.update(sr.patched_files)
+                estructura.update(patched_files)
                 archivos_creados.extend(
-                    [os.path.join(project_dir, p.replace("/", os.sep)) for p in sr.patched_files.keys()]
+                    [os.path.join(project_dir, p.replace("/", os.sep)) for p in patched_files.keys()]
                 )
 
             # Compile gate
