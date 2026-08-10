@@ -506,6 +506,8 @@ def _generar_desde_spec_validado(
         contexto_normalizado,
         intentos=intentos,
     )
+    _dump_debug_json("compiled_restrictions.json", spec.get("restrictions", []))
+    _dump_debug_json("spec_with_compiled_restrictions.json", spec)
 
     if isinstance(files_iniciales, list) and files_iniciales:
         files_generados = [

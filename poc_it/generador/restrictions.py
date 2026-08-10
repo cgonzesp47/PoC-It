@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 import json
-from enum import Enum
 from typing import Any, List
+
+from poc_it.generador.restriction_models import (
+    RestrictionEnforcement,
+    migrate_legacy_enforcement,
+)
 
 from poc_it.generador.json_utils import extraer_json_tolerante
 from poc_it.infraestructura.llm_client import chat_completion_json
-
-
-class ConstraintEnforcement(str, Enum):
-    CODE = "code"
-    RUNTIME = "runtime"
-    EXTERNAL_PRECONDITION = "external_precondition"
-    DOCUMENTATION = "documentation"
 
 
 def sanitizar_restrictions(restrictions: List[dict]) -> List[dict]:
@@ -126,21 +123,17 @@ def sanitizar_restrictions(restrictions: List[dict]) -> List[dict]:
 
         rr["kind"] = _infer_kind(rr)
 
-        enforcement = str(rr.get("enforcement") or "").strip().lower()
-        if enforcement not in {
-            ConstraintEnforcement.CODE.value,
-            ConstraintEnforcement.RUNTIME.value,
-            ConstraintEnforcement.EXTERNAL_PRECONDITION.value,
-            ConstraintEnforcement.DOCUMENTATION.value,
-        }:
-            enforcement = ConstraintEnforcement.CODE.value
-        rr["enforcement"] = enforcement
+        enforcement = migrate_legacy_enforcement(rr)
+        rr["enforcement"] = enforcement.value
+        if str(r.get("enforcement") or "").strip():
+            rr["source_enforcement"] = str(r.get("enforcement") or "").strip()
+        rr["migration_applied"] = rr.get("source_enforcement") != rr["enforcement"]
 
         # Severidad: si no viene, inferir por tipo (kind)
         severity = str(rr.get("severity") or "").strip().upper()
         if severity not in ("BLOCK", "WARN"):
             severity = _inferir_severidad(rr)
-        if enforcement != ConstraintEnforcement.CODE.value:
+        if enforcement is not RestrictionEnforcement.TEXT:
             severity = "WARN"
         rr["severity"] = severity
 

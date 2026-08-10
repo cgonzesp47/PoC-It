@@ -170,14 +170,14 @@ async def upload_file():
     assert "CODE_FAKE_SUCCESS_RESPONSE" in _codes(issues)
 
 
-def test_endpoint_detects_route_mismatch_and_json_vs_multipart() -> None:
+def test_endpoint_detects_route_mismatch_and_request_transport_mismatch() -> None:
     file_contract = {
         "kind": "endpoint",
         "path": "app/api/endpoints/upload.py",
         "endpoint": {
             "methods": ["POST"],
             "path": "/upload",
-            "request": {"content_type": "application/json"},
+            "request": {"type": "json"},
         },
     }
     generated_file = GeneratedFile(
@@ -200,7 +200,104 @@ async def upload_file(file: UploadFile = File(...)):
     codes = _codes(issues)
 
     assert "CODE_ENDPOINT_ROUTE_MISMATCH" in codes
-    assert "CODE_ENDPOINT_REQUEST_TYPE_MISMATCH" in codes
+    assert "ENDPOINT_REQUEST_TRANSPORT_MISMATCH" in codes
+
+
+def test_endpoint_unknown_request_transport_does_not_fail() -> None:
+    file_contract = {
+        "kind": "endpoint",
+        "path": "src/custom/location/example.py",
+        "endpoint": {
+            "methods": ["POST"],
+            "path": "/upload",
+            "request": {"type": "json"},
+        },
+    }
+    generated_file = GeneratedFile(
+        path="src/custom/location/example.py",
+        content="""
+from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.post("/upload")
+async def upload_file(payload):
+    return {"done": True}
+""",
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    assert "ENDPOINT_REQUEST_TRANSPORT_MISMATCH" not in _codes(issues)
+
+
+def test_endpoint_logging_not_required_without_contract() -> None:
+    file_contract = {
+        "kind": "endpoint",
+        "path": "app/api/endpoints/sample.py",
+        "endpoint": {"methods": ["POST"], "path": "/sample"},
+    }
+    generated_file = GeneratedFile(
+        path="app/api/endpoints/sample.py",
+        content="""
+from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.post("/sample")
+async def sample():
+    try:
+        return {"ok": True}
+    except Exception:
+        raise
+""",
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    assert "CODE_ENDPOINT_LOGGING_REQUIRED" not in _codes(issues)
+
+
+def test_endpoint_logging_contract_accepts_logger_error_with_exc_info() -> None:
+    file_contract = {
+        "kind": "endpoint",
+        "path": "app/api/endpoints/sample.py",
+        "endpoint": {"methods": ["POST"], "path": "/sample"},
+        "observability_requirements": {
+            "log_unhandled_errors": True,
+        },
+    }
+    generated_file = GeneratedFile(
+        path="app/api/endpoints/sample.py",
+        content="""
+from fastapi import APIRouter
+import logging
+
+router = APIRouter()
+audit = logging.getLogger(__name__)
+
+@router.post("/sample")
+async def sample():
+    try:
+        return {"ok": True}
+    except Exception:
+        audit.error("failed", exc_info=True)
+        raise
+""",
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    assert "CODE_ENDPOINT_LOGGING_REQUIRED" not in _codes(issues)
 
 
 def test_health_endpoint_stays_isolated() -> None:
@@ -475,6 +572,77 @@ async def upload_file(name, content):
     )
 
     assert "FILE_CONTRACT_DATA_FLOW_MISMATCH" not in _codes(issues)
+
+
+def test_endpoint_response_contract_is_not_satisfied_by_string_mention() -> None:
+    file_contract = {
+        "kind": "endpoint",
+        "path": "app/api/endpoints/status.py",
+        "endpoint": {
+            "methods": ["GET"],
+            "path": "/status",
+            "response": {
+                "json_example": {
+                    "status": "ok",
+                }
+            },
+        },
+    }
+    generated_file = GeneratedFile(
+        path="app/api/endpoints/status.py",
+        content='''
+from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.get("/status")
+async def status():
+    message = "status"
+    return {"result": "ok"}
+''',
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    assert "ENDPOINT_RESPONSE_CONTRACT_MISMATCH" in _codes(issues)
+
+
+def test_endpoint_response_contract_accepts_static_matching_return() -> None:
+    file_contract = {
+        "kind": "endpoint",
+        "path": "app/api/endpoints/status.py",
+        "endpoint": {
+            "methods": ["GET"],
+            "path": "/status",
+            "response": {
+                "json_example": {
+                    "status": "ok",
+                }
+            },
+        },
+    }
+    generated_file = GeneratedFile(
+        path="app/api/endpoints/status.py",
+        content='''
+from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.get("/status")
+async def status():
+    return {"status": "ok"}
+''',
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    assert "ENDPOINT_RESPONSE_CONTRACT_MISMATCH" not in _codes(issues)
 
 
 def test_endpoint_inline_required_action_stub_is_not_flagged_as_required_interface_stub() -> None:
