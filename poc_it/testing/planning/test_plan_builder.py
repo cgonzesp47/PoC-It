@@ -355,10 +355,18 @@ def _sample_request_from_contract(*, ep: dict, openapi: Optional[dict], path: st
     if not isinstance(req_fields, list) or not req_fields:
         return None
 
+    request_field_types = ep.get("request_field_types") or {}
+    if not isinstance(request_field_types, dict):
+        request_field_types = {}
+
     out: Dict[str, Any] = {}
     for key in req_fields:
         kk = str(key).strip()
         if not kk:
+            continue
+        field_type = str(request_field_types.get(kk) or "").strip().lower()
+        if field_type:
+            out[kk] = _jsonschema_default_value({"type": field_type})
             continue
         lower_key = kk.lower()
         if lower_key in ("id", "product_id", "user_id") or lower_key.endswith("_id"):
@@ -374,6 +382,10 @@ def _sample_request_from_contract(*, ep: dict, openapi: Optional[dict], path: st
 
 def _required_response_keys(ep: dict) -> List[str]:
     keys = ep.get("response_json_required_keys") or ep.get("response_model_required_fields") or []
+    if not keys:
+        sample_response = ep.get("sample_response")
+        if isinstance(sample_response, dict):
+            keys = list(sample_response.keys())
     if not isinstance(keys, list):
         return []
     out: List[str] = []
@@ -416,15 +428,18 @@ def _build_capabilities(
 ) -> EndpointCapabilities:
     has_deps = bool(ep.get("depends_imports"))
     method = str(ep.get("method") or "").upper()
+    dependency_behaviors = ep.get("dependency_behaviors") or []
+    required_internal_calls = ep.get("required_internal_calls") or []
+    dependency_evidence = bool(dependency_behaviors) or bool(required_internal_calls)
     return EndpointCapabilities(
         startup_available=True,
         openapi_available=in_openapi,
         request_schema_complete=sample_req is not None or method in {"GET", "DELETE"},
         valid_request_generatable=sample_req is not None or method in {"GET", "DELETE"},
         invalid_request_generatable=sample_req is not None,
-        dependencies_discovered=has_deps,
+        dependencies_discovered=has_deps or dependency_evidence,
         dependencies_overrideable=overrideable,
-        dependency_protocol_known=overrideable or any(str(x).endswith(".get_db") for x in allowed),
+        dependency_protocol_known=overrideable or dependency_evidence or any(str(x).endswith(".get_db") for x in allowed),
         response_contract_known=bool(req_keys) or in_openapi,
         stateful_candidate=stateful,
     )
@@ -466,6 +481,37 @@ def _dependency_setup_from_endpoint(ep: dict) -> List[DependencyBehavior]:
                     exception_message=item.get("exception_message"),
                 )
             )
+
+    if result:
+        return result
+
+    for item in ep.get("required_internal_calls") or []:
+        if not isinstance(item, dict):
+            continue
+        dependency_fqn = str(
+            item.get("dependency_fqn")
+            or item.get("dependency")
+            or item.get("target_dependency")
+            or item.get("patch_target")
+            or ""
+        ).strip()
+        method_name = str(
+            item.get("method_name")
+            or item.get("method")
+            or item.get("target_method")
+            or item.get("call")
+            or ""
+        ).strip()
+        if not dependency_fqn or not method_name:
+            continue
+        result.append(
+            DependencyBehavior(
+                dependency_fqn=dependency_fqn,
+                method_name=method_name,
+                action="return",
+                value=item.get("return_value", {"ok": True}),
+            )
+        )
 
     return result
 
