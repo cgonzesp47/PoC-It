@@ -5,3 +5,6 @@
 
 #Cache folders
 __pycache__/
+
+# Generated PoC projects (test artifacts, not source)
+output/

@@ -211,6 +211,8 @@ def test_enriched_endpoint_prompt_contains_contract_first_sections():
     assert "ADC" in prompt
     assert "No construyas directamente clientes externos si existe un File Contract de integración relacionado." in prompt
     assert "Invoca el módulo interno asignado." in prompt
+    assert "Depends(build_client)" in prompt
+    assert "la llamada sigue siendo directa" in prompt
 
 
 def test_enriched_integration_prompt_contains_specific_rules():
@@ -237,6 +239,8 @@ def test_enriched_integration_prompt_contains_specific_rules():
     assert "No traduzcas excepciones a HTTPException." in prompt
     assert "DRIVE_FOLDER_ID" in prompt
     assert "ADC" in prompt
+    assert "función proveedora" in prompt
+    assert "reciba ese cliente como parámetro explícito" in prompt
 
 
 def test_fix_prompt_preserves_same_guarantees():
@@ -263,6 +267,120 @@ def test_fix_prompt_preserves_same_guarantees():
     assert "NotImplementedError" in prompt
 
 
+def test_fix_prompt_omits_previous_rejected_attempts_section_when_none_given():
+    prompt = build_prompt_file_contract_fix(
+        spec=_spec(),
+        file_contract=_endpoint_contract(),
+        previous_content="def broken():\n    pass\n",
+        errors=["missing required actions"],
+        related_contracts=[_integration_contract()],
+    )
+
+    assert "INTENTOS ANTERIORES RECHAZADOS" not in prompt
+
+
+def test_fix_prompt_warns_about_previous_rejected_attempts_and_their_new_errors():
+    """Regresión: cada ronda de reparación regeneraba el mismo intento fallido porque el prompt
+    solo contenía los errores ORIGINALES, sin decirle al LLM qué intentó antes y por qué se
+    rechazó. Esto le hacía repetir literalmente el mismo error (p.ej. usar `google.auth.default()`
+    sin `import google.auth`) en rondas sucesivas."""
+    prompt = build_prompt_file_contract_fix(
+        spec=_spec(),
+        file_contract=_endpoint_contract(),
+        previous_content="def broken():\n    pass\n",
+        errors=["missing required actions"],
+        related_contracts=[_integration_contract()],
+        previous_rejected_attempts=[
+            {
+                "content": "creds, _ = google.auth.default()",
+                "issues": ["Python symbol 'google' is used but not defined or imported."],
+            }
+        ],
+    )
+
+    assert "INTENTOS ANTERIORES RECHAZADOS" in prompt
+    assert "google.auth.default()" in prompt
+    assert "Python symbol 'google' is used but not defined or imported." in prompt
+
+
+def test_codegen_and_fix_prompts_warn_against_hardcoded_temp_paths() -> None:
+    """Regresión: un proyecto real generó `open(f"/tmp/{filename}", "w")` (ruta Unix
+    hardcodeada), que revienta en Windows con FileNotFoundError antes de llegar siquiera a usar
+    la integración. Ambos prompts (codegen inicial y reparación) deben indicar el uso de
+    `tempfile` en su lugar."""
+    codegen_prompt = build_prompt_file_contract(
+        spec=_spec(),
+        file_contract=_endpoint_contract(),
+        related_contracts=[],
+        descripcion_global="Servicio con fichero temporal",
+        contexto_normalizado=None,
+    )
+    fix_prompt = build_prompt_file_contract_fix(
+        spec=_spec(),
+        file_contract=_endpoint_contract(),
+        previous_content="def broken():\n    pass\n",
+        errors=["missing required actions"],
+        related_contracts=[_integration_contract()],
+    )
+
+    for prompt in (codegen_prompt, fix_prompt):
+        assert "tempfile" in prompt
+        assert "/tmp/" in prompt
+
+
+def test_codegen_and_fix_prompts_warn_against_dotted_access_without_submodule_import() -> None:
+    """Regresión: el LLM generó repetidamente (4 veces, idéntico) `google.auth.default()` sin
+    `import google.auth` (solo importaba `from google.auth.transport.requests import Request`,
+    que no deja `google` disponible como nombre), causando UNRESOLVED_PYTHON_SYMBOL. Ambos
+    prompts deben advertir de esta trampa genérica de Python (no específica de ningún SDK)."""
+    codegen_prompt = build_prompt_file_contract(
+        spec=_spec(),
+        file_contract=_endpoint_contract(),
+        related_contracts=[],
+        descripcion_global="Servicio con acceso a submódulo",
+        contexto_normalizado=None,
+    )
+    fix_prompt = build_prompt_file_contract_fix(
+        spec=_spec(),
+        file_contract=_endpoint_contract(),
+        previous_content="def broken():\n    pass\n",
+        errors=["missing required actions"],
+        related_contracts=[_integration_contract()],
+    )
+
+    for prompt in (codegen_prompt, fix_prompt):
+        assert "submódulo" in prompt
+        assert "import paquete.submodulo" in prompt
+
+
+def test_codegen_and_fix_prompts_warn_against_returning_whole_dict_as_scalar_field() -> None:
+    """Regresión: `upload_to_google_drive() -> Dict[str, str]` devolvía `{'status': 'ok'}` (sin
+    'file_id'), y el endpoint hacía `file_id = upload_to_google_drive(...)` seguido de
+    `return {"status": "success", "file_id": file_id}` — asignando el DICT COMPLETO a un campo
+    que debía ser un string. FastAPI reventaba con ResponseValidationError -> 500. Ambos prompts
+    deben advertir de este patrón (mismo día que el bug de `test_file["filename"]` vs
+    `test_file["file_path"]`: pérdida de coherencia entre funciones que el LLM escribe en la
+    misma pasada)."""
+    codegen_prompt = build_prompt_file_contract(
+        spec=_spec(),
+        file_contract=_endpoint_contract(),
+        related_contracts=[],
+        descripcion_global="Servicio que compone datos entre funciones auxiliares",
+        contexto_normalizado=None,
+    )
+    fix_prompt = build_prompt_file_contract_fix(
+        spec=_spec(),
+        file_contract=_endpoint_contract(),
+        previous_content="def broken():\n    pass\n",
+        errors=["missing required actions"],
+        related_contracts=[_integration_contract()],
+    )
+
+    for prompt in (codegen_prompt, fix_prompt):
+        assert "dict completo" in prompt
+        assert "Dict[str, str]" in prompt
+
+
 def test_codegen_prompt_includes_authentication_runtime_contract() -> None:
     prompt = build_prompt_file_contract(
         spec=_spec(),
@@ -280,6 +398,34 @@ def test_codegen_prompt_includes_authentication_runtime_contract() -> None:
     assert "Requires static credential file:" in prompt
     assert "Requires embedded secret:" in prompt
     assert "Do not introduce a new configuration field for credentials when `requires_configuration_field=false`." in prompt
+
+
+def test_codegen_prompt_forbids_placeholder_credential_arguments_and_from_file_constructors() -> None:
+    """Regresión: un proyecto real generó `Credentials.from_service_account_file(None, ...)`
+    (una llamada "from file" con un placeholder `None`) pese a `discovery=ambient` y
+    `requires_static_credential_file=false`. El prompt debe prohibir explícitamente ambos
+    patrones, de forma genérica (sin nombrar ningún SDK concreto)."""
+    prompt = build_prompt_file_contract(
+        spec=_spec(),
+        file_contract=_integration_contract(),
+        related_contracts=[],
+        descripcion_global="Runtime-auth integration",
+        contexto_normalizado=None,
+    )
+
+    normalized_prompt = " ".join(prompt.split())
+
+    assert "None" in prompt
+    assert "placeholder" in prompt.lower()
+    assert "from file" in normalized_prompt.lower() or "from path" in normalized_prompt.lower()
+    assert "ambient-credential entry point" in normalized_prompt.lower()
+
+    # Genérico: la regla en sí (no el resto del prompt, que sí incluye datos de ejemplo de la
+    # fixture) no debe mencionar ningún SDK/proveedor concreto.
+    rule_start = normalized_prompt.lower().index("never pass `none`")
+    rule_text = normalized_prompt.lower()[rule_start : rule_start + 600]
+    for forbidden in ("google", "aws", "azure", "boto3"):
+        assert forbidden not in rule_text
 
 
 def test_fix_prompt_contains_invalid_field_allowed_fields_and_runtime_contract() -> None:

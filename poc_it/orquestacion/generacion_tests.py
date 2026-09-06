@@ -117,6 +117,7 @@ def generar_tests_unitarios(
             estructura_destino=estructura,
             archivos_creados=archivos_creados,
             resultado=resultado,
+            runtime_contracts=runtime_contracts,
         )
     except Exception as exc:
         logger.info("[TESTS] Error generando/materializando tests via TestGenerationService: %s", exc)

@@ -7,44 +7,47 @@ import sys
 from pathlib import Path
 from typing import Final
 
+from poc_it.runtime.poc_runtime_environment import prepare_poc_runtime_environment
+
 # IMPORTANTE:
 # No podemos depender del intérprete que ejecuta PoC-it, porque el proyecto generado debe
 # verificarse en un entorno hermético (otra máquina / runner limpio).
 #
 # Política:
-# - Si existe un venv del proyecto generado en `.poc_it/venv`, usamos SU python.
-# - Si no existe, hacemos fallback a sys.executable (comportamiento previo).
+# - `python_executable` debe venir del entorno aislado de la PoC (`.poc_it/venv`), resuelto por
+#   `prepare_poc_runtime_environment` (poc_it.runtime.poc_runtime_environment), NUNCA de
+#   `sys.executable`. Si un caller no lo pasa explícitamente, lo resolvemos aquí como fallback
+#   best-effort para no romper compatibilidad, pero el camino recomendado es que el orquestador
+#   prepare el entorno UNA VEZ y lo pase explícitamente a todas las fases runtime/tests.
 PYTHON_EXECUTABLE: Final[str] = sys.executable
 
 
 def _venv_python(project_dir: str) -> str:
-    """Devuelve el python a usar para verificar el proyecto generado.
+    """Resuelve el python a usar para verificar el proyecto generado (fallback best-effort).
 
-    Preferimos el venv local del proyecto (si existe) para asegurar que están instaladas
-    las dependencias declaradas en requirements.txt, evitando falsos negativos como:
-    `ModuleNotFoundError: No module named 'fastapi'`.
+    Preferido: los callers deben pasar `python_executable` explícitamente (obtenido de
+    `prepare_poc_runtime_environment`). Esta función solo cubre el caso en que no se pasó nada.
     """
     try:
-        venv_py = Path(project_dir) / ".poc_it" / "venv" / "Scripts" / "python.exe"  # Windows
-        if venv_py.exists():
-            return str(venv_py)
-        venv_py2 = Path(project_dir) / ".poc_it" / "venv" / "bin" / "python"  # Linux/macOS
-        if venv_py2.exists():
-            return str(venv_py2)
+        env = prepare_poc_runtime_environment(project_dir)
+        if env.python_executable.exists():
+            return str(env.python_executable)
     except Exception:
         pass
     return PYTHON_EXECUTABLE
 
 
-def _cmd_import_main(project_dir: str) -> list[str]:
+def _cmd_import_main(project_dir: str, python_executable: str | None) -> list[str]:
     # IMPORTANTE: el script se ejecuta con cwd=project_dir, así que la ruta debe ser RELATIVA.
     # Si usamos absoluta aquí, en Windows se ha observado duplicación de segmentos al invocar python.
-    return [_venv_python(project_dir), r".poc_it\_poc_it_runtime_import_main.py"]
+    py = python_executable or _venv_python(project_dir)
+    return [py, r".poc_it\_poc_it_runtime_import_main.py"]
 
 
-def _cmd_smoke_openapi(project_dir: str) -> list[str]:
+def _cmd_smoke_openapi(project_dir: str, python_executable: str | None) -> list[str]:
     # Igual que arriba: ruta relativa al cwd del subprocess.
-    return [_venv_python(project_dir), r".poc_it\_poc_it_runtime_smoke_openapi.py"]
+    py = python_executable or _venv_python(project_dir)
+    return [py, r".poc_it\_poc_it_runtime_smoke_openapi.py"]
 
 _MISSING_MODULE_RE: Final[re.Pattern[str]] = re.compile(r"ModuleNotFoundError: No module named '([^']+)'")
 _REQUIREMENTS_PKG_RE: Final[re.Pattern[str]] = re.compile(r"^([a-zA-Z0-9_.-]+)")
@@ -200,7 +203,9 @@ def _ensure_probe_scripts(project_dir: str) -> None:
     )
 
 
-def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -> tuple[bool, str]:
+def runtime_verify_fastapi_project(
+    project_dir: str, spec: dict | None = None, *, python_executable: str | None = None
+) -> tuple[bool, str]:
     """
     Verificación runtime mínima (genérica) para proyectos FastAPI generados.
 
@@ -213,10 +218,14 @@ def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -
     - No valida endpoints concretos (p.ej. /health) porque no siempre existirán.
     - No valida integraciones externas (Drive, DB, etc.). Solo valida "arranque/import-time".
     - Devuelve detalles ricos (stdout/stderr + hints) para repair loop.
+    - `python_executable`: intérprete del entorno aislado de la PoC (ver
+      `poc_it.runtime.poc_runtime_environment.prepare_poc_runtime_environment`). Si no se pasa,
+      se resuelve aquí best-effort, pero el caller debería prepararlo una única vez y pasarlo
+      explícitamente a todas las fases runtime/tests.
     """
     _ensure_probe_scripts(project_dir)
 
-    ok_main, out_main = _run_cmd(_cmd_import_main(project_dir), cwd=project_dir)
+    ok_main, out_main = _run_cmd(_cmd_import_main(project_dir, python_executable), cwd=project_dir)
     if not ok_main:
         missing = _extract_missing_module(out_main)
         if missing:
@@ -257,7 +266,7 @@ def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -
             encoding="utf-8",
             errors="ignore",
         )
-        cmd = [_venv_python(project_dir), r".poc_it\_poc_it_runtime_import_endpoints.py"]
+        cmd = [python_executable or _venv_python(project_dir), r".poc_it\_poc_it_runtime_import_endpoints.py"]
         ok_eps, out_eps = _run_cmd(cmd, cwd=project_dir)
         if not ok_eps:
             missing = _extract_missing_module(out_eps)
@@ -283,7 +292,7 @@ def runtime_verify_fastapi_project(project_dir: str, spec: dict | None = None) -
             return False, f"[runtime_verify] endpoints modules import failed:\nModules={endpoint_modules}\n{out_eps}\n{hint}"
 
     # Smoke runtime adicional: /openapi.json con TestClient.
-    ok_smoke, out_smoke = _run_cmd(_cmd_smoke_openapi(project_dir), cwd=project_dir)
+    ok_smoke, out_smoke = _run_cmd(_cmd_smoke_openapi(project_dir, python_executable), cwd=project_dir)
     if not ok_smoke:
         hint = (
             "HINTS:\n"

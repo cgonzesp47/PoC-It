@@ -45,6 +45,21 @@ def test_render_conftest_supports_value_providers():
     assert "return self.bind_value(dep_fqn, value)" in rendered
 
 
+def test_render_conftest_supports_auto_doubles():
+    rendered = render_conftest_py(
+        {
+            "tests_style": "sync",
+            "allowed_dependency_overrides": [],
+            "endpoints": [],
+        }
+    )
+
+    assert "from unittest.mock import MagicMock" in rendered
+    assert "def bind_auto_double(self, dep_fqn):" in rendered
+    assert "double = MagicMock(name=dep_fqn.rsplit('.', 1)[-1])" in rendered
+    assert "app.dependency_overrides[dep_callable] = _override_auto" in rendered
+
+
 def test_render_conftest_clears_dependency_overrides():
     rendered = render_conftest_py(
         {

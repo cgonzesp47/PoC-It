@@ -11,7 +11,7 @@ model_list:
   - model_name: ctx-json-groq
     hidden: false
     litellm_params:
-      model: groq/llama-3.3-70b-versatile
+      model: groq/openai/gpt-oss-120b
       api_key: os.environ/GROQ_API_KEY
 
   - model_name: ctx-json-gemini
@@ -23,12 +23,12 @@ model_list:
   - model_name: ctx-json-openrouter
     hidden: false
     litellm_params:
-      model: openrouter/openai/gpt-oss-120b:free
+      model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
       api_key: os.environ/OPENROUTER_API_KEY
 
 
   # Classification/decision (JSON)
-  # Nota: usamos Mistral para mejorar cumplimiento de JSON estructurado en días con cola en Cerebras.
+  # Nota: usamos Mistral para mejorar cumplimiento de JSON estructurado.
   - model_name: cls-json
     hidden: false
     litellm_params:
@@ -38,7 +38,7 @@ model_list:
   - model_name: cls-json-groq
     hidden: false
     litellm_params:
-      model: groq/llama-3.3-70b-versatile
+      model: groq/openai/gpt-oss-120b
       api_key: os.environ/GROQ_API_KEY
 
   - model_name: cls-json-gemini
@@ -50,12 +50,12 @@ model_list:
   - model_name: cls-json-openrouter
     hidden: false
     litellm_params:
-      model: openrouter/openai/gpt-oss-120b:free
+      model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
       api_key: os.environ/OPENROUTER_API_KEY
 
   # Code generation
   # Primary: Mistral (codestral-latest)
-  # Fallback: Cerebras (gpt-oss-120b) - handled by proxy routing below
+  # Fallback: OpenRouter - handled by proxy routing below
   - model_name: code-gen
     hidden: false
     litellm_params:
@@ -66,19 +66,16 @@ model_list:
   - model_name: code-gen-fallback
     hidden: false
     litellm_params:
-      # Cerebras fallback optimized for code generation
-      # NOTE: Cerebras model IDs are strict; use the exact ID exposed by your account.
-      # From the models shown in your UI, the most code-capable is likely the Qwen 3 235B Instruct family.
-      # Try this canonical ID (common in Cerebras catalogs); adjust if your account uses a different slug.
-      model: cerebras/gpt-oss-120b
-      api_key: os.environ/CEREBRAS_API_KEY
+      # OpenRouter fallback (reemplaza a Cerebras: la cuenta requiere billing y fallaba siempre).
+      model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+      api_key: os.environ/OPENROUTER_API_KEY
 
   # Documentation (text)
   # Reparto de carga: OpenRouter y Mistral antes que Gemini/Groq.
   - model_name: docs
     hidden: false
     litellm_params:
-      model: openrouter/openai/gpt-oss-120b:free
+      model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
       api_key: os.environ/OPENROUTER_API_KEY
 
   - model_name: docs-mistral
@@ -93,24 +90,26 @@ model_list:
       model: gemini/gemini-2.5-flash
       api_key: os.environ/GEMINI_API_KEY
 
-  - model_name: docs-cerebras
+  - model_name: docs-openrouter-2
     hidden: false
     litellm_params:
-      model: cerebras/gpt-oss-120b
-      api_key: os.environ/CEREBRAS_API_KEY
+      # Segundo fallback OpenRouter (reemplaza a Cerebras: la cuenta requiere billing y fallaba siempre).
+      model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+      api_key: os.environ/OPENROUTER_API_KEY
 
   - model_name: docs-groq
     hidden: false
     litellm_params:
-      model: groq/llama-3.3-70b-versatile
+      model: groq/openai/gpt-oss-120b
       api_key: os.environ/GROQ_API_KEY
 
   # Estimates (text/short)
   - model_name: estimate
     hidden: false
     litellm_params:
-      model: cerebras/gpt-oss-120b
-      api_key: os.environ/CEREBRAS_API_KEY
+      # OpenRouter (reemplaza a Cerebras: la cuenta requiere billing y fallaba siempre).
+      model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+      api_key: os.environ/OPENROUTER_API_KEY
 
   - model_name: estimate-gemini
     hidden: false
@@ -121,24 +120,24 @@ model_list:
   - model_name: estimate-groq
     hidden: false
     litellm_params:
-      model: groq/llama-3.3-70b-versatile
+      model: groq/openai/gpt-oss-120b
       api_key: os.environ/GROQ_API_KEY
 
   - model_name: estimate-openrouter
     hidden: false
     litellm_params:
-      model: openrouter/openai/gpt-oss-120b:free
+      model: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
       api_key: os.environ/OPENROUTER_API_KEY
 
   # Separate alias for Groq large model (optional)
   - model_name: groq-big
     hidden: false
     litellm_params:
-      model: groq/llama-3.3-70b-versatile
+      model: groq/openai/gpt-oss-120b
       api_key: os.environ/GROQ_API_KEY
 
 # Proxy-level fallback routing (requires LiteLLM Proxy version that supports this field)
-# When calling "code-gen", if Mistral errors, route to "code-gen-fallback" (Cerebras).
+# When calling "code-gen", if Mistral errors, route to "code-gen-fallback" (OpenRouter).
 # Router/fallbacks (LiteLLM Router)
 # Nota: en LiteLLM Proxy moderno, los fallbacks se definen con `router_settings.model_group_alias`.
 # Esto es lo que hace que en logs aparezca "Available Model Group Fallbacks=...".
@@ -188,11 +187,11 @@ router_settings:
     - docs:
         # Orden requerido:
         # 1) OpenRouter (primary del grupo: model_name "docs")
-        # 2) Cerebras
+        # 2) OpenRouter (segundo fallback, reemplaza a Cerebras)
         # 3) Mistral
         - docs-gemini
         - docs-groq
-        - docs-cerebras
+        - docs-openrouter-2
         - docs-mistral
 
     - estimate:

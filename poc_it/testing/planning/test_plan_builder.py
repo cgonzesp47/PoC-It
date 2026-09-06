@@ -355,18 +355,10 @@ def _sample_request_from_contract(*, ep: dict, openapi: Optional[dict], path: st
     if not isinstance(req_fields, list) or not req_fields:
         return None
 
-    request_field_types = ep.get("request_field_types") or {}
-    if not isinstance(request_field_types, dict):
-        request_field_types = {}
-
     out: Dict[str, Any] = {}
     for key in req_fields:
         kk = str(key).strip()
         if not kk:
-            continue
-        field_type = str(request_field_types.get(kk) or "").strip().lower()
-        if field_type:
-            out[kk] = _jsonschema_default_value({"type": field_type})
             continue
         lower_key = kk.lower()
         if lower_key in ("id", "product_id", "user_id") or lower_key.endswith("_id"):
@@ -382,10 +374,6 @@ def _sample_request_from_contract(*, ep: dict, openapi: Optional[dict], path: st
 
 def _required_response_keys(ep: dict) -> List[str]:
     keys = ep.get("response_json_required_keys") or ep.get("response_model_required_fields") or []
-    if not keys:
-        sample_response = ep.get("sample_response")
-        if isinstance(sample_response, dict):
-            keys = list(sample_response.keys())
     if not isinstance(keys, list):
         return []
     out: List[str] = []
@@ -399,10 +387,15 @@ def _required_response_keys(ep: dict) -> List[str]:
 def _endpoint_has_depends_overrideable(ep: dict, allowed: set[str]) -> bool:
     deps_imports = ep.get("depends_imports") or []
     if not isinstance(deps_imports, list) or not deps_imports:
-        return False
+        # Sin dependencias inyectadas => no hay nada que "overridear". Esto es
+        # VACUAMENTE cierto (no un "no lo sabemos"): un endpoint sin dependencias externas es
+        # hermético por construcción. Devolver False aquí (como antes) capaba estructuralmente
+        # a CUALQUIER endpoint sin `Depends()` (p.ej. GET /health) en OPENAPI_CONTRACT para
+        # siempre, aunque fuera trivialmente determinista y no tuviera nada que mockear.
+        return True
     deps = [str(dep).strip() for dep in deps_imports if str(dep).strip()]
     if not deps:
-        return False
+        return True
     return bool(allowed) and all(dep in allowed for dep in deps)
 
 
@@ -414,6 +407,31 @@ def _openapi_from_spec(spec: Optional[dict]) -> Optional[dict]:
     if isinstance(spec.get("paths"), dict) and ("components" in spec or "info" in spec or isinstance(spec.get("openapi"), str)):
         return spec
     return None
+
+
+def _declared_errors_by_endpoint(spec: Optional[dict]) -> Dict[Tuple[str, str], List[dict]]:
+    """Índice (method, path) -> errores declarados por el usuario en la plantilla
+    (`ContratoAPI.errors`, materializados por spec_builder en `spec["endpoints"][i]["errors"]`).
+
+    Esta es la evidencia que Fase B necesita para generar casos de error hermético que reflejen
+    lo que el usuario describió (403, 409, ...), en vez de limitarse al 422 genérico de FastAPI.
+    """
+    result: Dict[Tuple[str, str], List[dict]] = {}
+    if not isinstance(spec, dict):
+        return result
+    endpoints = spec.get("endpoints")
+    if not isinstance(endpoints, list):
+        return result
+    for item in endpoints:
+        if not isinstance(item, dict):
+            continue
+        method = str(item.get("method") or "").upper().strip()
+        path = str(item.get("path") or "").strip()
+        errors = item.get("errors")
+        if not method or not path or not isinstance(errors, list):
+            continue
+        result[(method, path)] = [e for e in errors if isinstance(e, dict)]
+    return result
 
 
 def _build_capabilities(
@@ -428,24 +446,23 @@ def _build_capabilities(
 ) -> EndpointCapabilities:
     has_deps = bool(ep.get("depends_imports"))
     method = str(ep.get("method") or "").upper()
-    dependency_behaviors = ep.get("dependency_behaviors") or []
-    required_internal_calls = ep.get("required_internal_calls") or []
-    dependency_evidence = bool(dependency_behaviors) or bool(required_internal_calls)
     return EndpointCapabilities(
         startup_available=True,
         openapi_available=in_openapi,
         request_schema_complete=sample_req is not None or method in {"GET", "DELETE"},
         valid_request_generatable=sample_req is not None or method in {"GET", "DELETE"},
         invalid_request_generatable=sample_req is not None,
-        dependencies_discovered=has_deps or dependency_evidence,
+        dependencies_discovered=has_deps,
         dependencies_overrideable=overrideable,
-        dependency_protocol_known=overrideable or dependency_evidence or any(str(x).endswith(".get_db") for x in allowed),
+        dependency_protocol_known=overrideable or any(str(x).endswith(".get_db") for x in allowed),
         response_contract_known=bool(req_keys) or in_openapi,
         stateful_candidate=stateful,
     )
 
 
-def _dependency_setup_from_endpoint(ep: dict) -> List[DependencyBehavior]:
+def _dependency_setup_from_endpoint(
+    ep: dict, allowed: Optional[set] = None, *, auto_mock_external_risk: bool = False
+) -> List[DependencyBehavior]:
     result: List[DependencyBehavior] = []
 
     for item in ep.get("dependency_behaviors") or []:
@@ -482,38 +499,145 @@ def _dependency_setup_from_endpoint(ep: dict) -> List[DependencyBehavior]:
                 )
             )
 
-    if result:
+    # Fallback determinista: para cualquier dependencia inyectada de este endpoint que esté
+    # marcada como overrideable (`allowed_dependency_overrides`), pertenezca a un proyecto con
+    # riesgo de integración externa real detectado (`_infer_external_dependency_risk`: SDKs de
+    # red/DB/credenciales) y no tenga ya un comportamiento explícito (arriba, típicamente vía
+    # semantic enrichment LLM), generamos un doble automático genérico (`unittest.mock.MagicMock`)
+    # en lugar de dejarla sin mockear.
+    #
+    # Por qué solo cuando hay riesgo externo: cuando la dependencia inyectada es un fake/objeto en
+    # memoria SIN SDK de red/credenciales (p.ej. un repositorio in-memory en los fixtures E2E), es
+    # perfectamente seguro dejar que el test la ejecute de verdad — y hacerlo produce datos reales
+    # coherentes (ids, campos) en vez de un MagicMock vacío que rompe las aserciones de contenido.
+    # Aplicar el auto-mock incondicionalmente ahí sustituía esa implementación real y funcional por
+    # un doble que no sabe qué forma debe tener la respuesta.
+    #
+    # Por qué hace falta esto para dependencias de riesgo real: sin él, `dependency_setup` quedaba
+    # vacío para CUALQUIER dependencia externa no cubierta por enrichment semántico (que en
+    # producción nunca está configurado con un LLM real — ver `SemanticEnrichmentService`), así que
+    # en los tests herméticos la dependencia real se ejecutaba de verdad (p.ej. un cliente de
+    # Google Drive intentando autenticarse), provocando errores 500 en vez de un test hermético.
+    already_covered = {behavior.dependency_fqn for behavior in result}
+    if not auto_mock_external_risk:
         return result
-
-    for item in ep.get("required_internal_calls") or []:
-        if not isinstance(item, dict):
+    for dep_fqn in ep.get("depends_imports") or []:
+        dep_fqn = str(dep_fqn or "").strip()
+        if not dep_fqn or dep_fqn in already_covered:
             continue
-        dependency_fqn = str(
-            item.get("dependency_fqn")
-            or item.get("dependency")
-            or item.get("target_dependency")
-            or item.get("patch_target")
-            or ""
-        ).strip()
-        method_name = str(
-            item.get("method_name")
-            or item.get("method")
-            or item.get("target_method")
-            or item.get("call")
-            or ""
-        ).strip()
-        if not dependency_fqn or not method_name:
+        if not allowed or dep_fqn not in allowed:
             continue
         result.append(
             DependencyBehavior(
-                dependency_fqn=dependency_fqn,
-                method_name=method_name,
-                action="return",
-                value=item.get("return_value", {"ok": True}),
+                dependency_fqn=dep_fqn,
+                method_name="",
+                action="provide_auto",
+                value=None,
             )
         )
+        already_covered.add(dep_fqn)
 
     return result
+
+
+def _declared_error_cases(
+    *,
+    base_case_id: str,
+    path: str,
+    method: str,
+    path_params: Dict[str, Any],
+    sample_req: Optional[dict],
+    ep: dict,
+    already_used_statuses: set,
+    auto_mock_external_risk: bool,
+) -> Tuple[List[TestCasePlan], List[str]]:
+    """Genera un caso HERMETIC_HTTP por cada error declarado por el usuario en la plantilla
+    (`ContratoAPI.errors`, propagado hasta aquí como `ep["declared_errors"]`) que no esté ya
+    cubierto por otro caso (happy path, 404 por not-found, controlled_failure, 422 validación).
+
+    Solo se genera cuando `auto_mock_external_risk` es True: es el único escenario en el que la
+    dependencia se liga a un auto-double MagicMock permisivo (`provide_auto`), así que podemos
+    hacer que CUALQUIER llamada sobre él lance la excepción declarada (`provide_auto_raise`) sin
+    arriesgarnos a un `StrictDoubleError` por adivinar mal el nombre del método real invocado —
+    riesgo real cuando la plantilla solo declara status_code/code/description, no qué método de
+    qué dependencia dispara ese error.
+    """
+    cases: List[TestCasePlan] = []
+    evidence: List[str] = []
+    if not auto_mock_external_risk:
+        return cases, evidence
+
+    dep_imports = [str(x).strip() for x in (ep.get("depends_imports") or []) if str(x).strip()]
+    if not dep_imports:
+        return cases, evidence
+    dep_fqn = dep_imports[0]
+
+    declared = ep.get("declared_errors") or []
+    seen_status: set = set()
+    for item in declared:
+        if not isinstance(item, dict):
+            continue
+        status_code = item.get("status_code")
+        if not isinstance(status_code, int) or not (400 <= status_code < 600):
+            continue
+        if status_code in already_used_statuses or status_code in seen_status:
+            continue
+        seen_status.add(status_code)
+
+        code = str(item.get("code") or "").strip() or f"error_{status_code}"
+        description = str(item.get("description") or code).strip()
+
+        # Herméticos: cualquier otra dependencia del endpoint (además de la que forzamos a
+        # fallar) también se auto-mockea, para no dejar que un dependency real (con riesgo
+        # externo) se ejecute de verdad en un caso que se supone hermético.
+        case_dep_setup = [
+            DependencyBehavior(
+                dependency_fqn=dep_fqn,
+                method_name="",
+                action="provide_auto_raise",
+                value=None,
+                exception_type="HTTPException",
+                exception_message=description,
+                exception_status_code=status_code,
+            )
+        ]
+        for other_dep_fqn in dep_imports[1:]:
+            case_dep_setup.append(
+                DependencyBehavior(
+                    dependency_fqn=other_dep_fqn,
+                    method_name="",
+                    action="provide_auto",
+                    value=None,
+                )
+            )
+
+        cases.append(
+            TestCasePlan(
+                case_id=f"{base_case_id}__declared_error_{status_code}",
+                level="HERMETIC_HTTP",
+                category="declared_error",
+                request=RequestSpec(
+                    method=method,
+                    path_template=path,
+                    path_params=dict(path_params),
+                    json_body=sample_req,
+                    expected_status=status_code,
+                    allowed_statuses=[status_code],
+                    response_media_type="application/json",
+                ),
+                dependency_setup=case_dep_setup,
+                assertions=[
+                    AssertionSpec(
+                        kind="STATUS_EQUALS",
+                        expected=status_code,
+                        metadata={"evidence": f"declared_error:{code}"},
+                    )
+                ],
+            )
+        )
+        evidence.append(f"declared_error:{code}")
+
+    return cases, evidence
 
 
 def _build_endpoint_cases(
@@ -528,6 +652,9 @@ def _build_endpoint_cases(
     req_keys: List[str],
     resp_mt: Optional[str],
     ep: dict,
+    allowed: Optional[set] = None,
+    auto_mock_external_risk: bool = False,
+    request_required_keys: Optional[List[str]] = None,
 ) -> Tuple[List[TestCasePlan], List[str], List[str]]:
     cases: List[TestCasePlan] = []
     limitations: List[str] = []
@@ -570,7 +697,13 @@ def _build_endpoint_cases(
         and bool(resp_mt or req_keys or allowed_statuses)
     )
     if can_http:
-        dep_setup = _dependency_setup_from_endpoint(ep)
+        used_statuses: set[int] = {422}
+        if isinstance(expected, int):
+            used_statuses.add(expected)
+
+        dep_setup = _dependency_setup_from_endpoint(
+            ep, allowed, auto_mock_external_risk=auto_mock_external_risk
+        )
         assertions = [AssertionSpec(kind="STATUS_EQUALS", expected=expected, metadata={"evidence": "response.status"})]
         if req_keys:
             assertions.append(
@@ -627,6 +760,7 @@ def _build_endpoint_cases(
                 )
             )
             evidence.append("not_found_evidence")
+            used_statuses.add(404)
 
         controlled_failure = ep.get("controlled_failure_evidence")
         if isinstance(controlled_failure, dict):
@@ -672,8 +806,26 @@ def _build_endpoint_cases(
                     )
                 )
                 evidence.append("controlled_failure_evidence")
+                used_statuses.add(failure_status)
 
-        if sample_req is not None:
+        declared_error_cases, declared_error_evidence = _declared_error_cases(
+            base_case_id=base_case_id,
+            path=path,
+            method=method,
+            path_params=path_params,
+            sample_req=sample_req,
+            ep=ep,
+            already_used_statuses=used_statuses,
+            auto_mock_external_risk=auto_mock_external_risk,
+        )
+        cases.extend(declared_error_cases)
+        evidence.extend(declared_error_evidence)
+
+        # Solo afirmamos 422 si tenemos evidencia positiva de al menos un campo requerido en el
+        # request (OpenAPI requestBody.schema.required): un handler `payload: dict` (sin modelo
+        # Pydantic) acepta `{}` como body válido y FastAPI nunca lo rechaza, así que sin esta
+        # evidencia el caso generado afirmaría un 422 que nunca ocurre.
+        if sample_req is not None and request_required_keys:
             cases.append(
                 TestCasePlan(
                     case_id=f"{base_case_id}__validation_error",
@@ -927,7 +1079,14 @@ def build_test_plan(*, structure: Dict[str, str], spec: Optional[dict], mode: st
     endpoints = (rc or {}).get("endpoints") if isinstance(rc, dict) else None
     endpoints = endpoints if isinstance(endpoints, list) else []
 
+    # Preferimos el OpenAPI REAL capturado en vivo de la app en ejecución (persistido en
+    # runtime_contracts.json por reparacion_runtime.py durante wiring verify), porque el SPEC
+    # determinista no puede conocer el status code real de cada endpoint (los decoradores de
+    # FastAPI rara vez lo declaran explícito). Sin este fallback, ningún endpoint puede
+    # promocionar más allá de OPENAPI_CONTRACT por falta de "evidencia" de su status feliz.
     openapi = _openapi_from_spec(spec)
+    if not isinstance(openapi, dict) and isinstance(rc, dict) and isinstance(rc.get("openapi"), dict):
+        openapi = rc.get("openapi")
     openapi_paths = _runtime_openapi_paths({"openapi": openapi} if isinstance(openapi, dict) else rc) if isinstance(rc, dict) or isinstance(openapi, dict) else {}
 
     imports = list((rc or {}).get("imports") or []) if isinstance(rc, dict) else []
@@ -940,6 +1099,8 @@ def build_test_plan(*, structure: Dict[str, str], spec: Optional[dict], mode: st
             if item:
                 allowed.add(item)
 
+    declared_errors_by_endpoint = _declared_errors_by_endpoint(spec)
+
     endpoint_plans: List[EndpointTestPlan] = []
 
     for ep in endpoints:
@@ -949,6 +1110,10 @@ def build_test_plan(*, structure: Dict[str, str], spec: Optional[dict], mode: st
         method = str(ep.get("method") or "").upper().strip()
         if not path or not method:
             continue
+
+        declared_errors = declared_errors_by_endpoint.get((method, path))
+        if declared_errors:
+            ep = {**ep, "declared_errors": declared_errors}
 
         methods_in_openapi = openapi_paths.get(path, set()) if openapi_paths else set()
         in_openapi = bool(method.lower() in methods_in_openapi) if methods_in_openapi else True
@@ -967,6 +1132,9 @@ def build_test_plan(*, structure: Dict[str, str], spec: Optional[dict], mode: st
 
         sample_req = _sample_request_from_contract(ep=ep, openapi=openapi, path=path, method=method)
         req_keys = _required_response_keys(ep) or openapi_required_keys
+
+        request_schema = _extract_request_schema_from_openapi(openapi=openapi, path=path, method_lower=method.lower())
+        request_required_keys = list(request_schema.get("required") or []) if isinstance(request_schema, dict) else []
         resp_mt = ep.get("response_media_type") if isinstance(ep.get("response_media_type"), str) else None
         if not resp_mt and isinstance(openapi_mt, str):
             resp_mt = openapi_mt
@@ -1000,9 +1168,23 @@ def build_test_plan(*, structure: Dict[str, str], spec: Optional[dict], mode: st
             req_keys=req_keys,
             resp_mt=resp_mt,
             ep=ep,
+            allowed=allowed,
+            auto_mock_external_risk=(risk != "none"),
+            request_required_keys=request_required_keys,
         )
 
-        if m == "PARCIAL" and risk != "none" and not capabilities.dependencies_overrideable:
+        # `risk` se infiere de los imports de TODO el proyecto (ver más arriba), no solo de este
+        # endpoint — un endpoint sin ninguna dependencia/llamada propia (p.ej. GET /health) no
+        # debe heredar el riesgo de un módulo de integración completamente distinto que use el
+        # mismo proyecto. Solo aplicamos el aviso si HAY evidencia de que este endpoint concreto
+        # toca alguna dependencia (inyectada u observada mediante llamadas).
+        endpoint_touches_dependency = bool(ep.get("depends_imports") or ep.get("observed_calls"))
+        if (
+            m == "PARCIAL"
+            and risk != "none"
+            and not capabilities.dependencies_overrideable
+            and endpoint_touches_dependency
+        ):
             limitations.append(f"Riesgo de integración externa detectado: {risk}.")
 
         endpoint_plans.append(

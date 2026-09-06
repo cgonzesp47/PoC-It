@@ -32,13 +32,35 @@ class WiringVerifyResult:
     ok: bool
     detail: str
     missing_paths: List[str]
+    # OpenAPI real capturado de la app en ejecución (vía TestClient), cuando se pudo obtener.
+    # Es la única fuente fiable de status codes/response shapes reales — sin esto, el
+    # planificador de tests (test_plan_builder.py) nunca sabe qué status "feliz" esperar por
+    # endpoint y ningún caso puede promocionar más allá de OPENAPI_CONTRACT.
+    openapi: Optional[dict] = None
 
 
-def _run_openapi_probe(project_dir: str) -> Tuple[bool, str, Optional[dict]]:
+def _resolve_python_executable(project_dir: str, python_executable: Optional[str]) -> str:
+    if python_executable:
+        return python_executable
+    from poc_it.runtime.poc_runtime_environment import prepare_poc_runtime_environment
+
+    env = prepare_poc_runtime_environment(project_dir)
+    if env.python_executable.exists():
+        return str(env.python_executable)
+    import sys
+
+    return sys.executable
+
+
+def _run_openapi_probe(project_dir: str, python_executable: Optional[str] = None) -> Tuple[bool, str, Optional[dict]]:
     """
     Intenta importar app.main y extraer /openapi.json usando TestClient en un proceso separado
     para aislar side-effects. Captura stdout+stderr.
+
+    Ejecuta con el Python del entorno aislado de la PoC (`.poc_it/venv`), nunca con el `python`
+    resuelto por PATH del proceso de PoC-it.
     """
+    py = _resolve_python_executable(project_dir, python_executable)
     code = r"""
 import json
 import sys
@@ -61,7 +83,7 @@ except Exception as e:
 print("OPENAPI_JSON:", json.dumps(data) if data is not None else "null")
 """
     p = subprocess.run(
-        ["python", "-c", code],
+        [py, "-c", code],
         cwd=project_dir,
         capture_output=True,
         text=True,
@@ -88,6 +110,7 @@ def verify_wiring_against_runtime_contracts(
     *,
     project_dir: str,
     estructura: Dict[str, str],
+    python_executable: Optional[str] = None,
 ) -> WiringVerifyResult:
     """
     Verifica que los paths de runtime_contracts existen en OpenAPI.
@@ -108,7 +131,7 @@ def verify_wiring_against_runtime_contracts(
     if not isinstance(endpoints, list) or not endpoints:
         return WiringVerifyResult(ok=True, detail="No runtime_contracts endpoints; skipping wiring verify.", missing_paths=[])
 
-    ok_probe, out, openapi = _run_openapi_probe(project_dir)
+    ok_probe, out, openapi = _run_openapi_probe(project_dir, python_executable)
     if not ok_probe or not isinstance(openapi, dict):
         return WiringVerifyResult(ok=False, detail="OpenAPI probe failed.\n" + out, missing_paths=[])
 
@@ -135,6 +158,12 @@ def verify_wiring_against_runtime_contracts(
                 "Causa típica: routers no incluidos en app.main (falta include_router).\n"
             ),
             missing_paths=sorted(set(missing)),
+            openapi=openapi,
         )
 
-    return WiringVerifyResult(ok=True, detail="Wiring OK (runtime_contracts paths present in OpenAPI).", missing_paths=[])
+    return WiringVerifyResult(
+        ok=True,
+        detail="Wiring OK (runtime_contracts paths present in OpenAPI).",
+        missing_paths=[],
+        openapi=openapi,
+    )

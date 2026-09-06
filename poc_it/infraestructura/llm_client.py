@@ -783,9 +783,13 @@ def solicitarRespuestaTextual(
 
     last_error: Optional[Exception] = None
 
-    groq_error: Optional[Exception] = None
-    openrouter_error: Optional[Exception] = None
-    ollama_error: Optional[Exception] = None
+    # Captura el último error de CADA proveedor intentado (en orden), incluyendo litellm_proxy,
+    # gemini, cerebras y mistral. Antes solo se guardaban groq/openrouter/ollama, así que si
+    # fallaban únicamente proveedores fuera de esa lista (p.ej. el proxy local no estaba
+    # levantado, o solo gemini/mistral tenían API key configurada), el mensaje final quedaba
+    # vacío ("All providers failed." sin ningún detalle) y no había forma de diagnosticar la
+    # causa real sin activar logging DEBUG.
+    provider_errors: Dict[str, Exception] = {}
 
     # Cadena base de proveedores
     # - Política: primero LiteLLM Proxy (API Park).
@@ -841,7 +845,7 @@ def solicitarRespuestaTextual(
                 #
                 # NOTA: sólo aplica a documentación, porque es donde más se observan timeouts.
                 if resolved_phase == "documentacion":
-                    extra_doc_aliases = ["docs-gemini", "docs-cerebras", "docs-groq"]
+                    extra_doc_aliases = ["docs-gemini", "docs-openrouter-2", "docs-groq"]
                     for a in extra_doc_aliases:
                         if a not in aliases_to_try:
                             aliases_to_try.append(a)
@@ -939,13 +943,15 @@ def solicitarRespuestaTextual(
                     COOLDOWN_SECONDS,
                 )
 
+            # Guardamos el error de ESTE proveedor sin importar cuál sea, para poder reportarlo
+            # si al final todos fallan (ver construcción de error_msg más abajo).
+            provider_errors[provider] = exc
+
             # Métricas de fallo por proveedor
             if provider == "litellm_proxy":
-                # Contabilizamos fallo del proxy como "fallback" potencial y dejamos evidencia.
                 # Si falla el proxy, DEBE saltar al siguiente proveedor del chain.
                 pass
             elif provider == "groq":
-                groq_error = exc
                 LLM_METRICS["groq_failures"] += 1
             elif provider == "openai":
                 LLM_METRICS["openai_failures"] += 1
@@ -956,10 +962,8 @@ def solicitarRespuestaTextual(
             elif provider == "gemini":
                 LLM_METRICS["gemini_failures"] += 1
             elif provider == "openrouter":
-                openrouter_error = exc
                 LLM_METRICS["openrouter_failures"] += 1
             elif provider == "ollama":
-                ollama_error = exc
                 LLM_METRICS["ollama_failures"] += 1
             else:
                 # proveedor no reconocido (defensivo)
@@ -974,12 +978,12 @@ def solicitarRespuestaTextual(
             continue
 
     error_msg = "All providers failed.\n"
-    if groq_error:
-        error_msg += f"- Groq error: {groq_error}\n"
-    if openrouter_error:
-        error_msg += f"- OpenRouter error: {openrouter_error}\n"
-    if ollama_error:
-        error_msg += f"- Ollama error: {ollama_error}\n"
+    if provider_errors:
+        for provider_name, provider_exc in provider_errors.items():
+            error_msg += f"- {provider_name} error: {provider_exc}\n"
+    else:
+        # Ningún proveedor llegó siquiera a intentarse (p.ej. todos en cooldown/deshabilitados).
+        error_msg += "- No provider was attempted (all skipped: cooldown/disabled).\n"
 
     if not is_demo_mode():
         logger.debug("[LLM METRICS]\n%s", "\n".join([f"  - {k}: {v}" for k, v in LLM_METRICS.items()]))

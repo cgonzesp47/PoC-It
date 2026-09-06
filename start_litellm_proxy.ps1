@@ -51,11 +51,10 @@ Get-Content $envFile | ForEach-Object {
 
 # Validaciones mínimas (no imprimimos los secretos)
 # Nota: OPENAI_API_KEY puede no ser necesario si no usas modelos OpenAI.
-# En este repo, el proxy define deployments para: Mistral, Groq, Cerebras, Gemini y OpenRouter.
+# En este repo, el proxy define deployments para: Mistral, Groq, Gemini y OpenRouter.
 $required = @(
   "MISTRAL_API_KEY",
   "GROQ_API_KEY",
-  "CEREBRAS_API_KEY",
   "GEMINI_API_KEY",
   "OPENROUTER_API_KEY"
 )
@@ -72,7 +71,7 @@ if ($missing.Count -gt 0) {
 }
 
 # Ejecutable litellm (en tu venv recomendado)
-$litellmExe = "C:\\venvs\\pocit\\Scripts\\litellm.exe"
+$litellmExe = "C:\Users\Carlos\Desktop\Proyectos\Programacion\PoC-It\venv\Scripts\litellm.exe"
 if (-not (Test-Path $litellmExe)) {
   Write-Host "[start_litellm_proxy] No se encontró $litellmExe"
   Write-Host "[start_litellm_proxy] Ajusta la ruta del venv en start_litellm_proxy.ps1 o instala litellm[proxy] en ese venv."

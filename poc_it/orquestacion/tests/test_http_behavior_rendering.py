@@ -118,3 +118,55 @@ def test_render_tests_from_test_plan_renders_dependency_value_provider() -> None
     http_test = rendered["tests/test_http_behavior.py"]
     assert "app.main.get_current_user" in http_test
     assert "demo" in http_test
+
+
+def test_render_tests_from_test_plan_renders_dependency_auto_double() -> None:
+    plan = {
+        "mode": "PARCIAL",
+        "strategy": "contract-first",
+        "endpoints": [],
+        "endpoint_plans": [
+            {
+                "method": "POST",
+                "path": "/upload",
+                "limitations": ["Sin limitaciones relevantes detectadas."],
+                "cases": [
+                    {
+                        "level": "HERMETIC_HTTP",
+                        "category": "happy_path",
+                        "request": {
+                            "method": "POST",
+                            "path_template": "/upload",
+                            "json_body": {"filename": "x"},
+                            "expected_status": 200,
+                            "allowed_statuses": [200],
+                            "response_media_type": "application/json",
+                        },
+                        "dependency_setup": [
+                            {
+                                "dependency_fqn": "app.integrations.google_drive_api.build_client",
+                                "method_name": "",
+                                "action": "provide_auto",
+                                "value": None,
+                            }
+                        ],
+                        "assertions": [
+                            {"kind": "STATUS_EQUALS", "expected": 200, "metadata": {"evidence": "response.status"}},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    rendered = render_tests_from_test_plan(
+        structure={TEST_PLAN_PATH: json.dumps(plan)},
+        runtime_contracts={},
+        runtime_facts={},
+    )
+
+    http_test = rendered["tests/test_http_behavior.py"]
+    assert (
+        "dependency_overrides_guard.bind_auto_double('app.integrations.google_drive_api.build_client')"
+        in http_test
+    )

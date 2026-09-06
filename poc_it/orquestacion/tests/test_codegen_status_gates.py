@@ -177,6 +177,15 @@ def test_codegen_valid_runs_runtime_loop(monkeypatch):
 
     monkeypatch.setattr("poc_it.orquestacion.orquestador_parcial.ejecutar_reparacion_runtime", fake_runtime)
 
+    # No hay junit xml real en disco para este proyecto de prueba, así que el orquestador cae al
+    # fallback "contract-lite" y llama a `pytest_llm_repair._run_pytest`. Sin mockearlo, eso
+    # dispararía una preparación REAL del entorno runtime aislado (venv real + pip), que es cara
+    # y no es lo que este test unitario quiere ejercitar (solo el gating de codegen_status).
+    monkeypatch.setattr(
+        "poc_it.orquestacion.pytest_llm_repair._run_pytest",
+        lambda project_dir, python_executable=None: (True, "", ""),
+    )
+
     # facts extractor stub (para no analizar AST real)
     monkeypatch.setattr(
         "poc_it.orquestacion.orquestador_parcial.extract_poc_facts_from_structure", lambda estructura: type("X", (), {"to_dict": lambda self: {"endpoints": []}})()
@@ -195,3 +204,73 @@ def test_codegen_valid_runs_runtime_loop(monkeypatch):
 
     orch.ejecutar()
     assert called["runtime"] == 1
+
+
+def test_late_documentation_failure_preserves_already_materialized_project(monkeypatch):
+    """Regresión: una excepción no recuperable tardía (p.ej. 'All providers failed' al redactar
+    el README final, ya con codegen/tests en verde) hacía que el handler catch-all de ejecutar()
+    borrase TODO `output/<proyecto>/` (limpiar_directorio=True) y lo sustituyera por solo dos
+    READMEs, tirando código y tests ya generados y válidos. Ahora, si ya se había materializado
+    código real (app/tests) antes del fallo, no se borra: solo se añade README_ERROR.md."""
+
+    def fake_generar_proyecto_completo(*args, **kwargs):
+        return {
+            "files": [
+                {"path": "app/main.py", "content": "from fastapi import FastAPI\\napp = FastAPI()\\n"},
+                {"path": "tests/test_smoke_import.py", "content": "def test_x():\\n    pass\\n"},
+                {"path": "README.md", "content": "x"},
+            ],
+            "spec": {"schema_version": "pocit.spec.v1"},
+            "codegen_status": "valid",
+            "materializable": True,
+            "codegen_errors": [],
+            "validation_report": {"errors": []},
+        }
+
+    monkeypatch.setattr(
+        "poc_it.orquestacion.orquestador_parcial.generar_proyecto_completo", fake_generar_proyecto_completo
+    )
+
+    materializaciones = []
+
+    def fake_materializar_proyecto(*, nombre_proyecto, estructura, limpiar_directorio=True, **kwargs):
+        materializaciones.append({"estructura": dict(estructura), "limpiar_directorio": limpiar_directorio})
+        return list(estructura.keys())
+
+    monkeypatch.setattr("poc_it.orquestacion.orquestador_parcial.materializar_proyecto", fake_materializar_proyecto)
+
+    def fake_ejecutar_reparacion_runtime(*, archivos_creados, **kwargs):
+        # El real `ejecutar_reparacion_runtime` muta esta lista in-place con las rutas de
+        # código/tests que materializa (p.ej. vía `TestGenerationService.materialize_result`).
+        archivos_creados.append("output/TmpProject/app/main.py")
+        archivos_creados.append("output/TmpProject/tests/test_smoke_import.py")
+
+    monkeypatch.setattr(
+        "poc_it.orquestacion.orquestador_parcial.ejecutar_reparacion_runtime", fake_ejecutar_reparacion_runtime
+    )
+    monkeypatch.setattr(
+        "poc_it.orquestacion.pytest_llm_repair._run_pytest",
+        lambda project_dir, python_executable=None: (True, "", ""),
+    )
+    monkeypatch.setattr(
+        "poc_it.orquestacion.orquestador_parcial.extract_poc_facts_from_structure",
+        lambda estructura: type("X", (), {"to_dict": lambda self: {"endpoints": []}})(),
+    )
+
+    def boom_docs(**kwargs):
+        raise RuntimeError("All providers failed.")
+
+    monkeypatch.setattr("poc_it.orquestacion.orquestador_parcial.generar_documentacion", boom_docs)
+
+    plantilla = _minimal_plantilla()
+    ctx = _minimal_context()
+    ctx.plantilla = plantilla
+    orch = OrquestadorParcial(plantilla=plantilla, modo_generacion="PARCIAL", context=ctx)
+
+    out = orch.ejecutar()
+
+    assert out.get("error")
+    error_materializacion = materializaciones[-1]
+    assert error_materializacion["limpiar_directorio"] is False
+    assert "README_ERROR.md" in error_materializacion["estructura"]
+    assert "README.md" not in error_materializacion["estructura"]

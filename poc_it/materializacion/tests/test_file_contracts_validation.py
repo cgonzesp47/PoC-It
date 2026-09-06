@@ -427,6 +427,84 @@ def test_literal_secret_assignment_is_detected_from_contract_metadata() -> None:
     assert {v.code for v in violations} == {"EMBEDDED_SECRET_FORBIDDEN"}
 
 
+def _configuration_access_contract(*, path: str, allowed_fields: list[str]) -> dict:
+    return {
+        "path": path,
+        "kind": "integration",
+        "configuration_access": {
+            "provider_module": "app.core.config",
+            "provider_symbol": "get_settings",
+            "allowed_fields": allowed_fields,
+        },
+    }
+
+
+def test_chained_configuration_access_to_undeclared_field_is_detected() -> None:
+    """Regresión real: `get_settings().google_drive_credentials` (patrón encadenado, sin
+    variable intermedia) referenciando un campo que Settings nunca declaró pasaba la
+    validación sin error — el bug llegaba intacto hasta que pytest lo ejecutaba de verdad."""
+    file_contracts = [_configuration_access_contract(path="app/integrations/google_drive.py", allowed_fields=["google_drive_folder_id"])]
+    files_by_path = {
+        "app/integrations/google_drive.py": (
+            "from app.core.config import get_settings\n\n"
+            "def upload_to_google_drive(filename):\n"
+            "    folder_id = get_settings().google_drive_folder_id\n"
+            "    creds = get_settings().google_drive_credentials\n"
+            "    return folder_id\n"
+        )
+    }
+
+    violations = validate_generated_python_against_file_contracts(
+        files_by_path=files_by_path,
+        file_contracts=file_contracts,
+    )
+
+    config_violations = [v for v in violations if v.code == "CONFIGURATION_FIELD_MISSING"]
+    assert len(config_violations) == 1
+    assert config_violations[0].details["field"] == "google_drive_credentials"
+
+
+def test_chained_configuration_access_to_allowed_field_passes() -> None:
+    file_contracts = [_configuration_access_contract(path="app/integrations/google_drive.py", allowed_fields=["google_drive_folder_id"])]
+    files_by_path = {
+        "app/integrations/google_drive.py": (
+            "from app.core.config import get_settings\n\n"
+            "def upload_to_google_drive(filename):\n"
+            "    return get_settings().google_drive_folder_id\n"
+        )
+    }
+
+    violations = validate_generated_python_against_file_contracts(
+        files_by_path=files_by_path,
+        file_contracts=file_contracts,
+    )
+
+    assert "CONFIGURATION_FIELD_MISSING" not in {v.code for v in violations}
+
+
+def test_two_step_configuration_access_to_undeclared_field_still_detected() -> None:
+    """No regresión: el patrón previamente soportado (asignación + acceso en dos pasos) debe
+    seguir funcionando igual que antes."""
+    file_contracts = [_configuration_access_contract(path="app/integrations/google_drive.py", allowed_fields=["google_drive_folder_id"])]
+    files_by_path = {
+        "app/integrations/google_drive.py": (
+            "from app.core.config import get_settings\n\n"
+            "def upload_to_google_drive(filename):\n"
+            "    settings = get_settings()\n"
+            "    return settings.google_drive_credentials\n"
+        )
+    }
+
+    violations = validate_generated_python_against_file_contracts(
+        files_by_path=files_by_path,
+        file_contracts=file_contracts,
+    )
+
+    config_violations = [v for v in violations if v.code == "CONFIGURATION_FIELD_MISSING"]
+    assert len(config_violations) == 1
+    assert config_violations[0].details["field"] == "google_drive_credentials"
+
+
 def test_object_to_string_type_mismatch_is_detected() -> None:
     file_contracts = [
         {

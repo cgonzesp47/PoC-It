@@ -6,13 +6,17 @@ from poc_it.generador.file_contracts import (
     build_file_contracts_from_spec,
     file_contracts_to_dict,
 )
-from poc_it.generador.file_contracts_validation import validate_file_contracts
+from poc_it.generador.file_contracts_validation import (
+    validate_file_contracts,
+    validate_generated_python_against_file_contracts,
+)
 from poc_it.generador.file_planner import enrich_spec_files_for_implementation
 from poc_it.generador.implementation_contracts import (
     build_implementation_contracts_from_spec,
 )
 from poc_it.generador.request_ir import build_request_ir_from_context
 from poc_it.generador.spec_builder import build_spec_from_request_ir
+from poc_it.materializacion.poc_facts_extractor import extract_poc_facts_from_structure
 
 
 def _context() -> dict:
@@ -220,6 +224,127 @@ def test_external_integration_flow_preserves_traceability_without_validation_err
         file_contracts=file_contracts,
     )
     assert errors == []
+
+
+def test_integration_and_endpoint_contracts_require_injectable_client_provider() -> None:
+    """Regresión real: la función de acción de la integración (`upload_to_google_drive`)
+    construía su propio cliente por dentro (import directo a `build_client`), lo que hacía
+    imposible mockear la llamada externa en tests herméticos. El contrato debe exigir que el
+    cliente se construya en una función proveedora separada (compatible con `Depends(...)`) y
+    que la acción lo reciba como parámetro — SIN dejar de invocarse como llamada directa (eso
+    es lo que evita repetir el conflicto con `required_internal_calls` de la vez anterior)."""
+    spec, implementation_contracts, file_contracts = _build_flow()
+
+    integration_contract = _find_contract(file_contracts, "app/integrations/google_drive.py")
+    endpoint_contract = _find_contract(file_contracts, "app/api/endpoints/upload.py")
+
+    assert any(
+        "provider function" in item.lower() and "zero-required-argument" in item.lower()
+        for item in integration_contract["must_implement"]
+    )
+    assert any(
+        "receive the client as an explicit parameter" in item.lower()
+        for item in integration_contract["must_implement"]
+    )
+    assert any(
+        "depends(build_client)" in item.lower() and "still direct" in item.lower()
+        for item in endpoint_contract["must_implement"]
+    )
+    # El nombre debe ser el mismo, EXACTO, a ambos lados del contrato (integración y endpoint) —
+    # esa coordinación es justo lo que faltaba y causó la regresión real.
+    assert any("build_client" in item for item in integration_contract["must_implement"])
+    # La obligación de invocar la integración se mantiene intacta (no se sustituye, se
+    # complementa) — es justo lo que preserva la compatibilidad con required_internal_calls.
+    assert "Invoke the referenced service or integration" in endpoint_contract["must_implement"]
+
+    errors = validate_file_contracts(
+        spec=spec,
+        implementation_contracts=implementation_contracts,
+        file_contracts=file_contracts,
+    )
+    assert errors == []
+
+
+def test_di_client_provider_pattern_is_compatible_with_required_internal_calls_and_facts_extractor() -> None:
+    """Verificación empírica end-to-end del patrón exigido por el contrato: el cliente se
+    inyecta vía Depends() en el endpoint y se pasa como argumento extra a la MISMA llamada
+    directa que `required_internal_calls` ya validaba. Comprueba, contra código real que sigue
+    exactamente ese patrón:
+    1) que `validate_generated_python_against_file_contracts` no reporta ninguna violación
+       (en particular ninguna de signature/data-flow), y
+    2) que `poc_facts_extractor` reconoce el cliente como una dependencia inyectada y
+       overrideable (lo que promociona el endpoint a HERMETIC_HTTP en test_plan_builder)."""
+    file_contracts = [
+        {
+            "path": "app/api/endpoints/upload.py",
+            "kind": "endpoint",
+            "required_internal_calls": [
+                {
+                    "module": "app.integrations.google_drive",
+                    "symbol": "upload_to_google_drive",
+                    "action_ref": "upload_to_google_drive",
+                    "required": True,
+                    "interface_ref": "app.integrations.google_drive:upload_to_google_drive",
+                    "parameters": [{"name": "filename", "type": "string", "required": True}],
+                    "arguments_ref": "",
+                }
+            ],
+        },
+        {
+            "path": "app/integrations/google_drive.py",
+            "kind": "integration",
+            "provided_interfaces": [
+                {
+                    "symbol": "upload_to_google_drive",
+                    "kind": "function",
+                    "action_ref": "upload_to_google_drive",
+                    "parameters": [{"name": "filename", "type": "string", "required": True}],
+                    "returns": None,
+                    "returns_ref": "",
+                    "return_hint": None,
+                    "purpose": "",
+                    "interface_ref": "app.integrations.google_drive:upload_to_google_drive",
+                    "interface_required": True,
+                    "owner_path": "app/integrations/google_drive.py",
+                    "consumer_path": "app/api/endpoints/upload.py",
+                }
+            ],
+        },
+    ]
+
+    files_by_path = {
+        "app/api/endpoints/upload.py": (
+            "from fastapi import APIRouter, Depends\n"
+            "from app.integrations.google_drive import upload_to_google_drive, build_client\n\n"
+            "router = APIRouter()\n\n"
+            "@router.post('/upload')\n"
+            "async def create_upload(request: dict, client=Depends(build_client)):\n"
+            "    file_id = upload_to_google_drive(request['filename'], client=client)\n"
+            "    return {'status': 'success', 'file_id': file_id}\n"
+        ),
+        "app/integrations/google_drive.py": (
+            "from functools import lru_cache\n\n"
+            "@lru_cache\n"
+            "def build_client():\n"
+            "    return object()\n\n"
+            "def upload_to_google_drive(filename: str, client) -> str:\n"
+            "    result = client.files().create(body={'name': filename}).execute()\n"
+            "    return result.get('id')\n"
+        ),
+    }
+
+    violations = validate_generated_python_against_file_contracts(
+        files_by_path=files_by_path,
+        file_contracts=file_contracts,
+    )
+    assert violations == []
+
+    facts = extract_poc_facts_from_structure(files_by_path)
+    endpoint = next(ep for ep in facts.endpoints if ep.path == "/upload")
+
+    assert endpoint.depends == ["build_client"]
+    assert endpoint.depends_imports == ["app.integrations.google_drive.build_client"]
+    assert endpoint.uses_injected is True
 
 
 def test_validation_detects_lost_required_action() -> None:

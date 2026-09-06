@@ -718,3 +718,75 @@ def store_resource():
     )
 
     assert "CODE_REQUIRED_ACTION_STUB" in _codes(issues)
+
+
+def test_integration_detects_disallowed_config_field_accessed_inline_chained() -> None:
+    """Regresión: `get_settings().CAMPO_NO_PERMITIDO` (encadenado, sin variable intermedia)
+    pasaba desapercibido porque `_extract_provider_bindings` solo reconocía el patrón
+    `settings = get_settings(); settings.CAMPO`. Este es justo el patrón que el LLM produjo en
+    producción para un cliente de Google Drive, dejando pasar una credencial no declarada en el
+    contrato hasta el bucle de reparación de todo el proyecto (que tampoco logró arreglarlo)."""
+    file_contract = {
+        "kind": "integration",
+        "path": "app/integrations/google_drive_api.py",
+        "allowed_imports": [{"import_root": "googleapiclient.discovery"}],
+        "configuration_access": {
+            "provider_module": "app.core.config",
+            "provider_symbol": "get_settings",
+            "allowed_fields": ["google_drive_folder_id"],
+        },
+    }
+    generated_file = GeneratedFile(
+        path="app/integrations/google_drive_api.py",
+        content="""
+from googleapiclient.discovery import build
+from google.oauth2.service_account import Credentials
+
+from app.core.config import get_settings
+
+def build_client():
+    creds = Credentials.from_service_account_info(
+        get_settings().google_drive_service_account
+    )
+    return build("drive", "v3", credentials=creds)
+""",
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    matching = [issue for issue in issues if issue.code == "CONFIGURATION_FIELD_MISSING"]
+    assert len(matching) == 1
+    assert matching[0].details["field"] == "google_drive_service_account"
+
+
+def test_integration_detects_unresolved_symbol_missing_import() -> None:
+    """Regresión: un símbolo usado sin importar (`MediaFileUpload`) solo se detectaba en el
+    validador de proyecto completo, varios pasos después de la generación por-archivo — aquí
+    debe detectarse ya en el primer filtro, igual que en el caso real que lo disparó."""
+    file_contract = {
+        "kind": "integration",
+        "path": "app/integrations/google_drive_api.py",
+        "allowed_imports": [{"import_root": "googleapiclient.discovery"}],
+    }
+    generated_file = GeneratedFile(
+        path="app/integrations/google_drive_api.py",
+        content="""
+from googleapiclient.discovery import build
+
+def upload_to_google_drive(client, filename):
+    media = MediaFileUpload(filename, resumable=True)
+    return client.files().create(media_body=media).execute()
+""",
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    matching = [issue for issue in issues if issue.code == "UNRESOLVED_PYTHON_SYMBOL"]
+    assert len(matching) == 1
+    assert matching[0].details["symbol"] == "MediaFileUpload"

@@ -232,7 +232,11 @@ def test_e2e_generation_matrix_executes_generated_pytest(tmp_path: Path, fixture
     requirements_dev = patch.get("requirements-dev.txt", "")
     if fixture.name == "multipart_archivos":
         if not requirements_dev:
-            service._asegurar_requirements_dev(patch, {"spec": {"dev_dependencies": []}})
+            # `_asegurar_requirements_dev` solo añade python-multipart si detecta evidencia real
+            # de parámetros de fichero en runtime_contracts (no lo hardcodea para toda PoC).
+            service._asegurar_requirements_dev(
+                patch, {"spec": {"dev_dependencies": []}}, runtime_contracts=fixture.runtime_contracts
+            )
             requirements_dev = patch.get("requirements-dev.txt", "")
         assert "python-multipart" in requirements_dev, "multipart_archivos: missing python-multipart in requirements-dev.txt"
 

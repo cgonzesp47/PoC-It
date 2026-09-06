@@ -637,6 +637,7 @@ async def upload(file: UploadFile = File(...)):
                         "handler_name": "upload",
                         "status_code": 200,
                         "response_json_required_keys": ["filename"],
+                        "file_params_required": ["file"],
                     }
                 ],
             },

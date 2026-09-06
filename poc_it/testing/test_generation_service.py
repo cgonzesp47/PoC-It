@@ -26,6 +26,104 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_FEATURE_FLAG = "POC_IT_USE_TEST_GENERATION_SERVICE"
 
+# Base genérica de test harness: independiente de framework/integración concreta.
+# No incluye paquetes específicos (p.ej. python-multipart) salvo que se detecte que hacen falta
+# realmente (ver `requiere_multipart`).
+#
+# httpx + httpx2: `fastapi.testclient.TestClient` (usado tanto por los tests generados como por
+# los probes internos de PoC-it, ver poc_it.orquestacion.verificador_runtime/wiring_verifier/
+# runtime_probe) requiere un cliente HTTP compatible con starlette.testclient. Versiones de
+# starlette anteriores a la migración a httpx2 solo conocen `httpx`; versiones más recientes
+# prefieren `httpx2` (con `httpx` como fallback deprecado). Instalar ambos evita acoplar PoC-it a
+# una versión concreta de starlette/fastapi: cualquiera de las dos que el entorno resuelva,
+# TestClient encuentra la que necesita.
+GENERIC_TEST_HARNESS_DEPS = ("pytest", "pytest-mock", "httpx", "httpx2", "pytest-json-report")
+
+
+def requiere_multipart(resultado: Dict[str, Any], runtime_contracts: Optional[dict] = None) -> bool:
+    """Detecta genéricamente si la PoC necesita `python-multipart` (upload de ficheros).
+
+    No es un hardcode de "toda PoC FastAPI necesita esto": solo se activa si hay evidencia real
+    de parámetros de fichero en algún endpoint (runtime_contracts) o si el propio SPEC ya lo
+    declara como dependencia/dev_dependency.
+    """
+    rc = runtime_contracts
+    if not isinstance(rc, dict) and isinstance(resultado, dict):
+        candidate = resultado.get("runtime_contracts")
+        rc = candidate if isinstance(candidate, dict) else None
+
+    if isinstance(rc, dict):
+        for ep in rc.get("endpoints") or []:
+            if not isinstance(ep, dict):
+                continue
+            if ep.get("file_params_required") or ep.get("file_params_optional"):
+                return True
+
+    spec = resultado.get("spec") if isinstance(resultado, dict) else None
+    if isinstance(spec, dict):
+        for key in ("dependencies", "dev_dependencies"):
+            declared = spec.get(key)
+            if isinstance(declared, list) and any(
+                str(d).strip().lower() == "python-multipart" for d in declared
+            ):
+                return True
+
+    return False
+
+
+def _normalizar_reqs(lines: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: set = set()
+    for ln in lines:
+        s = (ln or "").strip()
+        if not s or s.startswith("#"):
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def ensure_generic_requirements_dev(
+    estructura: Dict[str, str],
+    resultado: Dict[str, Any],
+    *,
+    runtime_contracts: Optional[dict] = None,
+) -> bool:
+    """Garantiza que `requirements-dev.txt` exista en `estructura` con, al menos, la base
+    genérica de test harness (+ `python-multipart` si se detecta que hace falta).
+
+    Idempotente y no destructivo: si `requirements-dev.txt` ya existe (con contenido), no lo
+    toca — esto puede llamarse tanto de forma temprana (antes de generar tests, para que los
+    probes internos de PoC-it que usan TestClient tengan su HTTP client disponible) como desde
+    `TestGenerationService.materialize_result` (tras generar tests) sin pisar nada.
+
+    Devuelve True si materializó `requirements-dev.txt` (no existía o estaba vacío).
+    """
+    spec = resultado.get("spec") if isinstance(resultado, dict) else None
+    dev_deps: List[str] = []
+    if isinstance(spec, dict):
+        dd = spec.get("dev_dependencies")
+        if isinstance(dd, list):
+            dev_deps = [str(x) for x in dd if str(x).strip()]
+
+    for base in GENERIC_TEST_HARNESS_DEPS:
+        if base not in dev_deps:
+            dev_deps.append(base)
+
+    if requiere_multipart(resultado, runtime_contracts) and "python-multipart" not in dev_deps:
+        dev_deps.append("python-multipart")
+
+    dev_deps = _normalizar_reqs(dev_deps)
+
+    existing = (estructura.get("requirements-dev.txt") or "").strip()
+    if existing:
+        return False
+
+    estructura["requirements-dev.txt"] = "\n".join(dev_deps) + "\n"
+    return True
+
 
 class TestGenerationService:
     __test__ = False
@@ -171,6 +269,7 @@ class TestGenerationService:
         estructura_destino: Dict[str, str],
         archivos_creados: List[str],
         resultado: Optional[Dict[str, Any]] = None,
+        runtime_contracts: Optional[dict] = None,
     ) -> bool:
         archivos_tests = materializar_proyecto(
             nombre_proyecto=nombre_proyecto,
@@ -180,7 +279,7 @@ class TestGenerationService:
         archivos_creados.extend(archivos_tests)
         estructura_destino.update(result.structure_patch)
 
-        self._asegurar_requirements_dev(estructura_destino, resultado or {})
+        self._asegurar_requirements_dev(estructura_destino, resultado or {}, runtime_contracts=runtime_contracts)
         req_files_to_materialize: Dict[str, str] = {}
         if "requirements-dev.txt" in estructura_destino:
             req_files_to_materialize["requirements-dev.txt"] = estructura_destino["requirements-dev.txt"]
@@ -227,35 +326,23 @@ class TestGenerationService:
         return "PARCIAL"
 
     def _normalizar_reqs(self, lines: List[str]) -> List[str]:
-        out: List[str] = []
-        seen = set()
-        for ln in lines:
-            s = (ln or "").strip()
-            if not s or s.startswith("#"):
-                continue
-            if s in seen:
-                continue
-            seen.add(s)
-            out.append(s)
-        return out
+        return _normalizar_reqs(lines)
 
-    def _asegurar_requirements_dev(self, estructura: Dict[str, str], resultado: Dict[str, Any]) -> None:
-        spec = resultado.get("spec") if isinstance(resultado, dict) else None
-        dev_deps = []
-        if isinstance(spec, dict):
-            dd = spec.get("dev_dependencies")
-            if isinstance(dd, list):
-                dev_deps = [str(x) for x in dd if str(x).strip()]
+    # Mantenido como atributo de clase por compatibilidad con callers existentes; la fuente de
+    # verdad es el `GENERIC_TEST_HARNESS_DEPS` a nivel de módulo.
+    _GENERIC_TEST_HARNESS_DEPS = GENERIC_TEST_HARNESS_DEPS
 
-        if not dev_deps:
-            dev_deps = ["pytest", "pytest-mock", "httpx", "pytest-json-report", "python-multipart"]
+    def _requiere_multipart(self, resultado: Dict[str, Any], runtime_contracts: Optional[dict]) -> bool:
+        return requiere_multipart(resultado, runtime_contracts)
 
-        dev_deps.extend(["pytest-json-report", "python-multipart"])
-        dev_deps = self._normalizar_reqs(dev_deps)
-
-        existing = (estructura.get("requirements-dev.txt") or "").strip()
-        if not existing:
-            estructura["requirements-dev.txt"] = "\n".join(dev_deps) + "\n"
+    def _asegurar_requirements_dev(
+        self,
+        estructura: Dict[str, str],
+        resultado: Dict[str, Any],
+        *,
+        runtime_contracts: Optional[dict] = None,
+    ) -> None:
+        ensure_generic_requirements_dev(estructura, resultado, runtime_contracts=runtime_contracts)
 
     def _safe_semantic_enrichment(
         self,

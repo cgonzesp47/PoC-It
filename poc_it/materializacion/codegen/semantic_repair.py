@@ -317,7 +317,15 @@ def _persist_rejected_candidate(
     candidate_content: str,
     before_issues: List[CodegenIssue],
     after_issues: List[CodegenIssue],
+    rejected_attempts_by_path: Dict[str, List[Dict[str, Any]]] | None = None,
 ) -> None:
+    if rejected_attempts_by_path is not None:
+        rejected_attempts_by_path.setdefault(path, []).append(
+            {
+                "content": candidate_content,
+                "issues": [str(issue.message or "").strip() for issue in after_issues if issue.message],
+            }
+        )
     candidate_filename = dump_codegen_candidate_for_debug(
         path=path,
         attempt=attempt,
@@ -456,6 +464,7 @@ def repair_generated_project(
         )
     )
     previous_blocking_count = len(blocking_before)
+    rejected_attempts_by_path: Dict[str, List[Dict[str, Any]]] = {}
 
     for round_index in range(1, max(1, int(max_rounds)) + 1):
         if not blocking_before:
@@ -533,6 +542,7 @@ def repair_generated_project(
                         )
                     )
                 ],
+                previous_rejected_attempts=rejected_attempts_by_path.get(path),
             )
             attempt_number = round_index
             raw = llm_call(
@@ -541,7 +551,7 @@ def repair_generated_project(
                 temperature=0.1,
                 max_tokens=2600,
                 fase="generacion_codigo_project_repair",
-                provider_hint="gen-code",
+                provider_hint="code-gen",
             )
             repaired_file, parse_issues = parse_single_file_response(
                 raw=raw,
@@ -580,6 +590,7 @@ def repair_generated_project(
                     candidate_content=candidate_file.content,
                     before_issues=path_issues,
                     after_issues=blocking_local_issues,
+                    rejected_attempts_by_path=rejected_attempts_by_path,
                 )
                 continue
             if candidate_ast_issues:
@@ -599,6 +610,7 @@ def repair_generated_project(
                     candidate_content=candidate_file.content,
                     before_issues=path_issues,
                     after_issues=blocking_local_issues,
+                    rejected_attempts_by_path=rejected_attempts_by_path,
                 )
                 continue
 
@@ -620,6 +632,7 @@ def repair_generated_project(
                     candidate_content=candidate_file.content,
                     before_issues=path_issues,
                     after_issues=blocking_local_issues,
+                    rejected_attempts_by_path=rejected_attempts_by_path,
                 )
                 continue
 
@@ -645,6 +658,7 @@ def repair_generated_project(
                     candidate_content=candidate_file.content,
                     before_issues=path_issues,
                     after_issues=candidate_project_issues,
+                    rejected_attempts_by_path=rejected_attempts_by_path,
                 )
                 continue
 

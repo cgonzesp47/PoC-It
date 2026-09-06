@@ -9,6 +9,16 @@ from poc_it.generador.utils_python_names import (
     safe_python_identifier,
 )
 
+# Nombre FIJO y determinista de la función proveedora del cliente de una integración.
+# Debe ser exactamente el mismo en el File Contract del fichero de integración (que la define,
+# ver `required_symbols` más abajo) y en el del endpoint consumidor (que la importa e inyecta
+# vía `Depends(...)`). Antes solo el lado de la integración tenía este nombre fijado
+# (`required_symbols = ["build_client"]`); el lado del endpoint solo recibía la instrucción
+# genérica "expón/inyecta un proveedor", sin el nombre exacto — cada llamada al LLM (son
+# generaciones independientes, un fichero por llamada) inventaba su propio nombre, y como no
+# coincidían, el endpoint terminaba sin saber qué importar.
+_INTEGRATION_CLIENT_PROVIDER_SYMBOL = "build_client"
+
 
 @dataclass(frozen=True)
 class FileContract:
@@ -463,11 +473,45 @@ def build_file_contracts_from_spec(
                     endpoint_specific_obligations.append("Validate the declared request")
                 if actions:
                     endpoint_specific_obligations.append("Execute all required actions")
-                endpoint_specific_obligations.append(
-                    "Invoke the referenced service or integration"
-                    if integration_refs or external_dependencies
-                    else "Keep invocation logic inside the endpoint boundary"
-                )
+                if integration_refs or external_dependencies:
+                    # IMPORTANTE: la acción se sigue invocando como llamada de función DIRECTA
+                    # (import + llamada), exactamente igual que antes — required_internal_calls
+                    # sigue validando eso sin cambios. Lo único que cambia es de dónde sale el
+                    # cliente que esa llamada necesita: en vez de que la función de la integración
+                    # lo construya por dentro (no overrideable), el handler lo recibe vía
+                    # `Depends(...)` y lo pasa como argumento en la misma llamada directa.
+                    endpoint_specific_obligations.append("Invoke the referenced service or integration")
+                    # CRÍTICO: dar el nombre EXACTO y el módulo EXACTO, no una descripción
+                    # genérica. El fichero de integración y el de endpoint se generan en llamadas
+                    # LLM independientes; si cada uno "inventa" su propio nombre para esta
+                    # función, no coinciden y el endpoint no tiene nada real que importar.
+                    provider_fqns = [
+                        f"{module_path_from_file_path(module_path)}.{_INTEGRATION_CLIENT_PROVIDER_SYMBOL}"
+                        for module_path in dedicated_modules
+                    ]
+                    if provider_fqns:
+                        endpoint_specific_obligations.append(
+                            "Import `"
+                            + _INTEGRATION_CLIENT_PROVIDER_SYMBOL
+                            + "` from "
+                            + ", ".join(f"`{fqn.rsplit('.', 1)[0]}`" for fqn in provider_fqns)
+                            + " and inject it as a `Depends("
+                            + _INTEGRATION_CLIENT_PROVIDER_SYMBOL
+                            + ")` parameter of the handler; pass the resulting client as an "
+                            "argument in the (still direct) call to the action function — do "
+                            "not let the action function build its own client internally, and "
+                            "do not invent a different name for this provider function"
+                        )
+                    else:
+                        endpoint_specific_obligations.append(
+                            f"Inject that integration's client provider function "
+                            f"(`{_INTEGRATION_CLIENT_PROVIDER_SYMBOL}`) as a `Depends(...)` "
+                            "parameter of the handler, and pass the resulting client as an "
+                            "argument in the (still direct) call to the action function — do "
+                            "not let the action function build its own client internally"
+                        )
+                else:
+                    endpoint_specific_obligations.append("Keep invocation logic inside the endpoint boundary")
                 if errors:
                     endpoint_specific_obligations.append("Map declared HTTP errors")
                 if any(endpoint.get("response") for endpoint in eps_for_file):
@@ -543,7 +587,7 @@ def build_file_contracts_from_spec(
                 technologies_by_name=technologies_by_name,
             )
             notes.extend(technology_notes)
-            required_symbols = ["build_client"]
+            required_symbols = [_INTEGRATION_CLIENT_PROVIDER_SYMBOL]
             responsibilities = [
                 "encapsular la integración externa asignada",
                 "construir el cliente de forma lazy",
@@ -622,7 +666,23 @@ def build_file_contracts_from_spec(
                     "Apply the declared authentication flow",
                     "Read the declared configuration",
                     "Raise internal or domain errors",
-                    "Allow substitution by mocks in tests",
+                    # Concreto y accionable (no solo "permitir mocks"): separa "construir el
+                    # cliente" (una función proveedora sin argumentos requeridos, compatible con
+                    # `Depends(...)`) de "usar el cliente para ejecutar la acción" (la función de
+                    # la acción NUNCA debe construir el cliente por dentro; debe recibirlo como
+                    # parámetro). Así el endpoint consumidor puede inyectar el cliente vía
+                    # `Depends(...)` y overridearlo en tests herméticos, sin dejar de invocar la
+                    # función de acción directamente (sigue siendo una llamada de función normal,
+                    # solo que con el cliente ya construido pasado como argumento).
+                    # Nombre EXACTO y fijo (ver required_symbols): el fichero de endpoint que
+                    # consume esta integración recibe la MISMA instrucción con este mismo
+                    # nombre, para que ambas generaciones (independientes) coincidan.
+                    f"Expose the client construction as its own zero-required-argument "
+                    f"provider function (FastAPI-Depends-compatible) named exactly "
+                    f"`{_INTEGRATION_CLIENT_PROVIDER_SYMBOL}`, separate from the action "
+                    f"function(s)",
+                    "Each action function must RECEIVE the client as an explicit parameter "
+                    "instead of constructing/importing it internally",
                 ]
                 + [
                     f"Implement external action '{action.get('id')}'"
@@ -666,7 +726,16 @@ def build_file_contracts_from_spec(
                 "variables de entorno",
                 "no validar credenciales en import-time",
             ]
-            allowed_imports = ["pydantic_settings", "functools"]
+            # "functools" es stdlib (no requiere package). El import de settings NO se hardcodea
+            # como literal "pydantic_settings": se deriva del TechnologySignal cuyo `packages`
+            # incluye "pydantic-settings" (spec_builder.py añade esa señal como baseline
+            # arquitectónico de PoC-it). Si esa señal faltara en spec.technology_signals, el
+            # gate DEPENDENCY_IMPORT_NOT_DECLARED (file_contracts_validation.py) lo atraparía
+            # antes de codegen en vez de dejar un import sin package instalable declarado.
+            allowed_imports = ["functools"] + _import_roots_for_package(
+                package="pydantic-settings",
+                technologies_by_name=technologies_by_name,
+            )
             if bool((persistence or {}).get("required")):
                 notes.append(
                     "Preparar settings de persistencia sin hardcodear vendor si SPEC no lo exige"
@@ -1034,11 +1103,43 @@ def _import_roots_for_integrations(
             if not isinstance(technology, dict):
                 continue
             import_roots = technology.get("import_roots") or []
-            if not isinstance(import_roots, list):
+            if not isinstance(import_roots, (list, tuple)):
                 continue
             for root in import_roots:
                 if isinstance(root, str) and root.strip():
                     roots.append(root.strip())
+    return _dedupe_strings(roots)
+
+
+def _import_roots_for_package(
+    *,
+    package: str,
+    technologies_by_name: Dict[str, Dict[str, Any]],
+) -> List[str]:
+    """Localiza los `import_roots` del TechnologySignal cuyo `packages` incluye `package`.
+
+    Es el inverso de `_import_roots_for_integrations`: en vez de partir de una integración
+    referenciada por el usuario, parte de un paquete que PoC-it necesita por decisión propia de
+    arquitectura (p.ej. pydantic-settings para app/core/config.py) y localiza el import_root
+    correspondiente a través del TechnologySignal — nunca hardcodeando el nombre del módulo.
+
+    Si no existe ningún TechnologySignal que declare ese package, devuelve [] (el import no se
+    añade a allowed_imports; el gate DEPENDENCY_IMPORT_NOT_DECLARED se encarga de reportar esa
+    ausencia como defecto de generación en vez de dejarlo para el runtime).
+    """
+    target = package.strip().casefold()
+    roots: List[str] = []
+    for technology in technologies_by_name.values():
+        if not isinstance(technology, dict):
+            continue
+        packages = technology.get("packages") or []
+        if not isinstance(packages, (list, tuple)):
+            continue
+        if not any(str(p or "").strip().casefold() == target for p in packages):
+            continue
+        for root in technology.get("import_roots") or []:
+            if isinstance(root, str) and root.strip():
+                roots.append(root.strip())
     return _dedupe_strings(roots)
 
 
@@ -1059,9 +1160,9 @@ def _missing_import_root_notes(
                 continue
             import_roots = technology.get("import_roots") or []
             packages = technology.get("packages") or []
-            if isinstance(import_roots, list) and import_roots:
+            if isinstance(import_roots, (list, tuple)) and import_roots:
                 continue
-            if not isinstance(packages, list):
+            if not isinstance(packages, (list, tuple)):
                 continue
             for package in packages:
                 package_name = str(package or "").strip()
@@ -1161,7 +1262,7 @@ def _technology_signals_for_dependencies(
     result: List[Dict[str, Any]] = []
     for technology in technologies_by_name.values():
         packages = technology.get("packages") or technology.get("dependency_names") or []
-        if not isinstance(packages, list):
+        if not isinstance(packages, (list, tuple)):
             continue
         if normalized_dependencies.intersection(
             {str(item or "").strip() for item in packages if str(item or "").strip()}

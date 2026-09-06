@@ -71,8 +71,18 @@ def run_pytest_in_project(
     *,
     timeout_seconds: int = 60,
     extra_env: Mapping[str, str] | None = None,
+    python_executable: str | None = None,
 ) -> PytestExecutionResult:
+    """Ejecuta pytest sobre `project_root`.
+
+    `python_executable`: intérprete a usar. Debe ser el Python del entorno aislado de la PoC
+    generada (`.poc_it/venv`, ver `poc_it.runtime.poc_runtime_environment`), NUNCA
+    `sys.executable` del proceso de PoC-it, si se está ejecutando código de una PoC generada.
+    Por compatibilidad, si no se pasa, se usa `sys.executable` (comportamiento previo) — pensado
+    para callers que ejecutan pytest sobre fixtures propias de PoC-it, no sobre una PoC generada.
+    """
     root = Path(project_root).resolve()
+    py = python_executable or sys.executable
     env = os.environ.copy()
     env["PYTHONPATH"] = str(root)
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
@@ -83,8 +93,8 @@ def run_pytest_in_project(
         for key, value in extra_env.items():
             env[str(key)] = str(value)
 
-    collect_command = (sys.executable, "-m", "pytest", "--collect-only", "-q")
-    command = (sys.executable, "-m", "pytest", "-q")
+    collect_command = (py, "-m", "pytest", "--collect-only", "-q")
+    command = (py, "-m", "pytest", "-q")
     started = time.perf_counter()
     try:
         collect_completed = subprocess.run(

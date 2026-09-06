@@ -2,13 +2,56 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from poc_it.generador.json_utils import extraer_json_tolerante
+from poc_it.generador.prompts_file_contracts import generic_python_correctness_rules
 from poc_it.infraestructura.llm_client import chat_completion_json
+
+_DIAGNOSTIC_METHODOLOGY_RULE = (
+    "- Al diagnosticar un error, no te quedes con la interpretación superficial del mensaje de "
+    "la excepción. Identifica la línea/expresión exacta que lo lanzó, y rastrea CADA valor "
+    "usado en esa expresión hasta su origen en el código (dónde se asignó, se devolvió, o se "
+    "seleccionó de un dict/objeto) para confirmar que realmente contiene lo que el código "
+    "asume. Solo si el valor rastreado es correcto, considera el propio recurso/sistema "
+    "externo (fichero, red, credenciales...) como culpable."
+)
+
+
+def _render_generic_rules_section() -> str:
+    rules = generic_python_correctness_rules() + [_DIAGNOSTIC_METHODOLOGY_RULE]
+    return "\n".join(["", "REGLAS GENÉRICAS (aprendidas de bugs reales, aplican a cualquier stack):", *rules, ""])
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _dump_safe_repair_attempt(*, outer_attempt: int, inner_attempt: int, payload: dict) -> None:
+    """
+    Persiste en `output/_debug/` el detalle de un intento de Safe LLM Repair (diagnóstico +
+    parche propuesto + por qué se aceptó/rechazó).
+
+    Por qué hace falta: antes, cuando un parche pasaba los gates internos de este módulo
+    (AST/compile) pero luego era rechazado por la verificación EXTERNA del caller
+    (reparacion_runtime.py: import real, wiring, o una petición real vía el probe), no quedaba
+    ningún rastro en disco de qué había propuesto el LLM ni por qué. Diagnosticar por qué la
+    reparación automática seguía fallando ronda tras ronda exigía adivinar a partir de logs de
+    una sola línea. Con esto queda un artefacto inspeccionable por intento.
+    """
+    try:
+        debug_dir = Path("output/_debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"safe_repair_o{outer_attempt}_i{inner_attempt}.json"
+        (debug_dir / filename).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        _LOGGER.warning("No se pudo persistir el intento de safe repair (o=%s i=%s): %s", outer_attempt, inner_attempt, exc)
 
 # ============================================
 # LLM SAFE REPAIR (PIPELINE A - SUBSECTION)
@@ -159,6 +202,43 @@ def _in_memory_ast_ok(patch: Dict[str, str]) -> Tuple[bool, str]:
     return True, "OK"
 
 
+def _render_previous_attempts_section(previous_attempts: Optional[List[Dict[str, Any]]]) -> str:
+    """
+    Renderiza los intentos de rondas EXTERIORES anteriores (llamadas previas a
+    `run_llm_safe_repair` para el mismo fallo) que superaron los gates internos de este módulo
+    (AST/compile) pero fueron rechazados por verificación EXTERNA (import real, wiring, o una
+    petición real al endpoint vía el probe) — algo que este módulo, por sí solo, no puede ver.
+
+    Por qué hace falta: sin esto, cada ronda exterior llamaba a este reparador desde cero, sin
+    ninguna pista de qué ya se había probado y por qué seguía fallando "de verdad", así que el
+    LLM podía repetir el mismo intento (o oscilar entre 2 intentos igual de erróneos)
+    indefinidamente.
+    """
+    if not previous_attempts:
+        return ""
+    entries = []
+    for item in previous_attempts:
+        if not isinstance(item, dict):
+            continue
+        entries.append(
+            {
+                "patch": item.get("patch") or {},
+                "por_que_se_rechazo": item.get("reason") or "",
+            }
+        )
+    if not entries:
+        return ""
+    return f"""
+
+- INTENTOS ANTERIORES YA PROBADOS Y RECHAZADOS (de rondas de reparación previas para este MISMO fallo):
+  Estos parches ya se aplicaron de verdad y se volvió a comprobar el proyecto (import real /
+  wiring / petición real al endpoint) — NO fue un rechazo superficial. NO repitas ninguno de
+  estos intentos ni una variación equivalente; el motivo de rechazo indica exactamente por qué
+  ese enfoque no funciona en la práctica.
+{json.dumps(entries, ensure_ascii=False, indent=2)[:8000]}
+"""
+
+
 def _render_diag_prompt(
     *,
     spec: Optional[dict],
@@ -166,6 +246,7 @@ def _render_diag_prompt(
     guardrails_warnings: Optional[List[str]],
     allowlist: Sequence[str],
     files_subset: List[Dict[str, str]],
+    previous_attempts: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     return f"""
 Eres un senior engineer. Necesito diagnosticar por qué un proyecto FastAPI generado NO es importable / falla en runtime_verify.
@@ -186,7 +267,8 @@ INPUTS:
 
 - files (contenido actual, solo subset allowlist):
 {json.dumps(files_subset, ensure_ascii=False, indent=2)[:12000]}
-
+{_render_previous_attempts_section(previous_attempts)}
+{_render_generic_rules_section()}
 SALIDA OBLIGATORIA (JSON puro):
 {{
   "root_causes": ["... (max 3)"],
@@ -214,6 +296,7 @@ def _render_patch_prompt(
     diag: dict,
     previous_rejected_patch: Optional[Dict[str, str]] = None,
     gate_errors: Optional[List[str]] = None,
+    previous_attempts: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     return f"""
 Eres un senior engineer. Genera un PATCH mínimo para corregir el fallo de import/runtime.
@@ -239,7 +322,8 @@ Contexto:
 
 - errores de gates (si existe):
 {json.dumps(gate_errors or [], ensure_ascii=False, indent=2)}
-
+{_render_previous_attempts_section(previous_attempts)}
+{_render_generic_rules_section()}
 SALIDA OBLIGATORIA (JSON puro):
 {{
   "files": [
@@ -266,6 +350,8 @@ def run_llm_safe_repair(
     runtime_detail: str,
     guardrails_warnings: Optional[List[str]] = None,
     extra_allow_paths: Optional[Sequence[str]] = None,
+    previous_attempts: Optional[List[Dict[str, Any]]] = None,
+    outer_attempt: int = 0,
 ) -> SafeRepairResult:
     logs: List[SafeRepairAttemptLog] = []
 
@@ -299,6 +385,7 @@ def run_llm_safe_repair(
             guardrails_warnings=guardrails_warnings,
             allowlist=allowlist,
             files_subset=files_subset,
+            previous_attempts=previous_attempts,
         )
         raw_diag = chat_completion_json(
             prompt=diag_prompt,
@@ -306,18 +393,41 @@ def run_llm_safe_repair(
             temperature=config.temperature_diag,
             max_tokens=900,
             fase="code-gen",
+            provider_hint="code-gen",
         )
         diag = extraer_json_tolerante(raw_diag) or {}
         files_to_change = diag.get("files_to_change")
 
         if not isinstance(files_to_change, list) or not files_to_change:
             logs.append(SafeRepairAttemptLog(attempt, "diagnose", False, "diag sin files_to_change"))
+            _dump_safe_repair_attempt(
+                outer_attempt=outer_attempt,
+                inner_attempt=attempt,
+                payload={
+                    "stage_reached": "diagnose",
+                    "outcome": "rejected",
+                    "reason": "diag sin files_to_change",
+                    "raw_diag": raw_diag,
+                    "allowlist": list(allowlist),
+                },
+            )
             continue
 
         files_to_change_norm = [str(p).replace("\\", "/") for p in files_to_change if isinstance(p, (str,))]
         files_to_change_norm = [p for p in files_to_change_norm if p in set(allowlist)]
         if not files_to_change_norm:
             logs.append(SafeRepairAttemptLog(attempt, "diagnose", False, "diag propone archivos fuera de allowlist"))
+            _dump_safe_repair_attempt(
+                outer_attempt=outer_attempt,
+                inner_attempt=attempt,
+                payload={
+                    "stage_reached": "diagnose",
+                    "outcome": "rejected",
+                    "reason": "diag propone archivos fuera de allowlist",
+                    "diag": diag,
+                    "allowlist": list(allowlist),
+                },
+            )
             continue
 
         # 2) PATCH
@@ -332,6 +442,7 @@ def run_llm_safe_repair(
             diag=diag,
             previous_rejected_patch=previous_rejected_patch,
             gate_errors=last_gate_errors,
+            previous_attempts=previous_attempts,
         )
         raw_patch = chat_completion_json(
             prompt=patch_prompt,
@@ -339,11 +450,23 @@ def run_llm_safe_repair(
             temperature=config.temperature_patch,
             max_tokens=2000,
             fase="code-gen",
+            provider_hint="code-gen",
         )
         data = extraer_json_tolerante(raw_patch) or {}
         files = data.get("files")
         if not isinstance(files, list) or not files:
             logs.append(SafeRepairAttemptLog(attempt, "patch", False, "patch sin files[]"))
+            _dump_safe_repair_attempt(
+                outer_attempt=outer_attempt,
+                inner_attempt=attempt,
+                payload={
+                    "stage_reached": "patch",
+                    "outcome": "rejected",
+                    "reason": "patch sin files[]",
+                    "diag": diag,
+                    "raw_patch": raw_patch,
+                },
+            )
             continue
 
         patch: Dict[str, str] = {}
@@ -360,6 +483,18 @@ def run_llm_safe_repair(
 
         if not patch:
             logs.append(SafeRepairAttemptLog(attempt, "patch", False, "patch vacío tras filtrar allowlist"))
+            _dump_safe_repair_attempt(
+                outer_attempt=outer_attempt,
+                inner_attempt=attempt,
+                payload={
+                    "stage_reached": "patch",
+                    "outcome": "rejected",
+                    "reason": "patch vacío tras filtrar allowlist",
+                    "diag": diag,
+                    "raw_patch": raw_patch,
+                    "patch_allowlist": patch_allowlist,
+                },
+            )
             continue
 
         # Gate mínimo local: AST en los .py del patch
@@ -368,9 +503,33 @@ def run_llm_safe_repair(
             previous_rejected_patch = patch
             last_gate_errors = [ast_detail]
             logs.append(SafeRepairAttemptLog(attempt, "gate", False, ast_detail))
+            _dump_safe_repair_attempt(
+                outer_attempt=outer_attempt,
+                inner_attempt=attempt,
+                payload={
+                    "stage_reached": "gate_ast",
+                    "outcome": "rejected",
+                    "reason": ast_detail,
+                    "diag": diag,
+                    "patch": patch,
+                },
+            )
             continue
 
         logs.append(SafeRepairAttemptLog(attempt, "patch", True, f"patch candidate ok (files={list(patch.keys())})"))
+        _dump_safe_repair_attempt(
+            outer_attempt=outer_attempt,
+            inner_attempt=attempt,
+            payload={
+                "stage_reached": "patch",
+                "outcome": "accepted_by_internal_gates",
+                "reason": "pasa AST/compile; queda pendiente de verificación EXTERNA en el caller "
+                "(import real / wiring / probe) — ver el log de esa verificación para saber si esto "
+                "sobrevivió o se acabó revirtiendo.",
+                "diag": diag,
+                "patch": patch,
+            },
+        )
         return SafeRepairResult(ok=True, patch=patch, logs=logs, allowlist=list(allowlist))
 
     return SafeRepairResult(ok=False, patch={}, logs=logs, allowlist=list(allowlist))
