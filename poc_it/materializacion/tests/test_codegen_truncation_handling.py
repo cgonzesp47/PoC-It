@@ -411,3 +411,97 @@ def test_solicitar_respuesta_textual_codegen_uses_specific_direct_chain_after_pr
 
     assert '"path":"app/x.py"' in text
     assert calls == ["litellm_proxy", "mistral", "cerebras"]
+
+
+def test_litellm_proxy_retries_same_alias_with_more_tokens_on_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Regresión: un truncamiento (`finish_reason=length`) en un alias del proxy (p.ej.
+    `docs-groq`) descartaba ese alias y saltaba al siguiente SIN darle más presupuesto de tokens
+    — aunque un truncamiento significa exactamente eso: el modelo quería seguir escribiendo. Debe
+    reintentar el MISMO alias con más `max_tokens` antes de rendirse y pasar al siguiente."""
+    calls: list[tuple[str, int | None]] = []
+
+    def fake_proxy(messages, model=None, temperature=0.0, max_tokens=None, timeout=70, **extra):
+        calls.append((model, max_tokens))
+        if max_tokens is not None and max_tokens < 2000:
+            raise LLMTruncatedResponseError(
+                provider="litellm_proxy",
+                model=model,
+                finish_reason="length",
+                partial_content="respuesta parcial truncada",
+            )
+        return "respuesta completa"
+
+    monkeypatch.setattr(
+        "poc_it.infraestructura.llm_client._call_litellm_proxy",
+        fake_proxy,
+    )
+    monkeypatch.setattr(
+        "poc_it.infraestructura.llm_client.PROVIDER_COOLDOWN",
+        {},
+    )
+    monkeypatch.setattr(
+        "poc_it.infraestructura.llm_client.SESSION_PROVIDER_DISABLED",
+        {},
+    )
+
+    text = solicitarRespuestaTextual(
+        prompt="genera documentación",
+        fase="documentacion",
+        max_tokens=1200,
+    )
+
+    assert text == "respuesta completa"
+    # El primer intento del primer alias truncó con max_tokens=1200; el reintento (mismo alias)
+    # debe haber duplicado el presupuesto (2400) antes de tener éxito — nunca debería haber
+    # saltado a un alias distinto solo por el truncamiento.
+    assert len(calls) == 2
+    first_alias, first_tokens = calls[0]
+    second_alias, second_tokens = calls[1]
+    assert first_alias == second_alias
+    assert first_tokens == 1200
+    assert second_tokens == 2400
+
+
+def test_litellm_proxy_keeps_boosting_tokens_across_multiple_truncations(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Regresión: un único reintento (1200 -> 2400) no bastaba cuando la respuesta deseada
+    necesitaba más presupuesto todavía (visto en producción: un README truncado incluso tras
+    duplicar una vez). Debe seguir duplicando (2400 -> 4800 -> 6000) hasta caber o agotar el tope,
+    no rendirse tras el primer reintento fallido."""
+    calls: list[int | None] = []
+
+    def fake_proxy(messages, model=None, temperature=0.0, max_tokens=None, timeout=70, **extra):
+        calls.append(max_tokens)
+        if max_tokens is not None and max_tokens < 4800:
+            raise LLMTruncatedResponseError(
+                provider="litellm_proxy",
+                model=model,
+                finish_reason="length",
+                partial_content="respuesta parcial truncada",
+            )
+        return "respuesta completa"
+
+    monkeypatch.setattr(
+        "poc_it.infraestructura.llm_client._call_litellm_proxy",
+        fake_proxy,
+    )
+    monkeypatch.setattr(
+        "poc_it.infraestructura.llm_client.PROVIDER_COOLDOWN",
+        {},
+    )
+    monkeypatch.setattr(
+        "poc_it.infraestructura.llm_client.SESSION_PROVIDER_DISABLED",
+        {},
+    )
+
+    text = solicitarRespuestaTextual(
+        prompt="genera documentación",
+        fase="documentacion",
+        max_tokens=1200,
+    )
+
+    assert text == "respuesta completa"
+    assert calls == [1200, 2400, 4800]

@@ -101,6 +101,16 @@ class LLMError(Exception):
     """Error genérico de llamadas LLM."""
 
 
+# Tope al que dejamos crecer max_tokens al reintentar una respuesta truncada (evita reintentos
+# desproporcionados/costosos si el prompt en sí induce respuestas muy largas indefinidamente).
+_TRUNCATION_RETRY_MAX_TOKENS = 6000
+
+# Cuántos intentos (inicial + reintentos duplicando max_tokens) permitimos por alias antes de
+# darlo por perdido y pasar al siguiente. Con un max_tokens inicial pequeño (p.ej. 1200 para el
+# README) hacen falta varias duplicaciones para alcanzar el tope: 1200 -> 2400 -> 4800 -> 6000.
+_TRUNCATION_RETRY_MAX_ATTEMPTS = 4
+
+
 class LLMTruncatedResponseError(LLMError):
     def __init__(
         self,
@@ -182,14 +192,25 @@ import time as _time
 PROVIDER_COOLDOWN: Dict[str, float] = {}
 COOLDOWN_SECONDS = 60  # desactiva proveedor 60s tras rate limit crítico
 
+# Cooldown largo del "circuit breaker por ejecución" (ver SESSION_PROVIDER_DISABLED más abajo).
+# Antes era permanente para el resto del proceso: en un pipeline de PoC-it que dura 10-15 minutos
+# (codegen + tests + estimaciones + documentación), un rate limit puntual muy al principio dejaba
+# ese proveedor descartado hasta el final — justo cuando más falta hacía como fallback en la fase
+# de documentación. Las ventanas de rate limit de los proveedores gratuitos suelen ser por minuto,
+# así que un cooldown largo pero finito recupera el proveedor para el resto de la ejecución sin
+# volver a golpearlo inmediatamente.
+SESSION_DISABLE_SECONDS = 300
+
 # Si un provider devuelve 429, NO hacemos retries (pasamos a fallback) para no
 # quemar tokens/tiempo en la misma ejecución.
 NO_RETRY_ON_429 = True
 
-# “Circuit breaker” por ejecución: si un provider entra en cooldown una vez durante
-# esta ejecución, se evita en el resto de llamadas del proceso (además del cooldown temporal).
-# Esto es útil cuando varias fases (cls-json/ctx-json/docs/estimate) comparten el mismo provider upstream.
-SESSION_PROVIDER_DISABLED: Dict[str, bool] = {}
+# “Circuit breaker” por ejecución: si un provider entra en cooldown una vez durante esta
+# ejecución, se evita durante SESSION_DISABLE_SECONDS (no permanentemente — ver comentario junto a
+# esa constante). Esto sigue siendo útil cuando varias fases (cls-json/ctx-json/docs/estimate)
+# comparten el mismo provider upstream: evita machacarlo en los minutos siguientes al rate limit.
+# Valor = timestamp de expiración (epoch), no un booleano.
+SESSION_PROVIDER_DISABLED: Dict[str, float] = {}
 
 
 # ==========================================================
@@ -816,8 +837,8 @@ def solicitarRespuestaTextual(
         # Circuit breaker: proveedor en cooldown
         # -------------------------------
         now = _time.time()
-        if SESSION_PROVIDER_DISABLED.get(provider):
-            logger.debug("[LLM] %s deshabilitado en esta ejecución. Saltando proveedor.", provider.upper())
+        if now < SESSION_PROVIDER_DISABLED.get(provider, 0):
+            logger.debug("[LLM] %s deshabilitado temporalmente en esta ejecución. Saltando proveedor.", provider.upper())
             continue
 
         cooldown_until = PROVIDER_COOLDOWN.get(provider, 0)
@@ -858,24 +879,60 @@ def solicitarRespuestaTextual(
                 for alias in aliases_to_try:
                     if not is_demo_mode():
                         logger.debug("[LLM] Provider: LITELLM_PROXY (model=%s)", alias or FALLBACK_PROVIDER)
-                    try:
-                        return _call_litellm_proxy(
-                            messages,
-                            model=alias or None,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            timeout=effective_timeout,
-                        )
-                    except Exception as exc:
-                        proxy_last_exc = exc
-                        # Si es rate limit/fallo, probamos el siguiente alias
-                        if not is_demo_mode():
-                            logger.debug(
-                                "[LLM] ERROR en LITELLM_PROXY (model=%s): %s",
-                                alias or FALLBACK_PROVIDER,
-                                exc,
+                    alias_max_tokens = max_tokens
+                    # Un truncamiento (`finish_reason=length`) significa que el modelo quería
+                    # escribir más de lo que le dejamos: cambiar de alias con el MISMO presupuesto
+                    # probablemente vuelva a truncar. Antes de descartar este alias, seguimos
+                    # duplicando `max_tokens` (tope `_TRUNCATION_RETRY_MAX_TOKENS`) hasta que quepa
+                    # o hasta agotar `_TRUNCATION_RETRY_MAX_ATTEMPTS` intentos — un único reintento
+                    # no bastaba cuando la respuesta deseada era varias veces mayor que el
+                    # presupuesto inicial (p.ej. un README de partida en max_tokens=1200).
+                    for retry_attempt in range(_TRUNCATION_RETRY_MAX_ATTEMPTS):
+                        try:
+                            return _call_litellm_proxy(
+                                messages,
+                                model=alias or None,
+                                temperature=temperature,
+                                max_tokens=alias_max_tokens,
+                                timeout=effective_timeout,
                             )
-                        continue
+                        except LLMTruncatedResponseError as exc:
+                            proxy_last_exc = exc
+                            if not is_demo_mode():
+                                logger.debug(
+                                    "[LLM] Respuesta truncada en LITELLM_PROXY (model=%s, max_tokens=%s): %s",
+                                    alias or FALLBACK_PROVIDER,
+                                    alias_max_tokens,
+                                    exc,
+                                )
+                            can_boost = (
+                                retry_attempt < _TRUNCATION_RETRY_MAX_ATTEMPTS - 1
+                                and isinstance(alias_max_tokens, int)
+                                and alias_max_tokens > 0
+                                and alias_max_tokens < _TRUNCATION_RETRY_MAX_TOKENS
+                            )
+                            if can_boost:
+                                alias_max_tokens = min(
+                                    alias_max_tokens * 2, _TRUNCATION_RETRY_MAX_TOKENS
+                                )
+                                if not is_demo_mode():
+                                    logger.debug(
+                                        "[LLM] Reintentando alias=%s con max_tokens=%s tras truncamiento.",
+                                        alias or FALLBACK_PROVIDER,
+                                        alias_max_tokens,
+                                    )
+                                continue
+                            break
+                        except Exception as exc:
+                            proxy_last_exc = exc
+                            # Si es rate limit/fallo, probamos el siguiente alias
+                            if not is_demo_mode():
+                                logger.debug(
+                                    "[LLM] ERROR en LITELLM_PROXY (model=%s): %s",
+                                    alias or FALLBACK_PROVIDER,
+                                    exc,
+                                )
+                            break
 
                 # Si todos los aliases fallan (p.ej. timeouts en docs), saltamos al siguiente proveedor
                 # del chain (groq/cerebras/mistral/gemini/openrouter/ollama).
@@ -936,11 +993,13 @@ def solicitarRespuestaTextual(
             # Si es error fuerte de rate limit, activar cooldown
             if "rate limit" in str(exc).lower() or "429" in str(exc):
                 PROVIDER_COOLDOWN[provider] = _time.time() + COOLDOWN_SECONDS
-                SESSION_PROVIDER_DISABLED[provider] = True
+                SESSION_PROVIDER_DISABLED[provider] = _time.time() + SESSION_DISABLE_SECONDS
                 logger.debug(
-                    "[LLM] %s desactivado durante %ss por rate limit y deshabilitado para el resto de esta ejecución.",
+                    "[LLM] %s desactivado durante %ss por rate limit (cooldown corto) y durante %ss "
+                    "adicionales como circuit breaker de esta ejecución.",
                     provider.upper(),
                     COOLDOWN_SECONDS,
+                    SESSION_DISABLE_SECONDS,
                 )
 
             # Guardamos el error de ESTE proveedor sin importar cuál sea, para poder reportarlo
