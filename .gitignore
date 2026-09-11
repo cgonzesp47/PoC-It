@@ -8,3 +8,7 @@ __pycache__/
 
 # Generated PoC projects (test artifacts, not source)
 output/
+
+# Frontend (ui/): dependencias y build, no son código fuente
+ui/node_modules/
+ui/dist/
