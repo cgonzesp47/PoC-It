@@ -96,6 +96,52 @@ def validate_generated_file_semantics(
             for error in unresolved
         ]
 
+        # `Depends(...)` en posición de anotación de tipo (`param: Depends(x)`) en vez de valor
+        # por defecto (`param: Tipo = Depends(x)`) es SIEMPRE un bug: FastAPI/Pydantic intentan
+        # tratar el resultado de Depends(...) como un tipo real al construir el modelo del
+        # endpoint, y revientan en import-time con errores opacos (p.ej.
+        # "'Depends' object has no attribute '__mro__'"). Detectable de forma determinista por
+        # AST, sin falsos positivos posibles.
+        tree_for_depends = _python_tree(generated_file)
+        if tree_for_depends is not None:
+            issues = list(issues) + _validate_depends_as_annotation(tree_for_depends, generated_file)
+
+    return issues
+
+
+def _is_depends_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id == "Depends"
+    if isinstance(func, ast.Attribute):
+        return func.attr == "Depends"
+    return False
+
+
+def _validate_depends_as_annotation(
+    tree: ast.Module, generated_file: GeneratedFile
+) -> List[CodegenIssue]:
+    issues: List[CodegenIssue] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        all_args = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+        for arg in all_args:
+            if arg.annotation is not None and _is_depends_call(arg.annotation):
+                issues.append(
+                    _issue(
+                        "CODE_DEPENDS_USED_AS_ANNOTATION",
+                        generated_file,
+                        (
+                            f"El parámetro '{arg.arg}' de {node.name} usa Depends(...) como "
+                            "anotación de tipo en vez de valor por defecto: debe escribirse "
+                            f"'{arg.arg}: <Tipo> = Depends(...)', no '{arg.arg}: Depends(...)'."
+                        ),
+                        symbol=node.name,
+                    )
+                )
     return issues
 
 
@@ -432,6 +478,19 @@ def _validate_provided_interfaces(
             continue
 
         function_node = functions.get(symbol)
+
+        # `interface_required=False` (owner_path == consumer_path, ver
+        # file_contracts._resolve_action_owner_path) significa que la acción no vive en un
+        # módulo/repositorio dedicado: su "interfaz" es el propio handler del endpoint, que ya
+        # se valida por separado (required_symbols, request/response contract) con su forma real
+        # (p.ej. un único parámetro de modelo Pydantic, no los campos aplanados de la acción).
+        # Exigir aquí, además, una función named-after-the-action-id con esos campos como
+        # parámetros sueltos es un contrato inventado que ninguna implementación idiomática
+        # cumple. Solo exigimos symbol/parámetros cuando de verdad hay una interfaz separada
+        # que implementar (p.ej. una integración externa en su propio módulo).
+        if not interface_required:
+            continue
+
         if function_node is None:
             issues.append(
                 _issue(

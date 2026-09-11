@@ -16,6 +16,7 @@ Nota:
 from dataclasses import asdict
 from typing import Any, Dict, List, Literal, Sequence, Tuple
 
+from poc_it.generador.path_utils import extract_path_param_names, has_path_param
 from poc_it.generador.request_ir import (
     ApiContractIR,
     PersistenceIR,
@@ -420,9 +421,9 @@ def _contract_to_endpoint(
     response_block, resp_assumptions = _build_response_block(c)
     assumptions.extend(resp_assumptions)
 
-    if "{id}" in path:
+    if has_path_param(path):
         request_block = dict(request_block)
-        request_block["path_params"] = _infer_path_params_from_schema_hint(c.request_schema_hint)
+        request_block["path_params"] = _infer_path_params_from_schema_hint(path, c.request_schema_hint)
 
     bundle_files = _bundle_files_for_contract(c)
     ep_source: Dict[str, Any] = {"type": source_type}
@@ -584,7 +585,7 @@ def _func_name_from_contract(c: ApiContractIR) -> str:
     base_seg = "".join(ch for ch in base_seg if ch.isalnum() or ch in ("_", "-")).replace("-", "_") or "root"
 
     path = _normalize_path(c.path)
-    has_id = "{id}" in path
+    has_id = has_path_param(path)
     singular = _singularize_es(base_seg)
     plural = base_seg
 
@@ -609,7 +610,7 @@ def _build_request_block(c: ApiContractIR) -> Tuple[Dict[str, Any], List[str]]:
     assumptions: List[str] = []
 
     path = _normalize_path(c.path)
-    has_id = "{id}" in path
+    has_id = has_path_param(path)
 
     rt = (c.request_type or "none").strip()
     if rt not in ("json", "multipart", "query", "none"):
@@ -905,15 +906,29 @@ def _build_source_from_assumptions(
     return _dedupe_stable(out)
 
 
-def _infer_path_params_from_schema_hint(schema_hint: Any) -> Dict[str, str]:
+def _infer_path_params_from_schema_hint(path: str, schema_hint: Any) -> Dict[str, str]:
+    """Tipos de los parámetros de `path` (p.ej. {"product_id": "string"}).
+
+    Los nombres se derivan siempre del propio `path` (nunca se asume "id" literal); el
+    `schema_hint`, si lo declara, solo aporta el tipo de cada parámetro por nombre.
+    """
+    param_names = extract_path_param_names(path) or ["id"]
+
+    hint_dict: Dict[str, Any] = {}
     if isinstance(schema_hint, dict):
         for key in ("path_params", "pathParams", "params"):
             v = schema_hint.get(key)
-            if isinstance(v, dict) and "id" in v and isinstance(v.get("id"), str) and v.get("id").strip():
-                return {"id": v.get("id").strip()}
-        if "id" in schema_hint and isinstance(schema_hint.get("id"), str) and schema_hint.get("id").strip():
-            return {"id": schema_hint.get("id").strip()}
-    return {"id": "string"}
+            if isinstance(v, dict):
+                hint_dict = v
+                break
+        else:
+            hint_dict = schema_hint
+
+    result: Dict[str, str] = {}
+    for name in param_names:
+        value = hint_dict.get(name)
+        result[name] = value.strip() if isinstance(value, str) and value.strip() else "string"
+    return result
 
 
 def _merge_contract_ir(preferred: ApiContractIR, fallback: ApiContractIR) -> ApiContractIR:
@@ -1054,7 +1069,7 @@ def _merge_endpoint_dicts(preferred: Dict[str, Any], fallback: Dict[str, Any]) -
 
 
 def _default_errors_for_endpoint(*, method: str, path: str) -> List[Dict[str, Any]]:
-    if "{id}" in path and method in ("GET", "PUT", "PATCH", "DELETE"):
+    if has_path_param(path) and method in ("GET", "PUT", "PATCH", "DELETE"):
         return [
             {
                 "status_code": 404,

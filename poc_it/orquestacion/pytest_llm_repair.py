@@ -1250,6 +1250,26 @@ def _runtime_openapi_paths(runtime_contracts: Optional[dict]) -> Dict[str, set]:
     return out
 
 
+def _path_template_matches(url: str, template: str) -> bool:
+    """True si `url` (concreta, p.ej. /products/1) encaja con `template` (p.ej. /products/{product_id}).
+
+    No asume ningún nombre de parámetro: cualquier segmento `{...}` de la plantilla actúa como
+    comodín, sea cual sea su nombre real.
+    """
+    if "{" not in template:
+        return url == template
+    url_segments = url.strip("/").split("/")
+    template_segments = template.strip("/").split("/")
+    if len(url_segments) != len(template_segments):
+        return False
+    for u_seg, t_seg in zip(url_segments, template_segments):
+        if re.fullmatch(r"\{[^{}]+\}", t_seg):
+            continue
+        if u_seg != t_seg:
+            return False
+    return True
+
+
 def _gate_patch_tests_endpoints_exist_in_openapi(
     patch: Dict[str, str],
     *,
@@ -1292,16 +1312,17 @@ def _gate_patch_tests_endpoints_exist_in_openapi(
 
             if not url:
                 continue
-            # Normalizar path params: /items/1 -> /items/{id} si existe en OpenAPI
-            candidates = [url]
-            if re.search(r"/\d+", url):
-                candidates.append(re.sub(r"/\d+", "/{id}", url))
+            # Match contra las plantillas reales de OpenAPI (p.ej. /products/{product_id}),
+            # sin asumir que el path param se llama literalmente "id": una URL concreta de test
+            # como /products/1 debe reconocerse contra CUALQUIER nombre de parámetro declarado.
             ok = False
-            for cand in candidates:
-                ms = openapi_paths.get(cand)
-                if ms and meth in ms:
-                    ok = True
-                    break
+            if url in openapi_paths and meth in openapi_paths[url]:
+                ok = True
+            else:
+                for template, ms in openapi_paths.items():
+                    if meth in ms and _path_template_matches(url, template):
+                        ok = True
+                        break
             if not ok:
                 bad.append(f"{path}:{meth.upper()} {url}")
 
@@ -2115,6 +2136,14 @@ def repair_tests_until_pytest_passes(
             except Exception:
                 pass
 
+            # `no_improve_streak` es el único freno para dejar de intentar reparar cuando los
+            # parches sucesivos no mejoran nada: sin incrementarlo aquí, el check de la línea
+            # ~2193 (`if no_improve_streak >= NO_IMPROVE_LIMIT`) nunca se cumple y el bucle
+            # agota siempre `max_allowed` intentos (hasta 10), aunque lleve varias iteraciones
+            # sin ningún progreso real — justo el patrón observado: mismo fallo "unclassified"
+            # repetido intento tras intento sin converger.
+            no_improve_streak += 1
+
             append_trace_event(
                 project_dir,
                 TraceEvent(
@@ -2123,8 +2152,34 @@ def repair_tests_until_pytest_passes(
                     attempt=attempt,
                     action="gate_reject_no_improve",
                     files_changed=list(patch.keys()),
+                    detail=f"no_improve_streak={no_improve_streak}",
                 ),
             )
+
+            if no_improve_streak >= NO_IMPROVE_LIMIT:
+                logger.info(
+                    "[PYTEST-REPAIR] %s parches consecutivos sin mejora; degradando a contract-lite.",
+                    no_improve_streak,
+                )
+                _degrade_to_contract_lite(nombre_proyecto=nombre_proyecto, estructura=estructura)
+                ok2, out2, _ = _run_pytest(project_dir, python_executable)
+                _persist_test_validation_report(
+                    project_dir,
+                    ok=bool(ok2),
+                    degraded=True,
+                    degrade_type="contract-lite",
+                    production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+                    rejected_patch_paths=rejected_patch_paths,
+                    harness_strategy=harness_strategy,
+                )
+                return _mk_result(
+                    ok=bool(ok2),
+                    attempts=attempt,
+                    last_output=out2,
+                    patched_files=patched_total,
+                    degraded=True,
+                    degrade_type="contract-lite",
+                )
 
             attempt += 1
             continue

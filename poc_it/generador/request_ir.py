@@ -29,6 +29,7 @@ from poc_it.analisis.normalizador_contexto import (
     canonicalize_technology_signals,
     stable_identifier,
 )
+from poc_it.generador.path_utils import has_path_param
 
 
 RequestType = Literal["json", "multipart", "query", "none"]
@@ -513,6 +514,9 @@ def validate_capability_coverage(ir: RequestIR) -> List[str]:
     contract_index = _build_contract_index(ir)
     action_index = _build_action_index(ir)
     integration_ids = {i.id.strip().lower() for i in ir.integrations or [] if i.id.strip()}
+    integration_kind_by_id = {
+        i.id.strip().lower(): i.kind for i in ir.integrations or [] if i.id.strip()
+    }
 
     if ir.product_capabilities and not ir.capability_coverage:
         errors.append(
@@ -575,10 +579,25 @@ def validate_capability_coverage(ir: RequestIR) -> List[str]:
         ):
             errors.append(f"Capacidad marcada como covered sin referencias: {capability}")
 
-        if valid_integration_refs and not _coverage_has_external_action(coverage, action_index):
-            errors.append(
-                f"Capacidad con integración externa pero sin acción external_call: {capability}"
-            )
+        if valid_integration_refs:
+            ref_kinds = {
+                integration_kind_by_id.get(ref.strip().lower(), "other")
+                for ref in valid_integration_refs
+            }
+            # Una integración de tipo "database" se materializa como acceso a datos propio
+            # (ORM/driver local), no como una llamada de red a un tercero: exigirle una acción
+            # "external_call" es un falso positivo para cualquier PoC con persistencia (p.ej.
+            # PostgreSQL). Solo las integraciones que sí son servicios externos genuinos
+            # (external_api, queue, email, auth, ...) requieren esa acción.
+            if ref_kinds == {"database"}:
+                if not _coverage_has_action_kind(coverage, action_index, "persistence"):
+                    errors.append(
+                        f"Capacidad con integración de base de datos pero sin acción de persistencia: {capability}"
+                    )
+            elif not _coverage_has_external_action(coverage, action_index):
+                errors.append(
+                    f"Capacidad con integración externa pero sin acción external_call: {capability}"
+                )
 
         for action_ref in valid_action_refs:
             _, action = action_index[action_ref]
@@ -873,12 +892,20 @@ def _coverage_has_external_action(
     coverage: CapabilityCoverageIR,
     action_index: Dict[str, Tuple[ApiContractIR, ActionIR]],
 ) -> bool:
+    return _coverage_has_action_kind(coverage, action_index, "external_call")
+
+
+def _coverage_has_action_kind(
+    coverage: CapabilityCoverageIR,
+    action_index: Dict[str, Tuple[ApiContractIR, ActionIR]],
+    kind: ActionKind,
+) -> bool:
     for action_ref in coverage.action_refs:
         indexed = action_index.get(action_ref)
         if indexed is None:
             continue
         _, action = indexed
-        if action.kind == "external_call":
+        if action.kind == kind:
             return True
     return False
 
@@ -1066,7 +1093,7 @@ def _parse_contracts(raw: Any) -> List[ApiContractIR]:
         if request_type not in ("json", "multipart", "query", "none"):
             request_type = "none"
 
-        if "{id}" in path and request_type == "query" and method in ("GET", "DELETE"):
+        if has_path_param(path) and request_type == "query" and method in ("GET", "DELETE"):
             request_type = "none"
 
         schema_hint = req.get("schema_hint")

@@ -255,15 +255,18 @@ Salida conceptual:
 - Assumption que indique que POST /documents se propone porque el usuario pidió la capacidad, pero no especificó su interfaz.
 
 Reglas capability_coverage:
+- CORRESPONDENCIA OBLIGATORIA 1:1 con funcionalidades_clave: capability_coverage debe tener EXACTAMENTE un elemento por cada elemento de funcionalidades_clave, en el mismo orden. Ni más (no dividas una funcionalidad en varias entradas), ni menos (ninguna funcionalidad puede quedar sin su entrada de cobertura).
+- El campo "capability" debe ser una copia LITERAL, carácter a carácter, del string correspondiente en funcionalidades_clave. Nunca lo parafrasees, resumas ni lo dividas en sub-capacidades, aunque esa funcionalidad implique varios contratos/acciones (por ejemplo, un CRUD completo sigue siendo UNA sola funcionalidad si así se declaró en funcionalidades_clave): en ese caso, lista TODOS los contratos/acciones relevantes dentro de contract_refs/action_refs de esa misma entrada, no crees una entrada por cada contrato.
 - capability_id puede utilizarse como identificador descriptivo interno de la respuesta del normalizador, pero la aplicación asignará posteriormente el identificador canónico de cada capacidad durante la reconciliación.
 - No dependas de capability_id para expresar la relación entre una capacidad y sus contratos.
-- contract_refs, action_refs e integration_refs deben contener las referencias estructurales necesarias para vincular cada capacidad.
+- contract_refs, action_refs e integration_refs deben contener las referencias estructurales necesarias para vincular cada capacidad; una misma entrada puede (y debe, cuando aplique) listar varios contratos/acciones.
 - No marques covered sin referencias válidas.
 - Las referencias deben existir después de construir RequestIR.
 - Una capacidad de integración no está cubierta solo porque aparezca el nombre de una librería.
 - Una capacidad que requiera interactuar con un sistema externo debe referenciar una acción de tipo external_call y la integración correspondiente.
+- Una capacidad de persistencia en una base de datos propia (integración kind="database") debe referenciar una acción de tipo persistence, no external_call: external_call es solo para servicios de terceros genuinamente externos (APIs, colas, email, etc.), nunca para el acceso a la base de datos propia de la PoC.
 - No determines que una capacidad es externa basándote únicamente en verbos como subir, enviar, guardar, publicar o consultar. Debes determinarlo por la participación real de una integración externa.
-- Ejemplo:
+- Ejemplo (nótese que "capability" es idéntico, literal, al elemento de funcionalidades_clave):
   {
     "funcionalidades_clave": [
       "Enviar una notificación mediante POST /notifications"
@@ -271,7 +274,7 @@ Reglas capability_coverage:
     "capability_coverage": [
       {
         "capability_id": "send_notification",
-        "capability": "Enviar una notificación",
+        "capability": "Enviar una notificación mediante POST /notifications",
         "contract_refs": [
           "POST /notifications"
         ],
@@ -280,6 +283,34 @@ Reglas capability_coverage:
         ],
         "integration_refs": [
           "notification_provider"
+        ],
+        "status": "covered"
+      }
+    ]
+  }
+- Ejemplo de funcionalidad que agrupa varios contratos (CRUD) en UNA sola entrada de cobertura:
+  {
+    "funcionalidades_clave": [
+      "Gestionar productos mediante operaciones de creación, consulta, modificación y eliminación"
+    ],
+    "capability_coverage": [
+      {
+        "capability_id": "manage_products",
+        "capability": "Gestionar productos mediante operaciones de creación, consulta, modificación y eliminación",
+        "contract_refs": [
+          "POST /products",
+          "GET /products/{product_id}",
+          "PUT /products/{product_id}",
+          "DELETE /products/{product_id}"
+        ],
+        "action_refs": [
+          "POST /products#create_product",
+          "GET /products/{product_id}#get_product",
+          "PUT /products/{product_id}#update_product",
+          "DELETE /products/{product_id}#delete_product"
+        ],
+        "integration_refs": [
+          "products_database"
         ],
         "status": "covered"
       }

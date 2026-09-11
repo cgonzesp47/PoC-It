@@ -78,6 +78,12 @@ if (-not (Test-Path $litellmExe)) {
   exit 1
 }
 
+# LiteLLM imprime un banner con caracteres Unicode al arrancar. Sin forzar
+# UTF-8, Python usa la codificacion de consola (cp1252) y el banner revienta
+# con UnicodeEncodeError, tumbando el arranque del proxy.
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+
 Write-Host "[start_litellm_proxy] Iniciando LiteLLM Proxy..."
 Write-Host "  - Config: $ConfigPath"
 Write-Host "  - Port:   $Port"

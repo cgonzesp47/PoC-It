@@ -917,18 +917,22 @@ def _build_scenario_plans(*, mode: str, endpoint_plans: List[EndpointTestPlan]) 
         if method != "POST":
             continue
 
-        singular_candidates = []
+        # Buscamos el endpoint de recurso único correspondiente a esta colección
+        # (p.ej. GET/DELETE /products/{product_id} para POST /products) sin asumir
+        # ningún nombre concreto de path param: basta con que sea "el path de la
+        # colección + exactamente un segmento {...}".
         stripped = path.rstrip("/")
-        if stripped.endswith("s"):
-            singular_candidates.append(stripped + "/{product_id}")
-            singular_candidates.append(stripped[:-1] + "/{product_id}")
-        singular_candidates.append(stripped + "/{id}")
+        single_resource_re = re.compile(rf"^{re.escape(stripped)}/\{{[^{{}}]+\}}$")
 
         read_endpoint = None
         delete_endpoint = None
-        for candidate_path in singular_candidates:
-            read_endpoint = by_path_method.get(("GET", candidate_path)) or read_endpoint
-            delete_endpoint = by_path_method.get(("DELETE", candidate_path)) or delete_endpoint
+        for (candidate_method, candidate_path), candidate_endpoint in by_path_method.items():
+            if not single_resource_re.match(candidate_path):
+                continue
+            if candidate_method == "GET":
+                read_endpoint = candidate_endpoint
+            elif candidate_method == "DELETE":
+                delete_endpoint = candidate_endpoint
 
         if read_endpoint is None:
             continue

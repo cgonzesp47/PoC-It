@@ -1490,7 +1490,14 @@ def _apply_interfaces_to_contracts(
         if endpoint_path not in mutable_by_path:
             continue
 
+        # Nombres ya usados por el propio endpoint (handler de cada ruta, "router", ...),
+        # calculado ANTES de resolver las acciones: una acción cuyo propietario es otro fichero
+        # (p.ej. una integración) se importa a este módulo, y su símbolo debe ser distinto de
+        # cualquier función local o el import sombrearía (o sería sombreado por) el handler.
+        endpoint_required_symbols = set(mutable_by_path[endpoint_path].get("required_symbols") or [])
+
         symbol_by_action_ref: Dict[str, str] = {}
+        owner_path_by_action_ref: Dict[str, str] = {}
         for action in endpoint.get("actions") or []:
             if not isinstance(action, dict):
                 continue
@@ -1499,7 +1506,28 @@ def _apply_interfaces_to_contracts(
             action_id = str(action.get("id") or "").strip()
             if not action_id:
                 continue
+
+            owner_path = _resolve_action_owner_path(
+                action=action,
+                endpoint_file=endpoint_path,
+                integration_path_by_ref=integration_path_by_ref,
+                repository_paths=[
+                    path
+                    for path in mutable_by_path
+                    if path.startswith("app/repositories/")
+                ]
+                if endpoint_path in endpoint_paths_with_repository
+                else [],
+            )
+            owner_path_by_action_ref[action_id] = owner_path
+
             symbol = _symbol_for_action(action)
+            if owner_path != endpoint_path and symbol in endpoint_required_symbols:
+                # Misma convención verbo+entidad para el nombre del handler y el id de la
+                # acción (p.ej. "create_product" como ruta POST Y como acción de persistencia
+                # en la integración): si se importa tal cual, colisiona con la función local.
+                symbol = _disambiguate_symbol(symbol, taken=endpoint_required_symbols)
+
             other_action_ref = next(
                 (
                     ref
@@ -1531,18 +1559,7 @@ def _apply_interfaces_to_contracts(
             if not action_id:
                 continue
 
-            owner_path = _resolve_action_owner_path(
-                action=action,
-                endpoint_file=endpoint_path,
-                integration_path_by_ref=integration_path_by_ref,
-                repository_paths=[
-                    path
-                    for path in mutable_by_path
-                    if path.startswith("app/repositories/")
-                ]
-                if endpoint_path in endpoint_paths_with_repository
-                else [],
-            )
+            owner_path = owner_path_by_action_ref[action_id]
             symbol = symbol_by_action_ref[action_id]
             owner_contract = mutable_by_path.get(owner_path)
             if owner_contract is None:
@@ -1672,6 +1689,19 @@ def _symbol_for_action(action: Dict[str, Any]) -> str:
     )
 
 
+def _disambiguate_symbol(symbol: str, *, taken: set[str]) -> str:
+    """Variante de `symbol` que no colisiona con `taken` (p.ej. los required_symbols locales
+    del fichero consumidor), añadiendo un sufijo estable y determinista."""
+    if symbol not in taken:
+        return symbol
+    candidate = f"{symbol}_action"
+    n = 2
+    while candidate in taken:
+        candidate = f"{symbol}_action_{n}"
+        n += 1
+    return candidate
+
+
 def _resolve_action_owner_path(
     *,
     action: Dict[str, Any],
@@ -1691,6 +1721,16 @@ def _resolve_action_owner_path(
         repository_paths = repository_paths or []
         if repository_paths:
             return sorted(repository_paths)[0]
+        # Sin módulo de repositorio dedicado: si existe un módulo de integración para la
+        # tecnología de persistencia (p.ej. app/integrations/postgresql_database.py), la acción
+        # de acceso a datos vive ahí, igual que ya se hace para external_call/notification.
+        # Sin este fallback, CUALQUIER PoC con persistencia y sin capa de repositorio explícita
+        # (el caso más común) hace recaer las acciones de persistencia en el propio endpoint,
+        # dejando el módulo de integración sin operaciones propias (PROJECT_INTEGRATION_OPERATION_MISSING)
+        # y exigiendo al handler del endpoint una firma que no le corresponde.
+        integration_path = integration_path_by_ref.get(integration_ref)
+        if integration_path:
+            return integration_path
 
     return endpoint_file
 

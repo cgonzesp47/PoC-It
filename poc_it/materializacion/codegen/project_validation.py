@@ -391,6 +391,94 @@ def _consumer_calls_symbol(tree: ast.Module, symbol_name: str) -> bool:
     return False
 
 
+def _literal_dict_return_keys(function_node: ast.AST) -> set[str] | None:
+    """Claves string-literal de los `return {...}` del cuerpo de la función.
+
+    Devuelve `None` si no se puede determinar con confianza (algún `return` no es un dict
+    literal con claves de string literal: retorna una variable, delega en otra función, usa
+    `**kwargs` o una clave dinámica) — en ese caso no se valida, para evitar falsos positivos.
+    """
+    keys: set[str] = set()
+    found_return = False
+    for node in ast.walk(function_node):
+        if not isinstance(node, ast.Return):
+            continue
+        found_return = True
+        value = node.value
+        if value is None:
+            continue
+        if not isinstance(value, ast.Dict):
+            return None
+        for key_node in value.keys:
+            if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+                keys.add(key_node.value)
+            else:
+                return None
+    return keys if found_return else None
+
+
+def _scope_result_key_accesses(scope: ast.AST, symbol_name: str) -> List[tuple[str, int]]:
+    """`(clave, lineno)` de accesos `var['clave']` / `var.get('clave')`, DENTRO de `scope`, sobre
+    variables asignadas desde una llamada a `symbol_name(...)` en ese mismo `scope`."""
+    bound_vars: set[str] = set()
+    for node in ast.walk(scope):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        func = node.value.func
+        called_name = (
+            func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+        )
+        if called_name != symbol_name:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                bound_vars.add(target.id)
+
+    accesses: List[tuple[str, int]] = []
+    for node in ast.walk(scope):
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in bound_vars
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        ):
+            accesses.append((node.slice.value, node.lineno))
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in bound_vars
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            accesses.append((node.args[0].value, node.lineno))
+    return accesses
+
+
+def _consumer_result_key_accesses(tree: ast.Module, symbol_name: str) -> List[tuple[str, int]]:
+    """`(clave, lineno)` de accesos `var['clave']` / `var.get('clave')` sobre variables
+    asignadas desde una llamada a `symbol_name(...)`.
+
+    Se evalúa función por función (no el módulo entero de una vez): dos handlers distintos
+    pueden reutilizar el mismo nombre de variable local (p.ej. `result`) para llamadas a
+    acciones DIFERENTES, y mezclar sus ámbitos produce falsos positivos — un acceso válido en
+    el handler de `get_product_action` se atribuiría erróneamente a `delete_product_action`
+    solo por compartir el nombre `result`.
+    """
+    accesses: List[tuple[str, int]] = []
+    function_nodes = [
+        node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    if not function_nodes:
+        return _scope_result_key_accesses(tree, symbol_name)
+    for function_node in function_nodes:
+        accesses.extend(_scope_result_key_accesses(function_node, symbol_name))
+    return accesses
+
+
 def _validate_internal_interfaces(
     *,
     files_by_path: dict[str, GeneratedFile],
@@ -448,6 +536,32 @@ def _validate_internal_interfaces(
 
             if consumer_tree is None:
                 continue
+
+            # Consistencia de forma de datos entre ficheros generados por LLM calls
+            # independientes: si `symbol_name` devuelve siempre un dict literal con claves
+            # conocidas, cualquier acceso `resultado['clave']`/`resultado.get('clave')` en el
+            # consumidor debe usar una clave que esa función realmente devuelva. Sin este check,
+            # un desajuste de nombres entre el proveedor y el consumidor (p.ej. `{'file_id':...}`
+            # vs `resultado['id']`) solo se descubre en tiempo de ejecución, dentro de pytest,
+            # donde consume un intento de reparación y puede degradar la suite completa.
+            if symbol_name in owner_functions:
+                returned_keys = _literal_dict_return_keys(owner_functions[symbol_name])
+                if returned_keys is not None:
+                    for key, lineno in _consumer_result_key_accesses(consumer_tree, symbol_name):
+                        if key not in returned_keys:
+                            issues.append(
+                                _issue(
+                                    "PROJECT_INTERNAL_CALL_RETURN_KEY_MISMATCH",
+                                    consumer_path,
+                                    (
+                                        f"Accede a la clave '{key}' del resultado de {symbol_name}, "
+                                        f"pero esa función solo devuelve {sorted(returned_keys)} "
+                                        f"(línea {lineno})."
+                                    ),
+                                    action_ref=str(call.get("action_ref") or "").strip() or None,
+                                    symbol=symbol_name or None,
+                                )
+                            )
             if not _consumer_imports_symbol(consumer_tree, module_name, symbol_name):
                 issues.append(
                     _issue(
@@ -562,6 +676,7 @@ def _validate_required_actions(
             continue
 
         symbol_name = str(owner_interfaces[0].get("symbol") or "").strip()
+        interface_required = bool(owner_interfaces[0].get("interface_required"))
         if (owner_module, symbol_name) not in interfaces_by_module_and_symbol:
             issues.append(
                 _issue(
@@ -571,18 +686,26 @@ def _validate_required_actions(
                 )
             )
 
-        owner_tree = trees.get(owner_path)
-        owner_functions = function_defs_by_name(owner_tree) if owner_tree is not None else {}
-        if symbol_name not in owner_functions:
-            issues.append(
-                _issue(
-                    "PROJECT_REQUIRED_ACTION_IMPLEMENTATION_MISSING",
-                    owner_path,
-                    f"El símbolo {symbol_name} no está implementado para {action_id}.",
-                    action_ref=action_id or None,
-                    symbol=symbol_name or None,
+        # `interface_required=False` (owner_path == endpoint file, ver
+        # file_contracts._resolve_action_owner_path): la acción no vive en un módulo/repositorio
+        # dedicado, así que `symbol_name` es el id de la acción, no necesariamente el nombre real
+        # del handler del endpoint (p.ej. "update_product" vs "replace_product"). Exigir aquí una
+        # función named-after-the-action-id es el mismo contrato inventado que ya se corrigió en
+        # `semantic_validation._validate_provided_interfaces`; esta es una segunda validación
+        # independiente del mismo requisito que no respetaba esa señal.
+        if interface_required:
+            owner_tree = trees.get(owner_path)
+            owner_functions = function_defs_by_name(owner_tree) if owner_tree is not None else {}
+            if symbol_name not in owner_functions:
+                issues.append(
+                    _issue(
+                        "PROJECT_REQUIRED_ACTION_IMPLEMENTATION_MISSING",
+                        owner_path,
+                        f"El símbolo {symbol_name} no está implementado para {action_id}.",
+                        action_ref=action_id or None,
+                        symbol=symbol_name or None,
+                    )
                 )
-            )
 
         needs_consumer = str(action.get("kind") or "").strip() in {"external_call", "notification"}
         if needs_consumer:

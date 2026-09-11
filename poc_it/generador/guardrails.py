@@ -198,7 +198,7 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
     - No endpoints extra (routers incluidos y decorators deben corresponder al SPEC)
     - Enforce request.type json vs multipart (UploadFile/File/python-multipart)
     - Logging obligatorio: si hay 'except Exception' debe haber logger.exception en el mismo fichero
-      (BLOCK para endpoints/services; WARNING en el resto)
+      (siempre WARNING: es una recomendación de observabilidad, no un defecto funcional)
     - Respuesta coherente con response.json_example (heurística suave, solo request.type=none)
     - Enforce restricciones declaradas en SPEC.restrictions (con severidad BLOCK/WARN)
 
@@ -350,17 +350,16 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
                     reparar.add("app/api/router.py")
 
     # --- 3) Logging obligatorio: except Exception -> logger.exception ---
-    # Punto medio: WARNING por defecto; BLOCK solo en endpoints/servicios donde la trazabilidad es crítica.
+    # Siempre WARNING, nunca BLOCK: es una recomendación de observabilidad, no un defecto
+    # funcional. El código puede manejar la excepción correctamente (capturarla, devolver el
+    # status HTTP adecuado) sin registrar el traceback; bloquear toda la generación de
+    # tests/runtime por esto penaliza con la pérdida total de esa señal algo que no tiene
+    # relación con si la PoC cumple lo que el usuario pidió (SPEC/file_contracts/imports).
     for p, src in by_path.items():
         if not p.endswith(".py"):
             continue
         if _missing_exception_logging(src):
-            msg = f"Falta logging obligatorio (logger.exception) en: {p}"
-            if p.startswith(("app/api/endpoints/", "app/endpoints/", "app/services/")):
-                errores.append(msg)
-                reparar.add(p)
-            else:
-                warnings.append(msg)
+            warnings.append(f"Falta logging obligatorio (logger.exception) en: {p}")
 
     # --- 4) Respuesta coherente con json_example (heurística) ---
     for path, json_example in response_example_by_path.items():
