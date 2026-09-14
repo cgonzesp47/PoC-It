@@ -70,11 +70,32 @@ if ($missing.Count -gt 0) {
   Write-Host "[start_litellm_proxy] El proxy puede arrancar igualmente, pero esos modelos fallarán."
 }
 
-# Ejecutable litellm (en tu venv recomendado)
-$litellmExe = "C:\Users\Carlos\Desktop\Proyectos\Programacion\PoC-It\venv\Scripts\litellm.exe"
-if (-not (Test-Path $litellmExe)) {
-  Write-Host "[start_litellm_proxy] No se encontró $litellmExe"
-  Write-Host "[start_litellm_proxy] Ajusta la ruta del venv en start_litellm_proxy.ps1 o instala litellm[proxy] en ese venv."
+# Resolución dinámica del ejecutable litellm
+$possiblePaths = @(
+  (Join-Path $scriptDir ".venv\Scripts\litellm.exe"),
+  (Join-Path $scriptDir "venv\Scripts\litellm.exe")
+)
+
+$litellmExe = $null
+foreach ($path in $possiblePaths) {
+  if (Test-Path $path) {
+    $litellmExe = $path
+    break
+  }
+}
+
+# Fallback: si no está en la raíz del repo, buscar si está activo en el PATH
+if (-not $litellmExe) {
+  $cmd = Get-Command "litellm" -ErrorAction SilentlyContinue
+  if ($cmd) {
+    $litellmExe = $cmd.Source
+  }
+}
+
+if (-not $litellmExe) {
+  Write-Host "[start_litellm_proxy] Error: No se encontró litellm.exe en .venv ni en venv." -ForegroundColor Red
+  Write-Host "[start_litellm_proxy] Asegúrate de haber creado el entorno virtual e instalado las dependencias:"
+  Write-Host "                       pip install -r requirements.txt"
   exit 1
 }
 
