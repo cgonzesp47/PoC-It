@@ -5,6 +5,20 @@ from typing import Any, Dict
 from poc_it.generador.request_ir import build_request_ir_from_context
 from poc_it.generador.spec_builder import build_spec_from_request_ir
 
+# PoC-it siempre añade un TechnologySignal baseline (pydantic-settings) para
+# app/core/config.py, independientemente de lo que el usuario haya declarado. Estos tests
+# verifican trazabilidad de señales *detectadas del usuario*, así que filtramos esa señal
+# baseline antes de comparar (ver poc_it.generador.spec_builder._baseline_technology_signals).
+_BASELINE_TECHNOLOGY_SIGNAL_IDS = {"fastapi", "uvicorn", "pydantic", "pydantic-settings"}
+
+
+def _user_technology_signals(spec: dict) -> list[dict]:
+    return [
+        item
+        for item in spec.get("technology_signals", [])
+        if str(item.get("id") or "") not in _BASELINE_TECHNOLOGY_SIGNAL_IDS
+    ]
+
 
 def _contract(
     method: str,
@@ -86,7 +100,7 @@ def test_context_with_proposed_contract_and_persistence_builds_spec_with_endpoin
 
     persistence = spec.get("persistence") or {}
     assert persistence.get("required") is True
-    assert spec["technology_signals"] == []
+    assert _user_technology_signals(spec) == []
     assert spec["integrations"] == []
     assert spec["configuration"] == []
 
@@ -272,7 +286,7 @@ def test_structured_integrations_configuration_actions_and_errors_are_preserved_
     assert req_ir.open_questions == ["¿Cómo validar el token?"]
     spec = build_spec_from_request_ir(req_ir)
 
-    assert [item["name"] for item in spec["technology_signals"]] == [
+    assert [item["name"] for item in _user_technology_signals(spec)] == [
         "google-api-python-client",
         "google-auth",
     ]

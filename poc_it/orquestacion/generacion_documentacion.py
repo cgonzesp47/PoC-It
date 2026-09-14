@@ -21,6 +21,7 @@ from poc_it.orquestacion.constantes import (
     README_MANUAL_FILENAME,
 )
 from poc_it.orquestacion.verificador_runtime import runtime_verify_fastapi_project
+from poc_it.runtime.poc_runtime_environment import prepare_poc_runtime_environment
 from poc_it.entrada.demo_progress import demo_progress, is_demo_mode
 
 logger = logging.getLogger(__name__)
@@ -57,7 +58,17 @@ def generar_documentacion(
     generar_docs = True
     if modo_generacion.upper() != ModoGeneracion.ASESOR:
         project_dir = os.path.join(OUTPUT_DIRNAME, nombre_proyecto)
-        ok_runtime, detail = runtime_verify_fastapi_project(project_dir)
+        # Usamos el entorno aislado de la PoC (mismo que runtime probes/tests) para no reportar
+        # falsos negativos de importabilidad por falta de deps en el entorno de PoC-it.
+        runtime_env = prepare_poc_runtime_environment(project_dir)
+        if runtime_env.runtime_environment_status != "ready":
+            logger.warning(
+                "[DOCS] No se pudo preparar el entorno aislado (.poc_it/venv) para verificar "
+                "importabilidad antes de generar docs: %s",
+                runtime_env.detail,
+            )
+        python_executable = str(runtime_env.python_executable)
+        ok_runtime, detail = runtime_verify_fastapi_project(project_dir, python_executable=python_executable)
         if not ok_runtime:
             generar_docs = False
             logger.info("[DOCS] Saltando generación de documentación: el proyecto no es importable aún.")
@@ -81,11 +92,26 @@ def generar_documentacion(
         funcionalidades_reales = context.plantilla.funcionalidades or ""
         usuarios_reales = context.plantilla.usuarios or ""
 
-    opciones_estrategicas = generar_opciones(
-        arquitectura=arquitectura_real,
-        limites=limites_reales,
-        tecnologias=tecnologias_reales,
-    )
+    # `opciones_estrategicas` solo lo consume `generar_readme_asesor` (modo ASESOR, más abajo);
+    # en COMPLETO/PARCIAL calcularlo era una llamada LLM cara y descartada. Además, al ser una
+    # llamada de texto libre sin reintento, un simple truncamiento del modelo (`finish_reason=
+    # length`) tumbaba todo el pipeline con "Error no recuperable" DESPUÉS de que ya se hubiera
+    # completado la generación de código — así que la aislamos con try/except para que, incluso
+    # en modo ASESOR, un fallo aquí degrade a un README sin esa sección en vez de abortar la
+    # ejecución completa.
+    opciones_estrategicas: list[str] = []
+    if modo_generacion.upper() == ModoGeneracion.ASESOR:
+        try:
+            opciones_estrategicas = generar_opciones(
+                arquitectura=arquitectura_real,
+                limites=limites_reales,
+                tecnologias=tecnologias_reales,
+            )
+        except Exception:
+            logger.exception(
+                "[DOCS] Fallo generando opciones estratégicas; se continúa sin esa sección."
+            )
+            opciones_estrategicas = []
 
     import time
 

@@ -390,7 +390,14 @@ def _build_pydantic_schema_index(estructura_generada: Dict[str, str]) -> Dict[st
     Devuelve: { "ProductResponse": { "required": [...], "optional": [...] } }
 
     Heurística:
-    - Solo analiza ficheros app/schemas*.py o cualquier .py bajo app/ que contenga clases BaseModel.
+    - Analiza cualquier fichero .py bajo app/ que contenga clases BaseModel — no solo
+      app/schemas*.py. Un endpoint puede declarar su modelo de request/response inline en el
+      propio fichero del endpoint (p.ej. `class UploadRequest(BaseModel): filename: str` en
+      app/api/endpoints/upload.py); restringir el escaneo a ficheros cuyo path contenga
+      "schema"/"schemas" dejaba esos modelos completamente invisibles para el extractor,
+      degradando la generación de tests a nivel OPENAPI_CONTRACT por falta de "evidencia" de un
+      request_model que en realidad sí existía. La pertenencia a BaseModel (comprobada más abajo)
+      ya filtra el ruido; no hace falta además restringir por convención de nombre de fichero.
     - Considera "required" si la anotación no tiene default y no es Optional/Union con None.
     - Considera "optional" si hay default o si el tipo incluye None (muy aproximado).
     """
@@ -402,9 +409,6 @@ def _build_pydantic_schema_index(estructura_generada: Dict[str, str]) -> Dict[st
         if not norm_path.endswith(".py"):
             continue
         if not norm_path.startswith("app/"):
-            continue
-        # reducir ruido: típicamente schemas.py, pero permitimos schemas.py y cualquier módulo de schemas
-        if "schema" not in norm_path and "schemas" not in norm_path:
             continue
         if not isinstance(content, str) or not content.strip():
             continue

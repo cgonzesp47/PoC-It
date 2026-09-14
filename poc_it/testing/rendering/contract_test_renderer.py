@@ -295,13 +295,20 @@ def _render_test_request_validation(plan: dict) -> str:
     return "import pytest\nfrom fastapi.testclient import TestClient\nfrom app.main import app\n\n\n" + "\n\n\n".join(endpoint_tests) + "\n"
 
 
-def _first_http_case(endpoint_plan: dict) -> Optional[dict]:
-    for case in endpoint_plan.get("cases") or []:
-        if not isinstance(case, dict):
-            continue
-        if str(case.get("level") or "") == "HERMETIC_HTTP":
-            return case
-    return None
+def _http_cases(endpoint_plan: dict) -> List[dict]:
+    return [
+        case
+        for case in endpoint_plan.get("cases") or []
+        if isinstance(case, dict) and str(case.get("level") or "") == "HERMETIC_HTTP"
+    ]
+
+
+def _case_test_name_suffix(case: dict, *, index: int) -> str:
+    case_id = str(case.get("case_id") or "").strip()
+    if not case_id:
+        return str(index)
+    slug = re.sub(r"[^0-9a-zA-Z_]+", "_", case_id).strip("_")
+    return slug or str(index)
 
 
 def _assertion_kind(assertion: dict) -> str:
@@ -355,6 +362,8 @@ def _render_dependency_setup_lines(test_case: dict) -> str:
         return ""
 
     providers: List[dict] = []
+    auto_doubles: List[dict] = []
+    auto_raising_doubles: List[dict] = []
     method_behaviors: List[dict] = []
 
     for item in setups:
@@ -371,6 +380,14 @@ def _render_dependency_setup_lines(test_case: dict) -> str:
             providers.append(item)
             continue
 
+        if action == "provide_auto":
+            auto_doubles.append(item)
+            continue
+
+        if action == "provide_auto_raise":
+            auto_raising_doubles.append(item)
+            continue
+
         method_name = str(item.get("method_name") or "").strip()
 
         if method_name and action in {"return", "raise", "async_return"}:
@@ -381,7 +398,7 @@ def _render_dependency_setup_lines(test_case: dict) -> str:
         dep_fqn = str(item.get("dependency_fqn") or "").strip()
         grouped.setdefault(dep_fqn, []).append(item)
 
-    if not providers and not grouped:
+    if not providers and not auto_doubles and not auto_raising_doubles and not grouped:
         return ""
 
     lines: List[str] = []
@@ -393,6 +410,31 @@ def _render_dependency_setup_lines(test_case: dict) -> str:
             f"{dep_fqn!r}, "
             f"{_py_literal(provider.get('value'))}"
             ")"
+        )
+
+    seen_auto_doubles: set = set()
+    for auto_double in auto_doubles:
+        dep_fqn = str(auto_double["dependency_fqn"])
+        if dep_fqn in seen_auto_doubles:
+            continue
+        seen_auto_doubles.add(dep_fqn)
+        lines.append(f"    dependency_overrides_guard.bind_auto_double({dep_fqn!r})")
+
+    seen_auto_raising_doubles: set = set()
+    for auto_raising in auto_raising_doubles:
+        dep_fqn = str(auto_raising["dependency_fqn"])
+        if dep_fqn in seen_auto_raising_doubles:
+            continue
+        seen_auto_raising_doubles.add(dep_fqn)
+        exc_type = str(auto_raising.get("exception_type") or "RuntimeError")
+        exc_message = str(auto_raising.get("exception_message") or exc_type)
+        if exc_type == "HTTPException":
+            status_code = int(auto_raising.get("exception_status_code") or 500)
+            exc_literal = f"HTTPException(status_code={status_code!r}, detail={_py_literal(exc_message)})"
+        else:
+            exc_literal = f"{exc_type}({_py_literal(exc_message)})"
+        lines.append(
+            f"    dependency_overrides_guard.bind_auto_double_raising({dep_fqn!r}, {exc_literal})"
         )
 
     for dep_fqn, behaviors in grouped.items():
@@ -417,9 +459,16 @@ def _render_dependency_setup_lines(test_case: dict) -> str:
             elif action == "raise":
                 exc_type = str(behavior.get("exception_type") or "RuntimeError")
                 exc_message = str(behavior.get("exception_message") or exc_type)
-                lines.append(
-                    f"    {var_name}.configure_raise({method_name!r}, {exc_type}({_py_literal(exc_message)}))"
-                )
+                if exc_type == "HTTPException":
+                    status_code = int(behavior.get("exception_status_code") or 500)
+                    lines.append(
+                        f"    {var_name}.configure_raise({method_name!r}, "
+                        f"HTTPException(status_code={status_code!r}, detail={_py_literal(exc_message)}))"
+                    )
+                else:
+                    lines.append(
+                        f"    {var_name}.configure_raise({method_name!r}, {exc_type}({_py_literal(exc_message)}))"
+                    )
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -430,38 +479,47 @@ def _render_http_behavior(plan: dict) -> str:
     for endpoint_plan in endpoint_plans:
         if not isinstance(endpoint_plan, dict):
             continue
-        http_case = _first_http_case(endpoint_plan)
-        if not isinstance(http_case, dict):
+        http_cases = _http_cases(endpoint_plan)
+        if not http_cases:
             continue
 
         method = str(endpoint_plan.get("method") or "GET").upper()
         path = str(endpoint_plan.get("path") or "/")
         tid = _endpoint_id(method, path)
-        request = http_case.get("request")
-        assertions = http_case.get("assertions") or []
         reason = "; ".join(endpoint_plan.get("limitations") or []) or "Contract case"
 
-        request_dict = request if isinstance(request, dict) else {}
-        if "method" not in request_dict:
-            request_dict = {**request_dict, "method": method}
-        if "path_template" not in request_dict:
-            request_dict = {**request_dict, "path_template": path}
+        for index, http_case in enumerate(http_cases):
+            request = http_case.get("request")
+            assertions = http_case.get("assertions") or []
+            category = str(http_case.get("category") or "").strip()
 
-        dependency_lines = _render_dependency_setup_lines(http_case)
-        call_lines = render_request_call(request_dict, client_name="client", response_name="resp")
-        call_block = "".join(f"    {line}\n" for line in call_lines.rstrip().splitlines())
-        assert_lines = _render_canonical_assertion_lines(assertions)
+            request_dict = request if isinstance(request, dict) else {}
+            if "method" not in request_dict:
+                request_dict = {**request_dict, "method": method}
+            if "path_template" not in request_dict:
+                request_dict = {**request_dict, "path_template": path}
 
-        blocks.append(
-            "from fastapi.testclient import TestClient\n"
-            "from app.main import app\n\n"
-            f"@pytest.mark.contract\n"
-            f"def test_contract_{tid}(client, dependency_overrides_guard):\n"
-            f'    """{str(reason).replace(chr(34) * 3, r"\\\"\\\"\\\"")}"""\n'
-            + dependency_lines
-            + call_block
-            + assert_lines
-        )
+            dependency_lines = _render_dependency_setup_lines(http_case)
+            imports = ["from fastapi.testclient import TestClient\n", "from app.main import app\n"]
+            if "HTTPException(" in dependency_lines:
+                imports.append("from fastapi import HTTPException\n")
+            call_lines = render_request_call(request_dict, client_name="client", response_name="resp")
+            call_block = "".join(f"    {line}\n" for line in call_lines.rstrip().splitlines())
+            assert_lines = _render_canonical_assertion_lines(assertions)
+
+            suffix = _case_test_name_suffix(http_case, index=index)
+            case_doc = f"{reason} ({category})" if category else reason
+
+            blocks.append(
+                "".join(imports)
+                + "\n"
+                + f"@pytest.mark.contract\n"
+                + f"def test_contract_{tid}__{suffix}(client, dependency_overrides_guard):\n"
+                + f'    """{str(case_doc).replace(chr(34) * 3, r"\\\"\\\"\\\"")}"""\n'
+                + dependency_lines
+                + call_block
+                + assert_lines
+            )
 
     if not blocks:
         return (

@@ -29,12 +29,8 @@ class FixResult:
 
 
 _HTTPX_MISSING_RE = re.compile(
-    r"(ModuleNotFoundError: No module named 'httpx'|requires the httpx package to be installed)",
-    re.IGNORECASE,
-)
-
-_PYDANTIC_SETTINGS_MISSING_RE = re.compile(
-    r"ModuleNotFoundError:\\s+No module named 'pydantic_settings'",
+    r"(ModuleNotFoundError: No module named 'httpx2?'"
+    r"|requires the httpx2? package to be installed)",
     re.IGNORECASE,
 )
 
@@ -167,42 +163,27 @@ def _ensure_line_in_reqs(content: str, requirement: str) -> str:
     return out
 
 
-def fix_missing_pydantic_settings(pytest_output: str, estructura: Dict[str, str]) -> Optional[FixResult]:
-    """
-    Fix determinista: si el código generado importa pydantic_settings (BaseSettings) pero no está
-    en requirements, pytest falla en collection.
-
-    Política:
-    - Añadir `pydantic-settings` a requirements.txt (paquete real en PyPI).
-    - No instalar nada: solo parchear el artefacto generado (estructura).
-    """
-    if not pytest_output or not _PYDANTIC_SETTINGS_MISSING_RE.search(pytest_output):
-        return None
-
-    req_path = "requirements.txt"
-    current = estructura.get(req_path, "")
-    patched = _ensure_line_in_reqs(current, "pydantic-settings")
-
-    if patched == current and current.strip():
-        return None
-
-    return FixResult(patched_files={req_path: patched or "pydantic-settings\n"}, message="Added pydantic-settings to requirements.txt")
-
-
 def fix_missing_httpx(pytest_output: str, estructura: Dict[str, str]) -> Optional[FixResult]:
     if not pytest_output or not _HTTPX_MISSING_RE.search(pytest_output):
         return None
 
-    # Política: si hay requirements-dev.txt, añadir httpx; si no, crear.
+    # Política: si hay requirements-dev.txt, añadir httpx/httpx2; si no, crear.
+    # Se añaden ambos porque `starlette.testclient.TestClient` acepta cualquiera de los dos
+    # (prueba httpx2 primero, cae a httpx con warning si no está); no sabemos aquí cuál de los
+    # dos resolverá pip, así que garantizamos los dos.
     req_path = "requirements-dev.txt"
     current = estructura.get(req_path, "")
     patched = _ensure_line_in_reqs(current, "httpx")
+    patched = _ensure_line_in_reqs(patched, "httpx2")
 
     if patched == current and current.strip():
-        # ya está presente; nada que hacer
+        # ya están presentes; nada que hacer
         return None
 
-    return FixResult(patched_files={req_path: patched or "httpx\n"}, message="Added httpx to requirements-dev.txt")
+    return FixResult(
+        patched_files={req_path: patched or "httpx\nhttpx2\n"},
+        message="Added httpx/httpx2 to requirements-dev.txt",
+    )
 
 
 def fix_testclient_get_json(pytest_output: str, estructura: Dict[str, str]) -> Optional[FixResult]:
@@ -1040,7 +1021,6 @@ def apply_first_matching_fixer(pytest_output: str, estructura: Dict[str, str]) -
     """
     for fx in (
         # Dependencias primero (collection)
-        fix_missing_pydantic_settings,
         fix_missing_httpx,
         # Footguns de pytest/harness (bloqueantes y muy comunes en PARCIAL)
         fix_fixture_called_directly,

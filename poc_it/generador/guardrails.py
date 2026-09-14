@@ -100,13 +100,93 @@ def _contains_sensitive_literal_assignment(src: str) -> bool:
             continue
         value = node.value
         if isinstance(value, ast.Dict):
-            literal_blob = ast.unparse(value).lower()
-            if any(pattern in literal_blob for pattern in _HARDCODED_CREDENTIAL_PATTERNS):
-                return True
+            # IMPORTANTE: inspeccionamos los VALORES del dict, no el dict entero unparseado.
+            # Unparsear todo el dict (incluyendo KEYS) producía falsos positivos con dicts
+            # perfectamente legítimos como {"private_key": os.environ["PRIVATE_KEY"]} (el nombre
+            # de la key describe qué se está cargando; el valor real viene de env/secret
+            # manager, no está hardcodeado).
+            for key_node, value_node in zip(value.keys, value.values):
+                # (a) valor literal que contiene directamente un marcador sensible (p.ej. un
+                #     bloque PEM embebido), sea cual sea el nombre de la key.
+                if isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
+                    lowered_value = value_node.value.lower()
+                    if any(pattern in lowered_value for pattern in _HARDCODED_CREDENTIAL_PATTERNS):
+                        return True
+                    # (b) key con nombre "sensible" (private_key, client_secret, ...) cuyo valor
+                    #     es un literal de cadena NO vacío: es un hardcode real, independientemente
+                    #     de si el texto del valor en sí contiene alguno de los marcadores.
+                    if (
+                        isinstance(key_node, ast.Constant)
+                        and isinstance(key_node.value, str)
+                        and value_node.value.strip()
+                    ):
+                        key_name = key_node.value.lower()
+                        if any(pattern in key_name for pattern in _HARDCODED_CREDENTIAL_PATTERNS):
+                            return True
         if isinstance(value, ast.Constant) and isinstance(value.value, str):
             lowered_value = value.value.lower()
             if any(pattern in lowered_value for pattern in _HARDCODED_CREDENTIAL_PATTERNS):
                 return True
+    return False
+
+
+def _except_handler_logs_traceably(handler: ast.ExceptHandler) -> bool:
+    """True si el bloque `except` registra el error de forma trazable:
+    - cualquier `<algo>.exception(...)` (independientemente del nombre del logger:
+      `logger`, `log`, `self.logger`, etc. — la restricción original solo reconocía
+      literalmente "logger.exception", dando falso positivo con cualquier otro nombre),
+    - `<algo>.error(...)`/`<algo>.critical(...)` con `exc_info` verdadero (equivalente
+      funcional a `.exception(...)`),
+    - o un `raise` (re-lanzar preserva el traceback para quien capture más arriba).
+    """
+    for node in ast.walk(handler):
+        if isinstance(node, ast.Raise):
+            return True
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        method = node.func.attr
+        if method == "exception":
+            return True
+        if method in ("error", "critical"):
+            for kw in node.keywords:
+                if kw.arg != "exc_info":
+                    continue
+                if isinstance(kw.value, ast.Constant):
+                    if bool(kw.value.value):
+                        return True
+                else:
+                    # exc_info=<expresión no literal>: no podemos evaluarla estáticamente;
+                    # ser permisivo en vez de arriesgar un falso positivo.
+                    return True
+    return False
+
+
+def _missing_exception_logging(src: str) -> bool:
+    """True si existe un `except Exception` cuyo bloque no registra el error de forma trazable.
+
+    AST-based y por-handler (no substring de fichero completo): la heurística anterior
+    (`"except Exception" in src and "logger.exception" not in src`) dos falsos positivos reales:
+    - False positive: un `except Exception` que SÍ registra el error, pero con un logger que no
+      se llama literalmente `logger` (p.ej. `log.exception(...)`, `self._logger.exception(...)`),
+      o que usa `logger.error(..., exc_info=True)` (equivalente funcional).
+    - False negative: cualquier `logger.exception(...)` en OTRA parte del fichero satisfacía la
+      condición para TODOS los `except Exception` del fichero, aunque el bloque relevante no
+      loggeara nada.
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        # Fallback conservador si el fichero no parsea (no debería llegar aquí en la práctica,
+        # ya que el gate AST corre antes que guardrails).
+        return "except Exception" in src and "logger.exception" not in src
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        if not (isinstance(node.type, ast.Name) and node.type.id == "Exception"):
+            continue
+        if not _except_handler_logs_traceably(node):
+            return True
     return False
 
 
@@ -118,7 +198,7 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
     - No endpoints extra (routers incluidos y decorators deben corresponder al SPEC)
     - Enforce request.type json vs multipart (UploadFile/File/python-multipart)
     - Logging obligatorio: si hay 'except Exception' debe haber logger.exception en el mismo fichero
-      (BLOCK para endpoints/services; WARNING en el resto)
+      (siempre WARNING: es una recomendación de observabilidad, no un defecto funcional)
     - Respuesta coherente con response.json_example (heurística suave, solo request.type=none)
     - Enforce restricciones declaradas en SPEC.restrictions (con severidad BLOCK/WARN)
 
@@ -208,7 +288,13 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
                 is_endpoint_file = p.startswith("app/api/endpoints/") or p.startswith("app/endpoints/")
                 if not is_endpoint_file:
                     continue
-                uses_uploadfile = "UploadFile" in src or "File(" in src
+                # "File(" a secas es un token demasiado genérico (colisiona con clases/funciones
+                # propias no relacionadas con FastAPI); solo lo contamos si viene de un import
+                # real de fastapi. "UploadFile" es lo bastante distintivo (PascalCase específico
+                # de FastAPI) como para seguir usándose en substring simple.
+                uses_uploadfile = "UploadFile" in src or bool(
+                    re.search(r"from\s+fastapi\s+import\s+[^\n]*\bFile\b", src)
+                )
                 if uses_uploadfile and not any_multipart_endpoint:
                     errores.append(
                         "Se detecta multipart (UploadFile/File) pero el SPEC declara endpoints json y no declara multipart: "
@@ -264,17 +350,16 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
                     reparar.add("app/api/router.py")
 
     # --- 3) Logging obligatorio: except Exception -> logger.exception ---
-    # Punto medio: WARNING por defecto; BLOCK solo en endpoints/servicios donde la trazabilidad es crítica.
+    # Siempre WARNING, nunca BLOCK: es una recomendación de observabilidad, no un defecto
+    # funcional. El código puede manejar la excepción correctamente (capturarla, devolver el
+    # status HTTP adecuado) sin registrar el traceback; bloquear toda la generación de
+    # tests/runtime por esto penaliza con la pérdida total de esa señal algo que no tiene
+    # relación con si la PoC cumple lo que el usuario pidió (SPEC/file_contracts/imports).
     for p, src in by_path.items():
         if not p.endswith(".py"):
             continue
-        if "except Exception" in src and "logger.exception" not in src:
-            msg = f"Falta logging obligatorio (logger.exception) en: {p}"
-            if p.startswith(("app/api/endpoints/", "app/endpoints/", "app/services/")):
-                errores.append(msg)
-                reparar.add(p)
-            else:
-                warnings.append(msg)
+        if _missing_exception_logging(src):
+            warnings.append(f"Falta logging obligatorio (logger.exception) en: {p}")
 
     # --- 4) Respuesta coherente con json_example (heurística) ---
     for path, json_example in response_example_by_path.items():
@@ -295,8 +380,17 @@ def guardrails_por_spec(spec: dict, files_generados: List[Dict[str, str]]) -> Gu
                 continue
 
             # Si el endpoint NO menciona ninguna key del ejemplo, es muy probable que no cumpla el contrato.
+            #
+            # No basta con buscar la key entre comillas (dict literal): el código correcto y
+            # habitual en FastAPI construye la respuesta con un modelo Pydantic
+            # (`class UploadResponse(BaseModel): status: str` / `UploadResponse(status="ok")`),
+            # donde la key aparece como identificador desnudo (anotación `status:` o kwarg
+            # `status=`), nunca entre comillas. Sin esto, cualquier endpoint que use
+            # response_model en vez de un dict literal disparaba un falso positivo.
             mentions_any_key = any(
-                f"\"{key}\"" in source_code or f"'{key}'" in source_code
+                f"\"{key}\"" in source_code
+                or f"'{key}'" in source_code
+                or re.search(rf"\b{re.escape(key)}\s*[:=]", source_code)
                 for key in expected_keys
             )
             if not mentions_any_key:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, List, Set
 
 from poc_it.generador.file_contracts_validation import (
@@ -14,6 +15,7 @@ from poc_it.generador.file_contracts_validation import (
     _secret_configuration_keys,
     _shape_from_return_spec,
     _shapes_are_compatible,
+    _validate_unresolved_python_symbols,
 )
 
 from .ast_utils import (
@@ -43,6 +45,15 @@ class ConfigurationFieldAccess:
     line: int | None
 
 
+class RequestTransport(str, Enum):
+    NONE = "none"
+    JSON = "json"
+    FORM = "form"
+    MULTIPART = "multipart"
+    RAW = "raw"
+    UNKNOWN = "unknown"
+
+
 def validate_generated_file_semantics(
     *,
     generated_file: GeneratedFile,
@@ -59,9 +70,79 @@ def validate_generated_file_semantics(
         "test": _validate_test,
     }
     validator = validators.get(kind)
-    if validator is None:
-        return []
-    return validator(generated_file=generated_file, file_contract=file_contract)
+    issues = validator(generated_file=generated_file, file_contract=file_contract) if validator else []
+
+    # Chequeo genérico (no ligado a `kind`): un símbolo usado sin importar/definir (p.ej.
+    # `MediaFileUpload` sin su `from ... import MediaFileUpload`) es un `NameError` garantizado
+    # en runtime, independientemente del tipo de archivo. Antes solo lo detectaba el validador de
+    # proyecto completo (`file_contracts_validation.py`, tras generar TODOS los archivos), así que
+    # un archivo con este bug pasaba el primer filtro y solo se detectaba — y no siempre se
+    # conseguía reparar — varios pasos después, en el bucle de reparación de todo el proyecto.
+    if generated_file.path.endswith(".py"):
+        try:
+            unresolved = _validate_unresolved_python_symbols(
+                path=generated_file.path,
+                source=generated_file.content,
+            )
+        except SyntaxError:
+            unresolved = []
+        issues = list(issues) + [
+            _issue(
+                error.code,
+                generated_file,
+                error.message,
+                details=dict(error.details or {}),
+            )
+            for error in unresolved
+        ]
+
+        # `Depends(...)` en posición de anotación de tipo (`param: Depends(x)`) en vez de valor
+        # por defecto (`param: Tipo = Depends(x)`) es SIEMPRE un bug: FastAPI/Pydantic intentan
+        # tratar el resultado de Depends(...) como un tipo real al construir el modelo del
+        # endpoint, y revientan en import-time con errores opacos (p.ej.
+        # "'Depends' object has no attribute '__mro__'"). Detectable de forma determinista por
+        # AST, sin falsos positivos posibles.
+        tree_for_depends = _python_tree(generated_file)
+        if tree_for_depends is not None:
+            issues = list(issues) + _validate_depends_as_annotation(tree_for_depends, generated_file)
+
+    return issues
+
+
+def _is_depends_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id == "Depends"
+    if isinstance(func, ast.Attribute):
+        return func.attr == "Depends"
+    return False
+
+
+def _validate_depends_as_annotation(
+    tree: ast.Module, generated_file: GeneratedFile
+) -> List[CodegenIssue]:
+    issues: List[CodegenIssue] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        all_args = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+        for arg in all_args:
+            if arg.annotation is not None and _is_depends_call(arg.annotation):
+                issues.append(
+                    _issue(
+                        "CODE_DEPENDS_USED_AS_ANNOTATION",
+                        generated_file,
+                        (
+                            f"El parámetro '{arg.arg}' de {node.name} usa Depends(...) como "
+                            "anotación de tipo en vez de valor por defecto: debe escribirse "
+                            f"'{arg.arg}: <Tipo> = Depends(...)', no '{arg.arg}: Depends(...)'."
+                        ),
+                        symbol=node.name,
+                    )
+                )
+    return issues
 
 
 def _issue(
@@ -103,6 +184,42 @@ def _extract_attribute_accesses(source: str) -> list[ConfigurationFieldAccess]:
         result.append(
             ConfigurationFieldAccess(
                 object_name=node.value.id,
+                field_name=node.attr,
+                line=getattr(node, "lineno", None),
+            )
+        )
+
+    return result
+
+
+def _extract_direct_provider_attribute_accesses(
+    source: str,
+    *,
+    provider_symbol: str,
+) -> list[ConfigurationFieldAccess]:
+    """Detecta acceso a campos de configuración encadenado directamente sobre la llamada al
+    proveedor (p.ej. `get_settings().CAMPO`), sin pasar por una variable intermedia.
+
+    `_extract_attribute_accesses` + `_extract_provider_bindings` solo detectan el patrón
+    `x = get_settings(); x.CAMPO`: si el código encadena la llamada y el atributo en una sola
+    expresión (patrón igual de común, y el que de hecho generó el LLM en la práctica), el acceso
+    a un campo no permitido pasaba completamente inadvertido.
+    """
+    tree = ast.parse(source)
+    result: list[ConfigurationFieldAccess] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        call = node.value
+        if not isinstance(call, ast.Call):
+            continue
+        func = call.func
+        if not isinstance(func, ast.Name) or func.id != provider_symbol:
+            continue
+        result.append(
+            ConfigurationFieldAccess(
+                object_name=provider_symbol,
                 field_name=node.attr,
                 line=getattr(node, "lineno", None),
             )
@@ -161,28 +278,45 @@ def _validate_configuration_access(
         generated_file.content,
         provider_symbol=provider_symbol,
     )
-    if not config_bindings:
+
+    accesses: list[ConfigurationFieldAccess] = list(
+        _extract_direct_provider_attribute_accesses(
+            generated_file.content,
+            provider_symbol=provider_symbol,
+        )
+    )
+    if config_bindings:
+        accesses.extend(
+            access
+            for access in _extract_attribute_accesses(generated_file.content)
+            if access.object_name in config_bindings
+        )
+    if not accesses:
         return []
 
     issues: List[CodegenIssue] = []
-    for access in _extract_attribute_accesses(generated_file.content):
-        if access.object_name not in config_bindings:
+    seen: set[tuple[str, int | None]] = set()
+    for access in accesses:
+        if access.field_name in allowed_fields:
             continue
-        if access.field_name not in allowed_fields:
-            issues.append(
-                _issue(
-                    "CONFIGURATION_FIELD_MISSING",
-                    generated_file,
-                    (
-                        "Generated code references configuration field "
-                        f"{access.field_name!r} not allowed by FileContract."
-                    ),
-                    details={
-                        "field": access.field_name,
-                        "allowed_fields": sorted(allowed_fields),
-                    },
-                )
+        key = (access.field_name, access.line)
+        if key in seen:
+            continue
+        seen.add(key)
+        issues.append(
+            _issue(
+                "CONFIGURATION_FIELD_MISSING",
+                generated_file,
+                (
+                    "Generated code references configuration field "
+                    f"{access.field_name!r} not allowed by FileContract."
+                ),
+                details={
+                    "field": access.field_name,
+                    "allowed_fields": sorted(allowed_fields),
+                },
             )
+        )
 
     return issues
 
@@ -344,6 +478,19 @@ def _validate_provided_interfaces(
             continue
 
         function_node = functions.get(symbol)
+
+        # `interface_required=False` (owner_path == consumer_path, ver
+        # file_contracts._resolve_action_owner_path) significa que la acción no vive en un
+        # módulo/repositorio dedicado: su "interfaz" es el propio handler del endpoint, que ya
+        # se valida por separado (required_symbols, request/response contract) con su forma real
+        # (p.ej. un único parámetro de modelo Pydantic, no los campos aplanados de la acción).
+        # Exigir aquí, además, una función named-after-the-action-id con esos campos como
+        # parámetros sueltos es un contrato inventado que ninguna implementación idiomática
+        # cumple. Solo exigimos symbol/parámetros cuando de verdad hay una interfaz separada
+        # que implementar (p.ej. una integración externa en su propio módulo).
+        if not interface_required:
+            continue
+
         if function_node is None:
             issues.append(
                 _issue(
@@ -490,6 +637,339 @@ def _contract_methods_paths(file_contract: Dict[str, Any]) -> List[tuple[str, st
         if method_value and path:
             result.append((method_value, path))
     return result
+
+
+def _annotation_name(
+    node: ast.AST | None,
+    *,
+    import_bindings: dict[str, str],
+) -> str:
+    if node is None:
+        return ""
+
+    if isinstance(node, ast.Name):
+        return import_bindings.get(node.id, node.id)
+
+    if isinstance(node, ast.Attribute):
+        parts: list[str] = []
+        current: ast.AST = node
+        while isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if isinstance(current, ast.Name):
+            parts.append(import_bindings.get(current.id, current.id))
+            return ".".join(reversed(parts))
+
+    if isinstance(node, ast.Subscript):
+        return _annotation_name(node.value, import_bindings=import_bindings)
+
+    if isinstance(node, ast.Call):
+        return _annotation_name(node.func, import_bindings=import_bindings)
+
+    return ""
+
+
+def _is_request_like_parameter(
+    parameter: ast.arg,
+    *,
+    import_bindings: dict[str, str],
+) -> bool:
+    annotation_name = _annotation_name(parameter.annotation, import_bindings=import_bindings)
+    normalized = annotation_name.lower()
+    return normalized.endswith("request") or normalized == "request"
+
+
+def infer_request_transport(
+    *,
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    import_bindings: dict[str, str],
+) -> RequestTransport:
+    for parameter in list(function_node.args.args) + list(function_node.args.kwonlyargs):
+        annotation_name = _annotation_name(parameter.annotation, import_bindings=import_bindings)
+        lowered_annotation = annotation_name.lower()
+
+        if "uploadfile" in lowered_annotation:
+            return RequestTransport.MULTIPART
+
+        default_node: ast.AST | None = None
+        positional_args = list(function_node.args.args)
+        defaults = list(function_node.args.defaults)
+        positional_offset = len(positional_args) - len(defaults)
+        for index, positional in enumerate(positional_args):
+            if positional.arg != parameter.arg:
+                continue
+            if index >= positional_offset:
+                default_node = defaults[index - positional_offset]
+            break
+
+        for kwonly, default in zip(function_node.args.kwonlyargs, function_node.args.kw_defaults):
+            if kwonly.arg == parameter.arg:
+                default_node = default
+                break
+
+        if isinstance(default_node, ast.Call):
+            helper_name = _annotation_name(default_node.func, import_bindings=import_bindings).lower()
+            if helper_name.endswith(".file") or helper_name == "file":
+                return RequestTransport.MULTIPART
+            if helper_name.endswith(".form") or helper_name == "form":
+                return RequestTransport.FORM
+            if helper_name.endswith(".body") or helper_name == "body":
+                return RequestTransport.RAW
+
+        if _is_request_like_parameter(parameter, import_bindings=import_bindings):
+            return RequestTransport.RAW
+
+    return RequestTransport.UNKNOWN
+
+
+def _dict_shape_from_node(node: ast.AST) -> dict[str, str] | None:
+    if not isinstance(node, ast.Dict):
+        return None
+
+    result: dict[str, str] = {}
+    for key, value in zip(node.keys, node.values):
+        if not (
+            isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+        ):
+            return None
+
+        if isinstance(value, ast.Constant):
+            if isinstance(value.value, bool):
+                inferred = "boolean"
+            elif isinstance(value.value, str):
+                inferred = "string"
+            elif isinstance(value.value, int):
+                inferred = "integer"
+            elif isinstance(value.value, float):
+                inferred = "number"
+            elif value.value is None:
+                inferred = "null"
+            else:
+                return None
+        elif isinstance(value, ast.Dict):
+            inferred = "object"
+        elif isinstance(value, ast.List):
+            inferred = "array"
+        else:
+            return None
+
+        result[key.value] = inferred
+
+    return result
+
+
+def _infer_static_return_shapes(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[dict[str, str]]:
+    shapes: list[dict[str, str]] = []
+    for node in ast.walk(function_node):
+        if not isinstance(node, ast.Return) or node.value is None:
+            continue
+        shape = _dict_shape_from_node(node.value)
+        if shape is not None:
+            shapes.append(shape)
+    return shapes
+
+
+def _normalize_expected_response_shape(response_meta: dict[str, Any]) -> dict[str, str] | None:
+    json_example = response_meta.get("json_example")
+    if not isinstance(json_example, dict) or not json_example:
+        return None
+
+    expected: dict[str, str] = {}
+    for key, value in json_example.items():
+        if isinstance(value, bool):
+            inferred = "boolean"
+        elif isinstance(value, str):
+            inferred = "string"
+        elif isinstance(value, int):
+            inferred = "integer"
+        elif isinstance(value, float):
+            inferred = "number"
+        elif value is None:
+            inferred = "null"
+        elif isinstance(value, dict):
+            inferred = "object"
+        elif isinstance(value, list):
+            inferred = "array"
+        else:
+            return None
+        expected[str(key)] = inferred
+    return expected
+
+
+def _response_shape_matches(
+    *,
+    expected: dict[str, str],
+    actual: dict[str, str],
+) -> bool:
+    for key, expected_type in expected.items():
+        if actual.get(key) != expected_type:
+            return False
+    return True
+
+
+def _call_logs_current_exception(call: ast.Call) -> bool:
+    if not isinstance(call.func, ast.Attribute):
+        return False
+
+    method = call.func.attr
+    if method == "exception":
+        return True
+    if method != "error":
+        return False
+
+    for keyword in call.keywords:
+        if (
+            keyword.arg == "exc_info"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+        ):
+            return True
+    return False
+
+
+def _function_logs_current_exception(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    for node in ast.walk(function_node):
+        if isinstance(node, ast.Call) and _call_logs_current_exception(node):
+            return True
+    return False
+
+
+def _validate_endpoint_observability(
+    *,
+    generated_file: GeneratedFile,
+    file_contract: Dict[str, Any],
+    declared_routes: List[RouteDeclaration],
+    function_map: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+) -> List[CodegenIssue]:
+    observability = file_contract.get("observability_requirements") or {}
+    if not observability.get("log_unhandled_errors"):
+        return []
+
+    issues: List[CodegenIssue] = []
+    route_by_function = {item.function_name: item for item in declared_routes}
+    for function_name in route_by_function:
+        function_node = function_map.get(function_name)
+        if function_node is None:
+            continue
+
+        has_generic_except = any(
+            isinstance(node, ast.ExceptHandler) and node.type is not None and isinstance(node.type, ast.Name) and node.type.id == "Exception"
+            for node in ast.walk(function_node)
+        )
+        if has_generic_except and not _function_logs_current_exception(function_node):
+            issues.append(
+                _issue(
+                    "CODE_ENDPOINT_LOGGING_REQUIRED",
+                    generated_file,
+                    "El handler captura Exception pero no registra el error según observability_requirements.",
+                )
+            )
+    return issues
+
+
+def _validate_endpoint_request_contract(
+    *,
+    generated_file: GeneratedFile,
+    file_contract: Dict[str, Any],
+    declared_routes: List[RouteDeclaration],
+    function_map: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+    imported: Dict[str, tuple[str, str | None]],
+) -> List[CodegenIssue]:
+    endpoint_meta = file_contract.get("endpoint") or {}
+    request_meta = endpoint_meta.get("request") or {}
+    expected_transport = str(
+        request_meta.get("transport")
+        or request_meta.get("content_type")
+        or request_meta.get("type")
+        or ""
+    ).strip().lower()
+
+    if not expected_transport:
+        return []
+
+    if "application/json" in expected_transport:
+        expected_transport = RequestTransport.JSON.value
+    elif "multipart/form-data" in expected_transport:
+        expected_transport = RequestTransport.MULTIPART.value
+
+    route_by_function = {item.function_name: item for item in declared_routes}
+    import_bindings: dict[str, str] = {}
+    for local_name, (module, original) in imported.items():
+        import_bindings[local_name] = f"{module}.{original}" if original else module
+
+    issues: List[CodegenIssue] = []
+    for function_name in route_by_function:
+        function_node = function_map.get(function_name)
+        if function_node is None:
+            continue
+
+        actual_transport = infer_request_transport(
+            function_node=function_node,
+            import_bindings=import_bindings,
+        )
+        if actual_transport is RequestTransport.UNKNOWN:
+            continue
+        if actual_transport.value != expected_transport:
+            issues.append(
+                _issue(
+                    "ENDPOINT_REQUEST_TRANSPORT_MISMATCH",
+                    generated_file,
+                    (
+                        "El transport inferido del handler no coincide con el FileContract: "
+                        f"esperado={expected_transport}, actual={actual_transport.value}."
+                    ),
+                    details={
+                        "expected_transport": expected_transport,
+                        "actual_transport": actual_transport.value,
+                    },
+                )
+            )
+    return issues
+
+
+def _validate_endpoint_response_contract(
+    *,
+    generated_file: GeneratedFile,
+    file_contract: Dict[str, Any],
+    declared_routes: List[RouteDeclaration],
+    function_map: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+) -> List[CodegenIssue]:
+    endpoint_meta = file_contract.get("endpoint") or {}
+    response_meta = endpoint_meta.get("response") or {}
+    expected_shape = _normalize_expected_response_shape(response_meta)
+    if expected_shape is None:
+        return []
+
+    route_by_function = {item.function_name: item for item in declared_routes}
+    static_shapes: list[dict[str, str]] = []
+    for function_name in route_by_function:
+        function_node = function_map.get(function_name)
+        if function_node is None:
+            continue
+        static_shapes.extend(_infer_static_return_shapes(function_node))
+
+    if not static_shapes:
+        return []
+
+    if any(
+        _response_shape_matches(expected=expected_shape, actual=actual_shape)
+        for actual_shape in static_shapes
+    ):
+        return []
+
+    return [
+        _issue(
+            "ENDPOINT_RESPONSE_CONTRACT_MISMATCH",
+            generated_file,
+            "Los returns estáticos inferibles no cumplen el response contract declarado.",
+            details={"expected_shape": expected_shape, "actual_shapes": static_shapes},
+        )
+    ]
 
 
 def _validate_integration(
@@ -781,28 +1261,31 @@ def _validate_endpoint(
                     )
                 )
 
-    request = endpoint_meta.get("request") or {}
-    request_type = str(request.get("content_type") or request.get("type") or "").lower()
-    if "json" in request_type and (
-        "UploadFile" in generated_file.content or "File(" in generated_file.content
-    ):
-        issues.append(
-            _issue(
-                "CODE_ENDPOINT_REQUEST_TYPE_MISMATCH",
-                generated_file,
-                "Un endpoint JSON no debe usar UploadFile ni multipart.",
-            )
+    issues.extend(
+        _validate_endpoint_request_contract(
+            generated_file=generated_file,
+            file_contract=file_contract,
+            declared_routes=declared_routes,
+            function_map=function_map,
+            imported=imported,
         )
-    if "multipart" in request_type and (
-        "UploadFile" not in generated_file.content and "File(" not in generated_file.content
-    ):
-        issues.append(
-            _issue(
-                "CODE_ENDPOINT_REQUEST_TYPE_MISMATCH",
-                generated_file,
-                "Un endpoint multipart debe aceptar archivo.",
-            )
+    )
+    issues.extend(
+        _validate_endpoint_response_contract(
+            generated_file=generated_file,
+            file_contract=file_contract,
+            declared_routes=declared_routes,
+            function_map=function_map,
         )
+    )
+    issues.extend(
+        _validate_endpoint_observability(
+            generated_file=generated_file,
+            file_contract=file_contract,
+            declared_routes=declared_routes,
+            function_map=function_map,
+        )
+    )
 
     route_paths = [path for _, path in contract_routes]
     if route_paths == ["/health"] and "app.integrations" not in " ".join(allowed_modules):

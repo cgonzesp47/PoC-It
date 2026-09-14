@@ -170,14 +170,14 @@ async def upload_file():
     assert "CODE_FAKE_SUCCESS_RESPONSE" in _codes(issues)
 
 
-def test_endpoint_detects_route_mismatch_and_json_vs_multipart() -> None:
+def test_endpoint_detects_route_mismatch_and_request_transport_mismatch() -> None:
     file_contract = {
         "kind": "endpoint",
         "path": "app/api/endpoints/upload.py",
         "endpoint": {
             "methods": ["POST"],
             "path": "/upload",
-            "request": {"content_type": "application/json"},
+            "request": {"type": "json"},
         },
     }
     generated_file = GeneratedFile(
@@ -200,7 +200,104 @@ async def upload_file(file: UploadFile = File(...)):
     codes = _codes(issues)
 
     assert "CODE_ENDPOINT_ROUTE_MISMATCH" in codes
-    assert "CODE_ENDPOINT_REQUEST_TYPE_MISMATCH" in codes
+    assert "ENDPOINT_REQUEST_TRANSPORT_MISMATCH" in codes
+
+
+def test_endpoint_unknown_request_transport_does_not_fail() -> None:
+    file_contract = {
+        "kind": "endpoint",
+        "path": "src/custom/location/example.py",
+        "endpoint": {
+            "methods": ["POST"],
+            "path": "/upload",
+            "request": {"type": "json"},
+        },
+    }
+    generated_file = GeneratedFile(
+        path="src/custom/location/example.py",
+        content="""
+from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.post("/upload")
+async def upload_file(payload):
+    return {"done": True}
+""",
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    assert "ENDPOINT_REQUEST_TRANSPORT_MISMATCH" not in _codes(issues)
+
+
+def test_endpoint_logging_not_required_without_contract() -> None:
+    file_contract = {
+        "kind": "endpoint",
+        "path": "app/api/endpoints/sample.py",
+        "endpoint": {"methods": ["POST"], "path": "/sample"},
+    }
+    generated_file = GeneratedFile(
+        path="app/api/endpoints/sample.py",
+        content="""
+from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.post("/sample")
+async def sample():
+    try:
+        return {"ok": True}
+    except Exception:
+        raise
+""",
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    assert "CODE_ENDPOINT_LOGGING_REQUIRED" not in _codes(issues)
+
+
+def test_endpoint_logging_contract_accepts_logger_error_with_exc_info() -> None:
+    file_contract = {
+        "kind": "endpoint",
+        "path": "app/api/endpoints/sample.py",
+        "endpoint": {"methods": ["POST"], "path": "/sample"},
+        "observability_requirements": {
+            "log_unhandled_errors": True,
+        },
+    }
+    generated_file = GeneratedFile(
+        path="app/api/endpoints/sample.py",
+        content="""
+from fastapi import APIRouter
+import logging
+
+router = APIRouter()
+audit = logging.getLogger(__name__)
+
+@router.post("/sample")
+async def sample():
+    try:
+        return {"ok": True}
+    except Exception:
+        audit.error("failed", exc_info=True)
+        raise
+""",
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    assert "CODE_ENDPOINT_LOGGING_REQUIRED" not in _codes(issues)
 
 
 def test_health_endpoint_stays_isolated() -> None:
@@ -477,6 +574,77 @@ async def upload_file(name, content):
     assert "FILE_CONTRACT_DATA_FLOW_MISMATCH" not in _codes(issues)
 
 
+def test_endpoint_response_contract_is_not_satisfied_by_string_mention() -> None:
+    file_contract = {
+        "kind": "endpoint",
+        "path": "app/api/endpoints/status.py",
+        "endpoint": {
+            "methods": ["GET"],
+            "path": "/status",
+            "response": {
+                "json_example": {
+                    "status": "ok",
+                }
+            },
+        },
+    }
+    generated_file = GeneratedFile(
+        path="app/api/endpoints/status.py",
+        content='''
+from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.get("/status")
+async def status():
+    message = "status"
+    return {"result": "ok"}
+''',
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    assert "ENDPOINT_RESPONSE_CONTRACT_MISMATCH" in _codes(issues)
+
+
+def test_endpoint_response_contract_accepts_static_matching_return() -> None:
+    file_contract = {
+        "kind": "endpoint",
+        "path": "app/api/endpoints/status.py",
+        "endpoint": {
+            "methods": ["GET"],
+            "path": "/status",
+            "response": {
+                "json_example": {
+                    "status": "ok",
+                }
+            },
+        },
+    }
+    generated_file = GeneratedFile(
+        path="app/api/endpoints/status.py",
+        content='''
+from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.get("/status")
+async def status():
+    return {"status": "ok"}
+''',
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    assert "ENDPOINT_RESPONSE_CONTRACT_MISMATCH" not in _codes(issues)
+
+
 def test_endpoint_inline_required_action_stub_is_not_flagged_as_required_interface_stub() -> None:
     file_contract = {
         "kind": "endpoint",
@@ -550,3 +718,75 @@ def store_resource():
     )
 
     assert "CODE_REQUIRED_ACTION_STUB" in _codes(issues)
+
+
+def test_integration_detects_disallowed_config_field_accessed_inline_chained() -> None:
+    """Regresión: `get_settings().CAMPO_NO_PERMITIDO` (encadenado, sin variable intermedia)
+    pasaba desapercibido porque `_extract_provider_bindings` solo reconocía el patrón
+    `settings = get_settings(); settings.CAMPO`. Este es justo el patrón que el LLM produjo en
+    producción para un cliente de Google Drive, dejando pasar una credencial no declarada en el
+    contrato hasta el bucle de reparación de todo el proyecto (que tampoco logró arreglarlo)."""
+    file_contract = {
+        "kind": "integration",
+        "path": "app/integrations/google_drive_api.py",
+        "allowed_imports": [{"import_root": "googleapiclient.discovery"}],
+        "configuration_access": {
+            "provider_module": "app.core.config",
+            "provider_symbol": "get_settings",
+            "allowed_fields": ["google_drive_folder_id"],
+        },
+    }
+    generated_file = GeneratedFile(
+        path="app/integrations/google_drive_api.py",
+        content="""
+from googleapiclient.discovery import build
+from google.oauth2.service_account import Credentials
+
+from app.core.config import get_settings
+
+def build_client():
+    creds = Credentials.from_service_account_info(
+        get_settings().google_drive_service_account
+    )
+    return build("drive", "v3", credentials=creds)
+""",
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    matching = [issue for issue in issues if issue.code == "CONFIGURATION_FIELD_MISSING"]
+    assert len(matching) == 1
+    assert matching[0].details["field"] == "google_drive_service_account"
+
+
+def test_integration_detects_unresolved_symbol_missing_import() -> None:
+    """Regresión: un símbolo usado sin importar (`MediaFileUpload`) solo se detectaba en el
+    validador de proyecto completo, varios pasos después de la generación por-archivo — aquí
+    debe detectarse ya en el primer filtro, igual que en el caso real que lo disparó."""
+    file_contract = {
+        "kind": "integration",
+        "path": "app/integrations/google_drive_api.py",
+        "allowed_imports": [{"import_root": "googleapiclient.discovery"}],
+    }
+    generated_file = GeneratedFile(
+        path="app/integrations/google_drive_api.py",
+        content="""
+from googleapiclient.discovery import build
+
+def upload_to_google_drive(client, filename):
+    media = MediaFileUpload(filename, resumable=True)
+    return client.files().create(media_body=media).execute()
+""",
+    )
+
+    issues = validate_generated_file_semantics(
+        generated_file=generated_file,
+        file_contract=file_contract,
+    )
+
+    matching = [issue for issue in issues if issue.code == "UNRESOLVED_PYTHON_SYMBOL"]
+    assert len(matching) == 1
+    assert matching[0].details["symbol"] == "MediaFileUpload"

@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple
 
+from poc_it.generador.path_utils import extract_path_param_names, has_path_param
+
 SpecErrorSeverity = Literal["fatal", "warning"]
 
 
@@ -266,10 +268,10 @@ def repair_spec_deterministic(spec: dict) -> Tuple[dict, List[SpecValidationErro
                     )
                 )
 
-            if "{id}" in path:
+            if has_path_param(path):
                 req = ep.get("request")
                 if isinstance(req, dict) and "path_params" not in req:
-                    req["path_params"] = {"id": "string"}
+                    req["path_params"] = {name: "string" for name in extract_path_param_names(path)}
                     changes.append(
                         SpecValidationError(
                             code="REPAIR_ADD_PATH_PARAMS",
@@ -294,7 +296,7 @@ def repair_spec_deterministic(spec: dict) -> Tuple[dict, List[SpecValidationErro
                     )
                 )
 
-            if "{id}" in path and method in ("GET", "PUT", "PATCH", "DELETE"):
+            if has_path_param(path) and method in ("GET", "PUT", "PATCH", "DELETE"):
                 if isinstance(errs, list) and not errs:
                     ep["errors"] = [{"status_code": 404, "code": "not_found"}]
                     changes.append(
@@ -321,8 +323,11 @@ def _extraer_json_tolerante(respuesta: str) -> Optional[dict]:
         if m:
             s = m.group(1).strip()
 
+    # strict=False: permite caracteres de control literales (saltos de línea reales) dentro
+    # de strings, frecuentes cuando el LLM devuelve código multi-línea sin escapar \n
+    # correctamente. Ver `poc_it.generador.json_utils.extraer_json_tolerante` (misma lógica).
     try:
-        return json.loads(s)
+        return json.loads(s, strict=False)
     except Exception:
         pass
 
@@ -330,7 +335,7 @@ def _extraer_json_tolerante(respuesta: str) -> Optional[dict]:
         start = s.index("{")
         end = s.rindex("}")
         candidate = s[start : end + 1]
-        return json.loads(candidate)
+        return json.loads(candidate, strict=False)
     except Exception:
         return None
 
@@ -1385,7 +1390,7 @@ def _validate_request_block(
         )
 
     path = str(endpoint.get("path") or "")
-    if "{id}" in path:
+    if has_path_param(path):
         pp = req.get("path_params")
         if not isinstance(pp, dict):
             e.append(
@@ -1398,15 +1403,16 @@ def _validate_request_block(
                 )
             )
         else:
-            if "id" not in pp:
-                e.append(
-                    SpecValidationError(
-                        code="REQUEST_PATH_PARAM_ID_MISSING",
-                        severity="fatal",
-                        path=f"$.endpoints[{idx}].request.path_params.id",
-                        message="Falta path param 'id'",
+            for param_name in extract_path_param_names(path):
+                if param_name not in pp:
+                    e.append(
+                        SpecValidationError(
+                            code="REQUEST_PATH_PARAM_ID_MISSING",
+                            severity="fatal",
+                            path=f"$.endpoints[{idx}].request.path_params.{param_name}",
+                            message=f"Falta path param '{param_name}'",
+                        )
                     )
-                )
 
         if rt == "query":
             e.append(
@@ -1472,7 +1478,7 @@ def _validate_response_block(
             )
         )
 
-    if method == "GET" and "{id}" not in path and source_type != "builder_default":
+    if method == "GET" and not has_path_param(path) and source_type != "builder_default":
         if isinstance(ex, dict) and ex.get("ok") is True and len(ex.keys()) == 1:
             e.append(
                 SpecValidationError(
@@ -1642,7 +1648,7 @@ def _validate_errors_block(
                 )
             )
 
-    if "{id}" in path and method in ("GET", "PUT", "PATCH", "DELETE") and not has_404:
+    if has_path_param(path) and method in ("GET", "PUT", "PATCH", "DELETE") and not has_404:
         e.append(
             SpecValidationError(
                 code="ERRORS_404_MISSING",

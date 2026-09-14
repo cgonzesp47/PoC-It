@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import builtins
 import json
+import re
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Dict, List, Set, Tuple
@@ -56,6 +58,159 @@ class SensitiveLiteralAssignment:
     name: str
     value: str
     line: int | None
+
+
+_PACKAGE_NAME_RE = re.compile(r"^([A-Za-z0-9_.-]+)")
+
+
+def _stdlib_module_names() -> Set[str]:
+    """Módulos que no requieren ningún package instalable (biblioteca estándar).
+
+    Usa `sys.stdlib_module_names` (Python >= 3.10) cuando está disponible; si no, cae a
+    `sys.builtin_module_names` como aproximación best-effort. No se mantiene una lista propia:
+    la autoridad es siempre la stdlib real del intérprete.
+    """
+    names: Set[str] = set(getattr(sys, "builtin_module_names", ()) or ())
+    stdlib_names = getattr(sys, "stdlib_module_names", None)
+    if stdlib_names:
+        names.update(stdlib_names)
+    return names
+
+
+def _package_base_name(raw: str) -> str:
+    """Extrae el nombre de paquete sin version specifiers/extras (p.ej. 'pydantic-settings>=2' -> 'pydantic-settings')."""
+    text = str(raw or "").strip()
+    match = _PACKAGE_NAME_RE.match(text)
+    base = match.group(1) if match else text
+    return base.strip().casefold()
+
+
+def _import_root(import_value: str) -> str:
+    return str(import_value or "").strip().split(".", 1)[0]
+
+
+def _internal_import_roots(spec: Mapping[str, Any]) -> Set[str]:
+    """Roots de módulos internos del propio proyecto generado (p.ej. "app"), derivados de
+    `spec.files` — no de una lista hardcodeada, para no acoplar esta validación a una
+    convención de nombres fija."""
+    roots: Set[str] = set()
+    for path in spec.get("files") or []:
+        text = str(path or "").replace("\\", "/").strip()
+        if not text:
+            continue
+        roots.add(text.split("/", 1)[0])
+    return roots
+
+
+def _technology_signal_packages_by_import_root(
+    spec: Mapping[str, Any],
+) -> Dict[str, List[str]]:
+    """Índice import_root -> packages, construido EXCLUSIVAMENTE desde
+    `TechnologySignal.import_roots` / `TechnologySignal.packages`. Nunca infiere paquetes desde
+    `id`, `name`, `category` ni desde el propio import_root."""
+    index: Dict[str, List[str]] = {}
+    for signal in spec.get("technology_signals") or []:
+        if not isinstance(signal, Mapping):
+            continue
+        packages = [
+            str(p or "").strip()
+            for p in (signal.get("packages") or [])
+            if str(p or "").strip()
+        ]
+        for root in signal.get("import_roots") or []:
+            root_str = str(root or "").strip()
+            if not root_str:
+                continue
+            index.setdefault(root_str, [])
+            index[root_str].extend(packages)
+    return index
+
+
+def validate_dependency_imports_declared(
+    *,
+    spec: Dict[str, Any],
+    file_contracts: List[Dict[str, Any]],
+) -> List[FileContractValidationError]:
+    """Gate genérico previo al codegen/runtime: todo import externo permitido por un
+    FileContract debe poder trazarse hasta un package instalable, vía:
+
+        import_root -> TechnologySignal.import_roots -> TechnologySignal.packages -> requirements
+
+    - imports de la stdlib: exentos (no requieren TechnologySignal/package).
+    - imports internos del proyecto (root presente en spec.files, p.ej. "app"): exentos.
+    - cualquier otro import externo debe estar cubierto por un TechnologySignal cuyo `packages`
+      esté declarado en `spec.dependencies` (o `dev_dependencies`).
+
+    Si no hay cobertura, emite `DEPENDENCY_IMPORT_NOT_DECLARED` (no espera al runtime para
+    descubrirlo).
+    """
+    errors: List[FileContractValidationError] = []
+
+    spec = spec if isinstance(spec, dict) else {}
+    file_contracts = file_contracts if isinstance(file_contracts, list) else []
+
+    packages_by_import_root = _technology_signal_packages_by_import_root(spec)
+    internal_roots = _internal_import_roots(spec)
+    stdlib = _stdlib_module_names()
+
+    declared_dependencies = {
+        _package_base_name(dep)
+        for dep in list(spec.get("dependencies") or []) + list(spec.get("dev_dependencies") or [])
+        if str(dep or "").strip()
+    }
+
+    seen: Set[Tuple[str, str]] = set()
+    for contract in file_contracts:
+        if not isinstance(contract, dict):
+            continue
+        path = str(contract.get("path") or "").replace("\\", "/")
+
+        for raw_import in contract.get("allowed_imports") or []:
+            root = _import_root(raw_import)
+            if not root or root in stdlib or root in internal_roots:
+                continue
+
+            key = (path, root)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            packages = packages_by_import_root.get(root)
+            if packages is None:
+                errors.append(
+                    FileContractValidationError(
+                        code="DEPENDENCY_IMPORT_NOT_DECLARED",
+                        path=path,
+                        message=f"Import root {root!r} is allowed but no TechnologySignal covers it.",
+                        details={
+                            "file": path,
+                            "import_root": root,
+                            "reason": "No declared installable package provides this import",
+                        },
+                    )
+                )
+                continue
+
+            if not packages or not any(
+                _package_base_name(pkg) in declared_dependencies for pkg in packages
+            ):
+                errors.append(
+                    FileContractValidationError(
+                        code="DEPENDENCY_IMPORT_NOT_DECLARED",
+                        path=path,
+                        message=(
+                            f"Import root {root!r} is covered by a TechnologySignal but its "
+                            f"package(s) {packages!r} are not declared in dependencies."
+                        ),
+                        details={
+                            "file": path,
+                            "import_root": root,
+                            "reason": "TechnologySignal packages are not present in declared dependencies",
+                        },
+                    )
+                )
+
+    return errors
 
 
 def validate_file_contracts(
@@ -654,6 +809,9 @@ def validate_file_contracts(
                     )
 
     errors.extend(validate_internal_data_contracts(file_contracts=unique_contracts))
+    errors.extend(
+        validate_dependency_imports_declared(spec=spec, file_contracts=unique_contracts)
+    )
 
     for path in planned_paths:
         if path not in files:
@@ -1272,15 +1430,27 @@ def _validate_configuration_access(
     if not provider_module or not provider_symbol or not allowed_fields:
         return []
 
+    # Dos formas equivalentes de acceder a la configuración, ambas deben validarse:
+    #   1) en dos pasos:  settings = get_settings(); settings.campo
+    #   2) encadenada:    get_settings().campo
+    # La forma (2) es al menos tan habitual como la (1) en código generado real, y antes
+    # quedaba completamente invisible aquí porque `_extract_provider_bindings` solo reconoce
+    # asignaciones (`x = get_settings()`) y `_extract_attribute_accesses` solo reconoce accesos
+    # sobre un nombre simple (`x.campo`), no sobre el resultado directo de una llamada.
     bindings = _extract_provider_bindings(source, provider_symbol=provider_symbol)
-    if not bindings:
+    accesses: List[ConfigurationFieldAccess] = []
+    if bindings:
+        accesses.extend(
+            access for access in _extract_attribute_accesses(source) if access.object_name in bindings
+        )
+    accesses.extend(
+        _extract_chained_provider_attribute_accesses(source, provider_symbol=provider_symbol)
+    )
+    if not accesses:
         return []
 
-    accesses = _extract_attribute_accesses(source)
     errors: List[FileContractValidationError] = []
     for access in accesses:
-        if access.object_name not in bindings:
-            continue
         if access.field_name in allowed_fields:
             continue
         line_suffix = f" at line {access.line}" if access.line is not None else ""
@@ -1530,6 +1700,39 @@ def _extract_attribute_accesses(source: str) -> List[ConfigurationFieldAccess]:
                 line=getattr(node, "lineno", None),
             )
         )
+    return result
+
+
+def _extract_chained_provider_attribute_accesses(
+    source: str, *, provider_symbol: str
+) -> List[ConfigurationFieldAccess]:
+    """Detecta accesos encadenados `provider_symbol().campo` (sin variable intermedia).
+
+    `_extract_provider_bindings` + `_extract_attribute_accesses` solo reconocen el patrón en
+    dos pasos (`x = provider_symbol(); x.campo`). El patrón de una sola línea
+    `get_settings().campo` — al menos igual de habitual en código generado real — quedaba
+    completamente invisible para `_validate_configuration_access`, permitiendo que código que
+    referencia un campo de configuración inexistente pasara la validación sin error.
+    """
+    tree = ast.parse(source)
+    result: List[ConfigurationFieldAccess] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        call = node.value
+        if not isinstance(call, ast.Call):
+            continue
+        func = call.func
+        if isinstance(func, ast.Name) and func.id == provider_symbol:
+            result.append(
+                ConfigurationFieldAccess(
+                    object_name=provider_symbol,
+                    field_name=node.attr,
+                    line=getattr(node, "lineno", None),
+                )
+            )
+
     return result
 
 

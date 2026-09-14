@@ -396,7 +396,13 @@ def _status_for_rendered_file(
 
 
 def _contains_real_tests(content: str) -> bool:
-    return any(line.lstrip().startswith("def test_") for line in (content or "").splitlines())
+    stripped = str(content or "")
+    if "assert True" in stripped and "def test_case_placeholder" in stripped:
+        return False
+    return any(
+        line.lstrip().startswith("def test_") and "placeholder" not in line.lower()
+        for line in stripped.splitlines()
+    )
 
 
 def _integration_validated(integration: str, endpoint_entries: List[Dict[str, Any]]) -> bool:

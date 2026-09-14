@@ -16,7 +16,13 @@ Nota:
 from dataclasses import asdict
 from typing import Any, Dict, List, Literal, Sequence, Tuple
 
-from poc_it.generador.request_ir import ApiContractIR, PersistenceIR, RequestIR
+from poc_it.generador.path_utils import extract_path_param_names, has_path_param
+from poc_it.generador.request_ir import (
+    ApiContractIR,
+    PersistenceIR,
+    RequestIR,
+    TechnologySignalIR,
+)
 
 SchemaVersion = Literal["pocit.spec.v1"]
 SpecStatus = Literal["draft"]
@@ -31,11 +37,25 @@ def build_spec_from_request_ir(ir: RequestIR) -> Dict[str, Any]:
     if not isinstance(ir, RequestIR):
         raise TypeError("ir debe ser RequestIR")
 
-    package_errors = validate_technology_packages(ir.technology_signals or [])
+    # `technology_signals` = señales detectadas del usuario + señales baseline que PoC-it
+    # introduce por su propia arquitectura de generación (p.ej. app/core/config.py siempre usa
+    # pydantic-settings). Ambas se tratan de forma UNIFORME a partir de aquí: cualquier import
+    # que dependa de un TechnologySignal debe poder trazarse hasta su(s) `packages`, sin importar
+    # si la señal vino del usuario o de PoC-it mismo.
+    technology_signals = _merge_technology_signals(
+        ir.technology_signals or [], _baseline_technology_signals()
+    )
+
+    package_errors = validate_technology_packages(technology_signals)
     if package_errors:
         raise ValueError("; ".join(package_errors))
 
     assumptions: List[str] = []
+    assumptions.append(
+        "app/core/config.py usa pydantic-settings (BaseSettings) por patrón de configuración "
+        "base de PoC-it; se añadió como TechnologySignal baseline (id=pydantic-settings) para "
+        "que su dependencia quede declarada en requirements.txt."
+    )
 
     endpoints, ep_assumptions = _build_endpoints(ir)
     assumptions.extend(ep_assumptions)
@@ -62,14 +82,14 @@ def build_spec_from_request_ir(ir: RequestIR) -> Dict[str, Any]:
         "run_command": "uvicorn app.main:app --reload",
         "imports_policy": "absolute_from_app",
         "files": files,
-        "dependencies": _build_dependencies(ir),
+        "dependencies": _build_dependencies(technology_signals, ir.integrations),
         "dev_dependencies": _default_dev_dependencies(),
         "env": _build_env(ir),
         "endpoints": endpoints,
         "contracts": _build_contracts(endpoints),
         "assumptions": _dedupe_stable(assumptions),
         "open_questions": _dedupe_stable(ir.open_questions or []),
-        "technology_signals": _build_technology_signals(ir),
+        "technology_signals": _build_technology_signals(technology_signals),
         "integrations": _build_integrations(ir),
         "configuration": _build_configuration(ir),
         "source": {
@@ -92,8 +112,113 @@ def build_spec_from_request_ir(ir: RequestIR) -> Dict[str, Any]:
 
 
 def _default_dependencies() -> List[str]:
-    # No hardcodear tecnologías específicas de persistencia.
-    return ["fastapi", "uvicorn"]
+    # No hardcodear tecnologías específicas de persistencia. fastapi/uvicorn siguen siendo la
+    # base fija de todo proyecto generado (entrypoint=app.main:app, run_command=uvicorn ...),
+    # pero su nombre instalable se deriva de `_baseline_technology_signals().packages` para que
+    # también queden trazadas como cualquier otro TechnologySignal (ver
+    # `_validate_dependency_imports_declared` en file_contracts_validation.py).
+    dependencies: List[str] = []
+    _extend_packages(
+        dependencies,
+        [pkg for signal in _baseline_technology_signals() for pkg in signal.packages],
+    )
+    return dependencies
+
+
+def _baseline_technology_signals() -> List[TechnologySignalIR]:
+    """Tecnologías que PoC-it introduce por su propio patrón de generación, no por detección
+    del usuario.
+
+    Estas señales existen para que archivos/import que PoC-it decide generar por diseño propio
+    (el framework fastapi/uvicorn en sí, o `app/core/config.py` usando
+    `pydantic_settings.BaseSettings`, ver `file_contracts.py` kind="config") queden trazados
+    igual que cualquier otra tecnología:
+
+        import requerido/permitido -> TechnologySignal que lo provee -> packages -> requirements.txt
+
+    en vez de que el import quede "flotando" en `allowed_imports` sin ningún TechnologySignal ni
+    dependencia declarada que lo respalde (la causa raíz de bugs como
+    `ModuleNotFoundError: No module named 'pydantic_settings'`).
+
+    IMPORTANTE: esto NO es una tabla de mapeo módulo->paquete para reparar errores en runtime.
+    Es la declaración, en un único sitio, de una decisión arquitectónica que PoC-it ya toma
+    determinísticamente (todo proyecto generado usa este patrón de configuración). El paquete
+    instalable sigue siendo siempre `packages`, nunca inferido de `id`/`name`/`import_root`.
+    """
+    return [
+        # El framework/runtime que PoC-it siempre genera (ver `_default_dependencies`,
+        # `entrypoint`/`run_command` fijos a app.main:app / uvicorn). Sin esta señal, cualquier
+        # `allowed_imports` que incluya "fastapi" o "uvicorn" quedaría sin TechnologySignal que
+        # lo cubra, disparando DEPENDENCY_IMPORT_NOT_DECLARED en todo proyecto generado.
+        TechnologySignalIR(
+            id="fastapi",
+            name="fastapi",
+            category="framework",
+            packages=("fastapi",),
+            import_roots=("fastapi",),
+            role="web framework",
+            evidence="",
+            confidence="explicit",
+        ),
+        TechnologySignalIR(
+            id="uvicorn",
+            name="uvicorn",
+            category="runtime",
+            packages=("uvicorn",),
+            import_roots=("uvicorn",),
+            role="asgi server",
+            evidence="",
+            confidence="explicit",
+        ),
+        TechnologySignalIR(
+            id="pydantic-settings",
+            name="pydantic-settings",
+            category="library",
+            packages=("pydantic-settings",),
+            import_roots=("pydantic_settings",),
+            role="config",
+            evidence="",
+            confidence="explicit",
+        ),
+        # Endpoints/schemas generados por PoC-it usan `pydantic.BaseModel` (allowed_imports para
+        # kind="endpoint" incluye "pydantic"). Es una dependencia transitiva de fastapi, pero se
+        # declara explícitamente aquí para que quede trazada igual que cualquier otro import
+        # externo, en vez de depender implícitamente de lo que fastapi arrastre.
+        TechnologySignalIR(
+            id="pydantic",
+            name="pydantic",
+            category="library",
+            packages=("pydantic",),
+            import_roots=("pydantic",),
+            role="data validation",
+            evidence="",
+            confidence="explicit",
+        ),
+    ]
+
+
+def _merge_technology_signals(
+    user_signals: Sequence[TechnologySignalIR],
+    baseline_signals: Sequence[TechnologySignalIR],
+) -> List[TechnologySignalIR]:
+    """Combina señales del usuario con señales baseline de PoC-it, sin duplicar por id.
+
+    Si el usuario/contexto ya declaró una señal con el mismo id (p.ej. el propio usuario mencionó
+    pydantic-settings explícitamente), esa señal del usuario tiene prioridad y la baseline no se
+    añade de nuevo.
+    """
+    merged: List[TechnologySignalIR] = list(user_signals or [])
+    existing_ids = {str(signal.id).strip() for signal in merged if str(signal.id or "").strip()}
+
+    for signal in baseline_signals or []:
+        signal_id = str(signal.id).strip()
+        if signal_id and signal_id in existing_ids:
+            continue
+        merged.append(signal)
+        if signal_id:
+            existing_ids.add(signal_id)
+
+    return merged
 
 
 def _normalize_identity(value: str) -> str:
@@ -157,22 +282,25 @@ def _extend_packages(target: List[str], packages: Any) -> None:
             target.append(package)
 
 
-def _build_dependencies(ir: RequestIR) -> List[str]:
+def _build_dependencies(
+    technology_signals: Sequence[TechnologySignalIR],
+    integrations: Sequence[Any],
+) -> List[str]:
     dependencies = list(_default_dependencies())
 
     signals_by_id = {
         str(signal.id).strip(): signal
-        for signal in ir.technology_signals
+        for signal in technology_signals
         if str(signal.id or "").strip()
     }
 
-    for signal in ir.technology_signals:
+    for signal in technology_signals:
         confidence = str(signal.confidence or "").strip().casefold()
         if confidence != "explicit":
             continue
         _extend_packages(dependencies, signal.packages)
 
-    for integration in ir.integrations:
+    for integration in integrations or []:
         for raw_ref in (integration.technology_refs or ()):
             technology_id = str(raw_ref or "").strip()
             if not technology_id:
@@ -190,7 +318,11 @@ def _build_dependencies(ir: RequestIR) -> List[str]:
 
 
 def _default_dev_dependencies() -> List[str]:
-    return ["pytest", "pytest-mock", "httpx"]
+    # httpx + httpx2: fastapi.testclient.TestClient requiere un cliente HTTP compatible con
+    # starlette.testclient; según la versión de starlette resuelta, puede exigir httpx2 (más
+    # reciente) o httpx (fallback deprecado pero funcional). Declarar ambos evita acoplar el
+    # SPEC a una versión concreta del framework.
+    return ["pytest", "pytest-mock", "httpx", "httpx2"]
 
 
 def _base_required_files() -> List[str]:
@@ -289,9 +421,9 @@ def _contract_to_endpoint(
     response_block, resp_assumptions = _build_response_block(c)
     assumptions.extend(resp_assumptions)
 
-    if "{id}" in path:
+    if has_path_param(path):
         request_block = dict(request_block)
-        request_block["path_params"] = _infer_path_params_from_schema_hint(c.request_schema_hint)
+        request_block["path_params"] = _infer_path_params_from_schema_hint(path, c.request_schema_hint)
 
     bundle_files = _bundle_files_for_contract(c)
     ep_source: Dict[str, Any] = {"type": source_type}
@@ -344,8 +476,10 @@ def _build_endpoint_actions(c: ApiContractIR) -> List[Dict[str, Any]]:
     return out
 
 
-def _build_technology_signals(ir: RequestIR) -> List[Dict[str, Any]]:
-    return [asdict(item) for item in (ir.technology_signals or [])]
+def _build_technology_signals(
+    technology_signals: Sequence[TechnologySignalIR],
+) -> List[Dict[str, Any]]:
+    return [asdict(item) for item in (technology_signals or [])]
 
 
 def _build_integrations(ir: RequestIR) -> List[Dict[str, Any]]:
@@ -451,7 +585,7 @@ def _func_name_from_contract(c: ApiContractIR) -> str:
     base_seg = "".join(ch for ch in base_seg if ch.isalnum() or ch in ("_", "-")).replace("-", "_") or "root"
 
     path = _normalize_path(c.path)
-    has_id = "{id}" in path
+    has_id = has_path_param(path)
     singular = _singularize_es(base_seg)
     plural = base_seg
 
@@ -476,7 +610,7 @@ def _build_request_block(c: ApiContractIR) -> Tuple[Dict[str, Any], List[str]]:
     assumptions: List[str] = []
 
     path = _normalize_path(c.path)
-    has_id = "{id}" in path
+    has_id = has_path_param(path)
 
     rt = (c.request_type or "none").strip()
     if rt not in ("json", "multipart", "query", "none"):
@@ -772,15 +906,29 @@ def _build_source_from_assumptions(
     return _dedupe_stable(out)
 
 
-def _infer_path_params_from_schema_hint(schema_hint: Any) -> Dict[str, str]:
+def _infer_path_params_from_schema_hint(path: str, schema_hint: Any) -> Dict[str, str]:
+    """Tipos de los parámetros de `path` (p.ej. {"product_id": "string"}).
+
+    Los nombres se derivan siempre del propio `path` (nunca se asume "id" literal); el
+    `schema_hint`, si lo declara, solo aporta el tipo de cada parámetro por nombre.
+    """
+    param_names = extract_path_param_names(path) or ["id"]
+
+    hint_dict: Dict[str, Any] = {}
     if isinstance(schema_hint, dict):
         for key in ("path_params", "pathParams", "params"):
             v = schema_hint.get(key)
-            if isinstance(v, dict) and "id" in v and isinstance(v.get("id"), str) and v.get("id").strip():
-                return {"id": v.get("id").strip()}
-        if "id" in schema_hint and isinstance(schema_hint.get("id"), str) and schema_hint.get("id").strip():
-            return {"id": schema_hint.get("id").strip()}
-    return {"id": "string"}
+            if isinstance(v, dict):
+                hint_dict = v
+                break
+        else:
+            hint_dict = schema_hint
+
+    result: Dict[str, str] = {}
+    for name in param_names:
+        value = hint_dict.get(name)
+        result[name] = value.strip() if isinstance(value, str) and value.strip() else "string"
+    return result
 
 
 def _merge_contract_ir(preferred: ApiContractIR, fallback: ApiContractIR) -> ApiContractIR:
@@ -921,7 +1069,7 @@ def _merge_endpoint_dicts(preferred: Dict[str, Any], fallback: Dict[str, Any]) -
 
 
 def _default_errors_for_endpoint(*, method: str, path: str) -> List[Dict[str, Any]]:
-    if "{id}" in path and method in ("GET", "PUT", "PATCH", "DELETE"):
+    if has_path_param(path) and method in ("GET", "PUT", "PATCH", "DELETE"):
         return [
             {
                 "status_code": 404,
