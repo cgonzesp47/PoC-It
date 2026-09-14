@@ -52,7 +52,62 @@ La idea arquitectónica central es que cada fase no tenga que reinterpretar desd
 - Node.js + npm — solo si vas a usar la **interfaz web**; se usan para compilar el frontend de `ui/`.
 - Tus propias API keys de al menos un proveedor LLM (ver siguiente punto). PoC-it no incluye ninguna clave propia: cada usuario debe configurar la suya antes de poder generar una PoC.
 
-### 2. Configurar tus API keys
+---
+
+### 2. Configuración del entorno de desarrollo
+
+### 2.1. Arranque rápido (Recomendado)
+
+Si quieres empezar directamente sin configurar el entorno a mano, el script se encarga de crear el `.venv`, instalar dependencias, generar tu `.env` si falta y arrancar el servidor:
+
+* **En Windows (PowerShell):**
+  ```powershell
+  Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+  .\run.ps1
+
+### 2.2. Arranque manual
+
+Sigue estos pasos ordenados según tu sistema operativo para configurar el entorno virtual e instalar las dependencias necesarias.
+
+#### En Windows (PowerShell):
+1. **Accede a la raíz de tu proyecto:**
+   ```powershell
+   cd C:\ruta\a\tu\proyecto\PoC-It
+   ```
+2. **Habilita la ejecución de scripts locales** (Evita el error de bloqueo de políticas de seguridad en la sesión actual de la terminal):
+   ```powershell
+   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+   ```
+3. **Crea y activa el entorno virtual de Python:**
+   ```powershell
+   python -m venv .venv
+   .venv\Scripts\Activate.ps1
+   ```
+   *Sabrás que se ha activado correctamente porque verás el prefijo `(.venv)` al inicio de tu línea de comandos.*
+4. **Instala los paquetes requeridos por el Backend:**
+   ```powershell
+   pip install -r requirements.txt
+   ```
+
+#### En macOS / Linux (Terminal):
+1. **Accede a la raíz de tu proyecto:**
+   ```bash
+   cd /ruta/a/tu/proyecto/PoC-It
+   ```
+2. **Crea y activa el entorno virtual de Python:**
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+3. **Instala los paquetes requeridos por el Backend:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+---
+
+
+### 3. Configurar tus API keys
 
 Copia `.env_example` a `.env` en la raíz del proyecto y rellena tus propias credenciales. El pipeline llama a los modelos a través de un proxy LiteLLM local (`litellm_config.yaml`) que reparte cada fase entre varios proveedores con fallback automático entre ellos, así que cuantas más de estas claves configures, más resiliente será la generación ante fallos o límites de un proveedor concreto:
 
