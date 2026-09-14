@@ -1,15 +1,44 @@
 from __future__ import annotations
 
 import json
+import re
+from enum import Enum
 from typing import Any, List
-
-from poc_it.generador.restriction_models import (
-    RestrictionEnforcement,
-    migrate_legacy_enforcement,
-)
 
 from poc_it.generador.json_utils import extraer_json_tolerante
 from poc_it.infraestructura.llm_client import chat_completion_json
+
+# Needle "desnudo" (sin espacios/operadores/comillas): un identificador Python válido.
+# Es exactamente el tipo de needle peligroso para `must_not_contain`, porque hace substring
+# match contra TODO el texto del archivo, incluyendo nombres de variable/atributo/import
+# legítimos (p.ej. `credentials = service_account.Credentials.from_service_account_file(...)`
+# es la forma CORRECTA de usar ADC, pero contiene la substring "credentials").
+_BARE_IDENTIFIER_NEEDLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+_BARE_ATTRIBUTE_ACCESS_NEEDLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.$")
+_BARE_KWARG_NEEDLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=$")
+
+
+def _as_literal_assignment_regex(word: str) -> str:
+    """Convierte un needle "desnudo" (p.ej. 'password', 'credentials') en un patrón `re:` que
+    solo dispara cuando ese identificador se asigna un LITERAL de cadena hardcodeado
+    (`algo_password = "..."`), no cuando aparece como nombre de variable/import/atributo
+    (`credentials = Credentials.from_service_account_file(...)`, `token_uri = settings.x`, etc.).
+
+    Esto preserva la intención de la restricción ("no hardcodear secretos") sin prohibir el
+    propio vocabulario que el código CORRECTO necesita usar (imports, nombres de parámetro,
+    nombres de campo de configuración)."""
+    escaped = re.escape(word)
+    pattern = rf'[A-Za-z0-9_]*{escaped}[A-Za-z0-9_]*\s*=\s*["\'][^"\']'
+    return "re:(?i)" + pattern
+
+
+class ConstraintEnforcement(str, Enum):
+    CODE = "code"
+    RUNTIME = "runtime"
+    EXTERNAL_PRECONDITION = "external_precondition"
+    DOCUMENTATION = "documentation"
 
 
 def sanitizar_restrictions(restrictions: List[dict]) -> List[dict]:
@@ -123,17 +152,53 @@ def sanitizar_restrictions(restrictions: List[dict]) -> List[dict]:
 
         rr["kind"] = _infer_kind(rr)
 
-        enforcement = migrate_legacy_enforcement(rr)
-        rr["enforcement"] = enforcement.value
-        if str(r.get("enforcement") or "").strip():
-            rr["source_enforcement"] = str(r.get("enforcement") or "").strip()
-        rr["migration_applied"] = rr.get("source_enforcement") != rr["enforcement"]
+        # Reglas SECURITY con must_not_contain "desnudo" (identificador plano, sin regex):
+        # reescribirlas a "solo dispara si ese identificador recibe un literal de cadena
+        # hardcodeado". Es la causa raíz de falsos positivos tipo 'no_credentials_in_code'
+        # bloqueando código que usa `credentials`/`token`/`key` como nombre de variable/import
+        # legítimo (patrón ADC/OAuth correcto), no como secreto embebido.
+        if rr["kind"] == "SECURITY":
+            rewritten_must_not: List[str] = []
+            for needle in rr["must_not_contain"]:
+                needle_str = str(needle).strip()
+                if not needle_str:
+                    continue
+                if needle_str.startswith("re:"):
+                    rewritten_must_not.append(needle_str)
+                    continue
+                if _BARE_IDENTIFIER_NEEDLE_RE.match(needle_str):
+                    rewritten_must_not.append(_as_literal_assignment_regex(needle_str))
+                    continue
+                if _BARE_KWARG_NEEDLE_RE.match(needle_str):
+                    # "credentials=", "token=", ... : matchea también kwargs legítimos como
+                    # `build(..., credentials=creds)`. Misma reescritura que un identificador
+                    # desnudo: solo dispara si recibe un literal de cadena hardcodeado.
+                    rewritten_must_not.append(_as_literal_assignment_regex(needle_str[:-1]))
+                    continue
+                if _BARE_ATTRIBUTE_ACCESS_NEEDLE_RE.match(needle_str):
+                    # "settings.", "config.", ... : prefijo de acceso a atributo. Es exactamente
+                    # el patrón CORRECTO para leer configuración en vez de hardcodear secretos
+                    # (`settings.google_drive_folder_id`), así que prohibirlo contradice la
+                    # propia restricción. Se descarta en vez de reescribirse.
+                    continue
+                rewritten_must_not.append(needle_str)
+            rr["must_not_contain"] = list(dict.fromkeys(rewritten_must_not))
+
+        enforcement = str(rr.get("enforcement") or "").strip().lower()
+        if enforcement not in {
+            ConstraintEnforcement.CODE.value,
+            ConstraintEnforcement.RUNTIME.value,
+            ConstraintEnforcement.EXTERNAL_PRECONDITION.value,
+            ConstraintEnforcement.DOCUMENTATION.value,
+        }:
+            enforcement = ConstraintEnforcement.CODE.value
+        rr["enforcement"] = enforcement
 
         # Severidad: si no viene, inferir por tipo (kind)
         severity = str(rr.get("severity") or "").strip().upper()
         if severity not in ("BLOCK", "WARN"):
             severity = _inferir_severidad(rr)
-        if enforcement is not RestrictionEnforcement.TEXT:
+        if enforcement != ConstraintEnforcement.CODE.value:
             severity = "WARN"
         rr["severity"] = severity
 

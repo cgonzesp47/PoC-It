@@ -15,6 +15,7 @@ from poc_it.generador.file_contracts_validation import (
     _secret_configuration_keys,
     _shape_from_return_spec,
     _shapes_are_compatible,
+    _validate_unresolved_python_symbols,
 )
 
 from .ast_utils import (
@@ -69,9 +70,79 @@ def validate_generated_file_semantics(
         "test": _validate_test,
     }
     validator = validators.get(kind)
-    if validator is None:
-        return []
-    return validator(generated_file=generated_file, file_contract=file_contract)
+    issues = validator(generated_file=generated_file, file_contract=file_contract) if validator else []
+
+    # Chequeo genérico (no ligado a `kind`): un símbolo usado sin importar/definir (p.ej.
+    # `MediaFileUpload` sin su `from ... import MediaFileUpload`) es un `NameError` garantizado
+    # en runtime, independientemente del tipo de archivo. Antes solo lo detectaba el validador de
+    # proyecto completo (`file_contracts_validation.py`, tras generar TODOS los archivos), así que
+    # un archivo con este bug pasaba el primer filtro y solo se detectaba — y no siempre se
+    # conseguía reparar — varios pasos después, en el bucle de reparación de todo el proyecto.
+    if generated_file.path.endswith(".py"):
+        try:
+            unresolved = _validate_unresolved_python_symbols(
+                path=generated_file.path,
+                source=generated_file.content,
+            )
+        except SyntaxError:
+            unresolved = []
+        issues = list(issues) + [
+            _issue(
+                error.code,
+                generated_file,
+                error.message,
+                details=dict(error.details or {}),
+            )
+            for error in unresolved
+        ]
+
+        # `Depends(...)` en posición de anotación de tipo (`param: Depends(x)`) en vez de valor
+        # por defecto (`param: Tipo = Depends(x)`) es SIEMPRE un bug: FastAPI/Pydantic intentan
+        # tratar el resultado de Depends(...) como un tipo real al construir el modelo del
+        # endpoint, y revientan en import-time con errores opacos (p.ej.
+        # "'Depends' object has no attribute '__mro__'"). Detectable de forma determinista por
+        # AST, sin falsos positivos posibles.
+        tree_for_depends = _python_tree(generated_file)
+        if tree_for_depends is not None:
+            issues = list(issues) + _validate_depends_as_annotation(tree_for_depends, generated_file)
+
+    return issues
+
+
+def _is_depends_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id == "Depends"
+    if isinstance(func, ast.Attribute):
+        return func.attr == "Depends"
+    return False
+
+
+def _validate_depends_as_annotation(
+    tree: ast.Module, generated_file: GeneratedFile
+) -> List[CodegenIssue]:
+    issues: List[CodegenIssue] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        all_args = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+        for arg in all_args:
+            if arg.annotation is not None and _is_depends_call(arg.annotation):
+                issues.append(
+                    _issue(
+                        "CODE_DEPENDS_USED_AS_ANNOTATION",
+                        generated_file,
+                        (
+                            f"El parámetro '{arg.arg}' de {node.name} usa Depends(...) como "
+                            "anotación de tipo en vez de valor por defecto: debe escribirse "
+                            f"'{arg.arg}: <Tipo> = Depends(...)', no '{arg.arg}: Depends(...)'."
+                        ),
+                        symbol=node.name,
+                    )
+                )
+    return issues
 
 
 def _issue(
@@ -113,6 +184,42 @@ def _extract_attribute_accesses(source: str) -> list[ConfigurationFieldAccess]:
         result.append(
             ConfigurationFieldAccess(
                 object_name=node.value.id,
+                field_name=node.attr,
+                line=getattr(node, "lineno", None),
+            )
+        )
+
+    return result
+
+
+def _extract_direct_provider_attribute_accesses(
+    source: str,
+    *,
+    provider_symbol: str,
+) -> list[ConfigurationFieldAccess]:
+    """Detecta acceso a campos de configuración encadenado directamente sobre la llamada al
+    proveedor (p.ej. `get_settings().CAMPO`), sin pasar por una variable intermedia.
+
+    `_extract_attribute_accesses` + `_extract_provider_bindings` solo detectan el patrón
+    `x = get_settings(); x.CAMPO`: si el código encadena la llamada y el atributo en una sola
+    expresión (patrón igual de común, y el que de hecho generó el LLM en la práctica), el acceso
+    a un campo no permitido pasaba completamente inadvertido.
+    """
+    tree = ast.parse(source)
+    result: list[ConfigurationFieldAccess] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        call = node.value
+        if not isinstance(call, ast.Call):
+            continue
+        func = call.func
+        if not isinstance(func, ast.Name) or func.id != provider_symbol:
+            continue
+        result.append(
+            ConfigurationFieldAccess(
+                object_name=provider_symbol,
                 field_name=node.attr,
                 line=getattr(node, "lineno", None),
             )
@@ -171,28 +278,45 @@ def _validate_configuration_access(
         generated_file.content,
         provider_symbol=provider_symbol,
     )
-    if not config_bindings:
+
+    accesses: list[ConfigurationFieldAccess] = list(
+        _extract_direct_provider_attribute_accesses(
+            generated_file.content,
+            provider_symbol=provider_symbol,
+        )
+    )
+    if config_bindings:
+        accesses.extend(
+            access
+            for access in _extract_attribute_accesses(generated_file.content)
+            if access.object_name in config_bindings
+        )
+    if not accesses:
         return []
 
     issues: List[CodegenIssue] = []
-    for access in _extract_attribute_accesses(generated_file.content):
-        if access.object_name not in config_bindings:
+    seen: set[tuple[str, int | None]] = set()
+    for access in accesses:
+        if access.field_name in allowed_fields:
             continue
-        if access.field_name not in allowed_fields:
-            issues.append(
-                _issue(
-                    "CONFIGURATION_FIELD_MISSING",
-                    generated_file,
-                    (
-                        "Generated code references configuration field "
-                        f"{access.field_name!r} not allowed by FileContract."
-                    ),
-                    details={
-                        "field": access.field_name,
-                        "allowed_fields": sorted(allowed_fields),
-                    },
-                )
+        key = (access.field_name, access.line)
+        if key in seen:
+            continue
+        seen.add(key)
+        issues.append(
+            _issue(
+                "CONFIGURATION_FIELD_MISSING",
+                generated_file,
+                (
+                    "Generated code references configuration field "
+                    f"{access.field_name!r} not allowed by FileContract."
+                ),
+                details={
+                    "field": access.field_name,
+                    "allowed_fields": sorted(allowed_fields),
+                },
             )
+        )
 
     return issues
 
@@ -354,6 +478,19 @@ def _validate_provided_interfaces(
             continue
 
         function_node = functions.get(symbol)
+
+        # `interface_required=False` (owner_path == consumer_path, ver
+        # file_contracts._resolve_action_owner_path) significa que la acción no vive en un
+        # módulo/repositorio dedicado: su "interfaz" es el propio handler del endpoint, que ya
+        # se valida por separado (required_symbols, request/response contract) con su forma real
+        # (p.ej. un único parámetro de modelo Pydantic, no los campos aplanados de la acción).
+        # Exigir aquí, además, una función named-after-the-action-id con esos campos como
+        # parámetros sueltos es un contrato inventado que ninguna implementación idiomática
+        # cumple. Solo exigimos symbol/parámetros cuando de verdad hay una interfaz separada
+        # que implementar (p.ej. una integración externa en su propio módulo).
+        if not interface_required:
+            continue
+
         if function_node is None:
             issues.append(
                 _issue(

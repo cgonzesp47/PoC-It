@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
+from poc_it.generador.file_contracts import _INTEGRATION_CLIENT_PROVIDER_SYMBOL
+
 
 def _safe_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
@@ -48,6 +50,12 @@ def _kind_specific_rules(file_contract: Dict[str, Any]) -> List[str]:
             "Invoca el módulo interno asignado.",
             "Traduce errores declarados a respuestas HTTP.",
             "No dupliques autenticación o configuración del proveedor.",
+            "Si el módulo interno que invocas construye un cliente externo (Google/AWS/HTTP/etc.), "
+            "importa también su función proveedora del cliente — llamada EXACTAMENTE "
+            f"`{_INTEGRATION_CLIENT_PROVIDER_SYMBOL}` (no inventes otro nombre) — y recíbela vía "
+            f"`Depends({_INTEGRATION_CLIENT_PROVIDER_SYMBOL})` como parámetro del handler; pasa "
+            "ese cliente como argumento en la llamada directa a la función de la acción (la "
+            "llamada sigue siendo directa, solo cambia de dónde sale el cliente).",
         ]
     if kind == "integration":
         return [
@@ -56,6 +64,11 @@ def _kind_specific_rules(file_contract: Dict[str, Any]) -> List[str]:
             "Implementa una operación llamable por cada acción externa asignada.",
             "No importes FastAPI salvo que el contrato lo permita expresamente.",
             "No traduzcas excepciones a HTTPException.",
+            "Separa \"construir el cliente\" de \"usar el cliente\": expón una función proveedora "
+            f"sin argumentos requeridos llamada EXACTAMENTE `{_INTEGRATION_CLIENT_PROVIDER_SYMBOL}` "
+            "(no un nombre distinto — el endpoint que la consume espera literalmente ese nombre) "
+            "que construye y devuelve el cliente, y haz que cada función de acción reciba ese "
+            "cliente como parámetro explícito en vez de construirlo/importarlo por dentro.",
         ]
     if kind == "config":
         return [
@@ -76,6 +89,48 @@ def _render_bullets(values: List[Any]) -> str:
     for value in values or []:
         items.append(f"- {json.dumps(value, ensure_ascii=False)}")
     return "\n".join(items) if items else "- []"
+
+
+def generic_python_correctness_rules() -> List[str]:
+    """
+    Reglas de corrección de Python genéricas (no atadas a ningún SDK, tecnología ni plantilla
+    concreta), derivadas de bugs reales y repetidos observados en generación de código.
+
+    Compartidas entre el prompt de codegen/reparación de contrato (este módulo) y el prompt de
+    reparación runtime (`poc_it.orquestacion.llm_safe_repair`), para que ambos caminos se
+    beneficien de las mismas lecciones aprendidas sin duplicar texto ni desincronizarse.
+    """
+    return [
+        "- Para ficheros temporales usa el módulo `tempfile` (p.ej. `tempfile.gettempdir()`, "
+        "`tempfile.NamedTemporaryFile`); no hardcodees rutas de directorio como `/tmp/...` "
+        "o `C:\\Temp\\...`, que no son portables entre sistemas operativos.",
+        "- Si usas acceso con puntos a un submódulo (p.ej. `paquete.submodulo.funcion()`), debes "
+        "importar ese submódulo explícitamente (`import paquete.submodulo`); un "
+        "`from paquete.submodulo import X` NO deja `paquete` disponible como nombre en el scope, "
+        "así que escribir `paquete.submodulo.funcion()` tras ese import fallaría con "
+        "'paquete' is not defined.",
+        "- Cuando una función auxiliar devuelva un dict con varios campos, en el punto de llamada "
+        "usa exactamente el campo que necesitas (p.ej. `resultado['campo']`), nunca el dict "
+        "completo como si fuera un único valor escalar. Antes de devolver una respuesta, "
+        "comprueba que cada valor coincide con el tipo declarado en la firma/response model "
+        "(si una función declara `-> Dict[str, str]`, ningún valor del dict puede ser a su vez "
+        "un dict u otro objeto no-string).",
+        "- Cualquier valor que extraigas de la respuesta de un SDK/cliente externo (Google/AWS/HTTP/"
+        "base de datos/etc., p.ej. `response['id']`, `resource.get('name')`) tiene un tipo dinámico "
+        "que NO puedes garantizar en tiempo de escritura del código: conviértelo explícitamente al "
+        "tipo declarado en tu `response_model` antes de construirlo (`str(...)`, `int(...)`, "
+        "`bool(...)`). NUNCA pases ese valor extraído directamente a un campo tipado sin conversión "
+        "— si el SDK real (o un doble/mock usado en tests) devuelve algo que no es exactamente ese "
+        "tipo primitivo, la validación de Pydantic del `response_model` fallará con un 500 en vez de "
+        "devolver la respuesta.",
+        "- El código de limpieza en un bloque `finally` (cerrar/borrar ficheros temporales, liberar "
+        "recursos, etc.) nunca debe poder lanzar una excepción que reemplace la respuesta o el error "
+        "que ya se estaba devolviendo (p.ej. borrar un fichero temporal que otra librería aún tiene "
+        "abierto). Envuelve esa limpieza en su propio `try/except Exception as exc:` para que un fallo "
+        "de limpieza nunca oculte el resultado real del endpoint — y dentro de ese except registra el "
+        "fallo con `logger.exception(...)` (nunca lo silencies con un `pass` vacío: cualquier "
+        "`except Exception` sin logging trazable se rechaza igualmente).",
+    ]
 
 
 def _priority_rules() -> List[str]:
@@ -104,6 +159,7 @@ def _priority_rules() -> List[str]:
         "- No sustituyas una llamada requerida por una respuesta constante.",
         "- No añadas nuevos campos de configuración, nuevos secrets ni nuevas restricciones contractuales.",
         "- Si falta información en el contrato, no la inventes.",
+        *generic_python_correctness_rules(),
     ]
 
 
@@ -240,6 +296,16 @@ def _authentication_contract_section(file_contract: Dict[str, Any]) -> List[str]
                 "- Do not embed secret values when `requires_embedded_secret=false`.",
                 "- Use only configuration fields listed in CONFIGURATION CONTRACT.",
                 "- If the selected library offers multiple authentication methods, choose one compatible with this contract.",
+                "- NEVER pass `None`, an empty string, or any other placeholder/sentinel value as a "
+                "required argument when constructing a credentials/client object — an argument "
+                "you cannot satisfy from CONFIGURATION CONTRACT or from ambient discovery means "
+                "you picked the wrong constructor/method for this contract, not that the argument "
+                "can be omitted.",
+                "- When `discovery=ambient` and `requires_static_credential_file=false`: use the "
+                "selected library's zero-argument (or scopes-only) ambient-credential entry point "
+                "(the one that auto-discovers credentials from the runtime environment). Do NOT "
+                "call a 'from file' / 'from path' / 'from json' style constructor at all, not even "
+                "with a placeholder path.",
             ]
         )
 
@@ -326,6 +392,34 @@ def build_prompt_file_contract(
     return "\n".join(line for line in prompt_lines if line is not None).strip()
 
 
+def _previous_rejected_attempts_section(
+    previous_rejected_attempts: Optional[List[Dict[str, Any]]],
+) -> List[str]:
+    if not previous_rejected_attempts:
+        return []
+
+    lines = [
+        "INTENTOS ANTERIORES RECHAZADOS EN ESTA MISMA REPARACIÓN",
+        (
+            "Ya intentaste corregir este archivo antes en esta misma reparación y cada intento "
+            "fue rechazado por introducir un error NUEVO. NO repitas el mismo contenido ni el "
+            "mismo error otra vez; corrige de una forma distinta."
+        ),
+    ]
+    for index, attempt in enumerate(previous_rejected_attempts, start=1):
+        issues = attempt.get("issues") or []
+        lines.append(f"Intento rechazado #{index}:")
+        lines.append("- Errores nuevos que introdujo ese intento:")
+        if issues:
+            lines.extend(f"  - {issue}" for issue in issues)
+        else:
+            lines.append("  - (sin detalle)")
+        lines.append("- Contenido rechazado de ese intento:")
+        lines.append(str(attempt.get("content") or ""))
+        lines.append("")
+    return lines
+
+
 def build_prompt_file_contract_fix(
     *,
     spec: dict,
@@ -335,6 +429,7 @@ def build_prompt_file_contract_fix(
     related_contracts: List[dict],
     structured_issues: Optional[List[Dict[str, Any]]] = None,
     generated_interface_summaries: Optional[List[Dict[str, Any]]] = None,
+    previous_rejected_attempts: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     fc_path = (file_contract.get("path") or "").replace("\\", "/")
     related_summary = _summarize_related_contracts(related_contracts)
@@ -472,6 +567,7 @@ def build_prompt_file_contract_fix(
         "ERRORES A CORREGIR",
         "- " + "\n- ".join(errors or ["repair_file"]),
         "",
+        *_previous_rejected_attempts_section(previous_rejected_attempts),
         "INTERFACES REALES DISPONIBLES",
         _safe_json(generated_interface_summaries or []),
         "",

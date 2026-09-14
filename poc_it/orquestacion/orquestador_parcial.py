@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Iterable, Tuple
 
 from poc_it.entrada.demo_progress import demo_progress, is_demo_mode
 
@@ -80,6 +80,49 @@ def _assert_preserved_context_fields(
             "ContextoNormalizado perdió campos: "
             + ", ".join(lost_fields)
         )
+
+
+def _required_env_var_names_from_spec(spec: Dict[str, Any] | None) -> list[str]:
+    """Nombres de variables de entorno que el SPEC declara como obligatorias
+    (`spec.env[*].required=True`), independientemente de CÓMO las lea el código generado
+    (`os.getenv(...)`, un campo de `pydantic_settings.BaseSettings`, o cualquier otro mecanismo
+    futuro).
+
+    Por qué hace falta esto además de `env_vars_explicit` (detectado por AST desde el código):
+    - `poc_facts_extractor` solo reconoce `os.getenv`/`os.environ[...]` literales en el código.
+    - Un campo de `pydantic_settings.BaseSettings` sin valor por defecto es EXACTAMENTE igual de
+      obligatorio, pero el extractor AST no lo ve — así que el test harness nunca le asignaba un
+      valor de relleno (`_ensure_env`), y `Settings()` reventaba con un `ValidationError` en
+      cuanto se instanciaba durante un test, mucho antes de llegar al código realmente bajo test.
+    - `spec.env` ya es la fuente de verdad declarativa (viene de `spec.configuration` con
+      `delivery="env"`), y no depende de ningún patrón de código concreto: cubre tanto
+      `os.getenv` como `pydantic_settings` como cualquier otro mecanismo de lectura.
+    """
+    if not isinstance(spec, dict):
+        return []
+    names: list[str] = []
+    for item in spec.get("env") or []:
+        if not isinstance(item, dict):
+            continue
+        if not bool(item.get("required")):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _merge_env_var_names(*groups: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for group in groups:
+        for name in group:
+            value = str(name or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+    return out
 
 
 class OrquestadorParcial:
@@ -367,6 +410,7 @@ Descripción:
         """
         Ejecuta el flujo completo incluyendo clasificación basada en ProjectContext.
         """
+        archivos_creados: list[str] = []
         try:
             context = self.context
             modo_generacion = (self.modo_generacion or context.clasificacion or "").upper()
@@ -536,9 +580,15 @@ Descripción:
 
                         # Inferir estilo de tests (sync vs async) desde el CÓDIGO real.
                         tests_style = "sync"
+                        env_vars_explicit = _merge_env_var_names(
+                            facts.get("env_vars_explicit") or [],
+                            _required_env_var_names_from_spec(
+                                resultado.get("spec") if isinstance(resultado, dict) else None
+                            ),
+                        )
                         runtime_facts = RuntimeFacts(
                             endpoints=endpoints,
-                            env_vars_explicit=list(facts.get("env_vars_explicit") or []),
+                            env_vars_explicit=env_vars_explicit,
                             imports=list(facts.get("imports") or []),
                             tests_style=tests_style,
                         )
@@ -547,7 +597,7 @@ Descripción:
                         hermetic_flag = str(modo_generacion).upper() == "PARCIAL"
                         runtime_contracts = RuntimeContracts(
                             endpoints=contracts_eps,
-                            env_vars_explicit=list(facts.get("env_vars_explicit") or []),
+                            env_vars_explicit=env_vars_explicit,
                             imports=list(facts.get("imports") or []),
                             tests_style=tests_style,
                             hermetic=hermetic_flag,
@@ -595,113 +645,130 @@ Descripción:
                     # La materialización ya deja CODEGEN_VALIDATION_ERROR.json para diagnóstico.
                     pass
 
-                # Estado final: determinista y estructurado.
-                #
-                # Política requerida:
-                # - Tanto en COMPLETO como en PARCIAL: si el loop de reparación de tests no converge,
-                #   degradar a "contract-lite" (suite mínima) y re-ejecutar pytest.
-                # - Si esa suite mínima pasa => continuar (docs/estimación/publicación) SIN generar README_ERROR fatal.
-                # - Si incluso contract-lite falla => no publicar.
-                run_result = RunResult.error(mode=str(modo_generacion).upper(), reason="pytest_failed")
+                # Runtime/tests solo se evaluan si el codegen es realmente valido.
+                # Un codegen "invalid" ya fijo estado_final=CODEGEN_INVALID arriba; no debe
+                # ejecutarse pytest (ni siquiera el fallback contract-lite), porque eso
+                # implicaria preparar el entorno runtime aislado (venv real) para un
+                # proyecto que ni siquiera paso el gate de codegen.
+                if codegen_status != "invalid":
+                    # Estado final: determinista y estructurado.
+                    #
+                    # Política requerida:
+                    # - Tanto en COMPLETO como en PARCIAL: si el loop de reparación de tests no converge,
+                    #   degradar a "contract-lite" (suite mínima) y re-ejecutar pytest.
+                    # - Si esa suite mínima pasa => continuar (docs/estimación/publicación) SIN generar README_ERROR fatal.
+                    # - Si incluso contract-lite falla => no publicar.
+                    run_result = RunResult.error(mode=str(modo_generacion).upper(), reason="pytest_failed")
 
-                # 1) Leer resultado del loop de repair si existe (lo setea ejecutar_reparacion_runtime)
-                degraded = False
-                degrade_type = None
-                try:
-                    pr = (resultado or {}).get("pytest_repair") if isinstance(resultado, dict) else None
-                    if isinstance(pr, dict):
-                        degraded = bool(pr.get("degraded"))
-                        degrade_type = pr.get("degrade_type")
-                except Exception:
+                    # 1) Leer resultado del loop de repair si existe (lo setea ejecutar_reparacion_runtime)
                     degraded = False
                     degrade_type = None
-
-                # 2) Evaluar pytest actual
-                try:
-                    from poc_it.orquestacion.pytest_llm_repair import (
-                        _extract_counts_from_junit_xml,
-                        _read_pytest_junit_xml,
-                    )
-
-                    xml = _read_pytest_junit_xml(project_dir)
-                    counts = _extract_counts_from_junit_xml(xml)
-                    pytest_ok = bool(counts and (counts[0] + counts[1] == 0))
-                except Exception:
-                    pytest_ok = False
-
-                # 3) Si no pasó y no degradó todavía, degradar aquí (contract-lite) como último recurso.
-                if not pytest_ok and not degraded:
                     try:
-                        # Degradación a contract-lite: suite mínima (smoke_import + openapi).
-                        # IMPORTANTE: materializar a disco el patch mínimo, porque `_degrade_to_contract_lite`
-                        # actualiza `estructura` pero no siempre garantiza escritura final si el pipeline se corta.
-                        from poc_it.orquestacion.pytest_llm_repair import _degrade_to_contract_lite, _run_pytest
-
-                        patch_min = _degrade_to_contract_lite(
-                            nombre_proyecto=self.nombre_proyecto,
-                            estructura=estructura,
-                        )
-                        try:
-                            materializar_proyecto(
-                                nombre_proyecto=self.nombre_proyecto,
-                                estructura=patch_min,
-                                limpiar_directorio=False,
-                            )
-                        except Exception:
-                            pass
-
-                        ok2, out2, _ = _run_pytest(project_dir)
-                        degraded = True
-                        degrade_type = "contract-lite"
-
-                        # refrescar estado pytest tras degradación (suite mínima)
-                        # Nota: el report XML puede no existir si pytest corrió sin junitxml fallback;
-                        # en ese caso, ok2 es la fuente de verdad.
-                        pytest_ok = bool(ok2)
-
-                        # reflejar en `resultado` para el resto del pipeline
-                        try:
-                            if isinstance(resultado, dict):
-                                resultado["pytest_repair"] = {
-                                    "ok": bool(pytest_ok),
-                                    "attempts": int((pr or {}).get("attempts") or 0) if isinstance(pr, dict) else 0,
-                                    "degraded": True,
-                                    "degrade_type": "contract-lite",
-                                    "artifacts": dict((pr or {}).get("artifacts") or {}) if isinstance(pr, dict) else {},
-                                }
-                        except Exception:
-                            pass
+                        pr = (resultado or {}).get("pytest_repair") if isinstance(resultado, dict) else None
+                        if isinstance(pr, dict):
+                            degraded = bool(pr.get("degraded"))
+                            degrade_type = pr.get("degrade_type")
                     except Exception:
-                        # best-effort: si falla degradación, seguimos con pytest_ok=False
-                        pass
+                        degraded = False
+                        degrade_type = None
 
-                # 4) Política: considerar OK si pytest pasa, incluyendo el caso OK_DEGRADED (contract-lite).
-                if pytest_ok:
-                    run_result = RunResult.ok(
-                        mode=str(modo_generacion).upper(),
-                        degraded=degraded,
-                        degrade_type=str(degrade_type) if degrade_type else None,
-                    )
+                    # 2) Evaluar pytest actual
+                    try:
+                        from poc_it.orquestacion.pytest_llm_repair import (
+                            _extract_counts_from_junit_xml,
+                            _read_pytest_junit_xml,
+                        )
 
-                if isinstance(resultado, dict):
-                    resultado = finalize_codegen_classification(
-                        preliminary_result=resultado,
-                        runtime_tests_passed=bool(run_result.pytest_ok),
-                    )
-                    resultado["pytest_ok"] = bool(run_result.pytest_ok)
-                    resultado["estado_final"] = run_result.status
-                    resultado["publishable"] = bool(run_result.publishable) and bool(resultado.get("materializable"))
-                    resultado["run_reasons"] = list(run_result.reasons)
-                    resultado["degraded"] = bool(run_result.degraded) if run_result.degraded is not None else None
-                    resultado["degrade_type"] = run_result.degrade_type
+                        xml = _read_pytest_junit_xml(project_dir)
+                        counts = _extract_counts_from_junit_xml(xml)
+                        pytest_ok = bool(counts and (counts[0] + counts[1] == 0))
+                    except Exception:
+                        pytest_ok = False
 
-                if str(modo_generacion).upper() == "COMPLETO":
-                    postprocesar_alineacion_por_pytest(
-                        nombre_proyecto=self.nombre_proyecto,
-                        project_dir=project_dir,
-                        resultado=resultado,
-                        estructura=estructura,
-                        archivos_creados=archivos_creados,
+                    # 3) Si no pasó y no degradó todavía, degradar aquí (contract-lite) como último recurso.
+                    if not pytest_ok and not degraded:
+                        try:
+                            # Degradación a contract-lite: suite mínima (smoke_import + openapi).
+                            # IMPORTANTE: materializar a disco el patch mínimo, porque `_degrade_to_contract_lite`
+                            # actualiza `estructura` pero no siempre garantiza escritura final si el pipeline se corta.
+                            from poc_it.orquestacion.pytest_llm_repair import _degrade_to_contract_lite, _run_pytest
+
+                            patch_min = _degrade_to_contract_lite(
+                                nombre_proyecto=self.nombre_proyecto,
+                                estructura=estructura,
+                            )
+                            try:
+                                materializar_proyecto(
+                                    nombre_proyecto=self.nombre_proyecto,
+                                    estructura=patch_min,
+                                    limpiar_directorio=False,
+                                )
+                            except Exception:
+                                pass
+
+                            ok2, out2, _ = _run_pytest(project_dir)
+                            degraded = True
+                            degrade_type = "contract-lite"
+
+                            # refrescar estado pytest tras degradación (suite mínima)
+                            # Nota: el report XML puede no existir si pytest corrió sin junitxml fallback;
+                            # en ese caso, ok2 es la fuente de verdad.
+                            pytest_ok = bool(ok2)
+
+                            # reflejar en `resultado` para el resto del pipeline
+                            try:
+                                if isinstance(resultado, dict):
+                                    resultado["pytest_repair"] = {
+                                        "ok": bool(pytest_ok),
+                                        "attempts": int((pr or {}).get("attempts") or 0) if isinstance(pr, dict) else 0,
+                                        "degraded": True,
+                                        "degrade_type": "contract-lite",
+                                        "artifacts": dict((pr or {}).get("artifacts") or {}) if isinstance(pr, dict) else {},
+                                    }
+                            except Exception:
+                                pass
+                        except Exception:
+                            # best-effort: si falla degradación, seguimos con pytest_ok=False
+                            pass
+
+                    # 4) Política: considerar OK si pytest pasa, incluyendo el caso OK_DEGRADED (contract-lite).
+                    if pytest_ok:
+                        run_result = RunResult.ok(
+                            mode=str(modo_generacion).upper(),
+                            degraded=degraded,
+                            degrade_type=str(degrade_type) if degrade_type else None,
+                        )
+
+                    if isinstance(resultado, dict):
+                        resultado = finalize_codegen_classification(
+                            preliminary_result=resultado,
+                            runtime_tests_passed=bool(run_result.pytest_ok),
+                        )
+                        resultado["pytest_ok"] = bool(run_result.pytest_ok)
+                        resultado["estado_final"] = run_result.status
+                        resultado["publishable"] = bool(run_result.publishable) and bool(resultado.get("materializable"))
+                        resultado["run_reasons"] = list(run_result.reasons)
+                        resultado["degraded"] = bool(run_result.degraded) if run_result.degraded is not None else None
+                        resultado["degrade_type"] = run_result.degrade_type
+
+                        # `runtime_tests_status` es un eje independiente de `codegen_status`:
+                        # - "skipped_environment_setup_failed": no se pudo preparar el venv aislado
+                        #   (pip install falló); el codegen puede seguir siendo válido.
+                        # - "passed" / "failed": pytest se ejecutó realmente en el entorno aislado.
+                        if resultado.get("runtime_tests_status") != "skipped_environment_setup_failed":
+                            resultado["runtime_tests_status"] = "passed" if run_result.pytest_ok else "failed"
+
+                    if str(modo_generacion).upper() == "COMPLETO":
+                        postprocesar_alineacion_por_pytest(
+                            nombre_proyecto=self.nombre_proyecto,
+                            project_dir=project_dir,
+                            resultado=resultado,
+                            estructura=estructura,
+                            archivos_creados=archivos_creados,
+                        )
+                else:
+                    logger.info(
+                        "[PIPELINE] codegen_status=invalid; se omite evaluacion/degradacion de pytest."
                     )
 
             modo_upper = modo_generacion
@@ -854,15 +921,32 @@ Descripción:
             logger.exception("[ORQUESTADOR] Error no recuperable durante generación libre")
             fallback_readme, fallback_error = self._build_fallback_docs(exc)
 
-            archivos_creados = materializar_proyecto(
+            # Si ya se había materializado código/tests reales antes de este fallo (p.ej. un
+            # error tardío e independiente en la fase de documentación, después de que codegen y
+            # el pytest loop ya hubieran corrido con éxito), NO los borramos: solo añadimos
+            # README_ERROR.md al lado. Antes, cualquier excepción no recuperable en CUALQUIER
+            # punto del pipeline (incluso tras tests ya generados y en verde) reemplazaba todo
+            # `output/<proyecto>/` por dos READMEs, tirando trabajo válido y aprovechable y
+            # dejando imposible diagnosticar el fallo real de los tests en el siguiente intento.
+            def _es_codigo_generado(ruta: str) -> bool:
+                partes = str(ruta or "").replace("\\", "/").split("/")
+                return "app" in partes or "tests" in partes
+
+            hay_proyecto_previo = any(_es_codigo_generado(r) for r in archivos_creados)
+
+            estructura_error: Dict[str, str] = {README_ERROR_FILENAME: fallback_error}
+            if not hay_proyecto_previo:
+                estructura_error[README_FINAL_FILENAME] = fallback_readme
+
+            archivos_creados_error = materializar_proyecto(
                 nombre_proyecto=self.nombre_proyecto,
-                estructura={README_FINAL_FILENAME: fallback_readme, README_ERROR_FILENAME: fallback_error},
-                limpiar_directorio=True,
+                estructura=estructura_error,
+                limpiar_directorio=not hay_proyecto_previo,
             )
 
             return {
                 "nombre_proyecto": self.nombre_proyecto,
-                "archivos_creados": archivos_creados,
+                "archivos_creados": archivos_creados_error if not hay_proyecto_previo else archivos_creados,
                 "error": str(exc),
             }
 
@@ -877,6 +961,14 @@ Descripción:
                     out["pytest_ok"] = resultado.get("pytest_ok")
                 if "publishable" in resultado:
                     out["publishable"] = resultado.get("publishable")
+                # Ejes de estado independientes (ver README/prepare_poc_runtime_environment):
+                # codegen_status != runtime_environment_status != runtime_tests_status.
+                if "codegen_status" in resultado:
+                    out["codegen_status"] = resultado.get("codegen_status")
+                if "runtime_environment_status" in resultado:
+                    out["runtime_environment_status"] = resultado.get("runtime_environment_status")
+                if "runtime_tests_status" in resultado:
+                    out["runtime_tests_status"] = resultado.get("runtime_tests_status")
         except Exception:
             pass
 

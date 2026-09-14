@@ -87,6 +87,7 @@ class DependencyBehavior:
     value: Any = None
     exception_type: Optional[str] = None
     exception_message: Optional[str] = None
+    exception_status_code: Optional[int] = None
 
     @property
     def dependency(self) -> str:

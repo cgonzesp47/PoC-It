@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import inspect
 import hashlib
 from dataclasses import dataclass, field
@@ -290,9 +291,17 @@ class PytestRepairResult:
     artifacts: Dict[str, str] = field(default_factory=dict)
 
 
-def _run_pytest(project_dir: str) -> Tuple[bool, str, str]:
+def _run_pytest(project_dir: str, python_executable: Optional[str] = None) -> Tuple[bool, str, str]:
     """
     Ejecuta pytest y genera un reporte estructurado mediante JUnit XML (built-in) + JSON report (pytest-json-report).
+
+    Importante:
+    - `python_executable` debe ser el Python del entorno aislado de la PoC generada
+      (`.poc_it/venv`, resuelto por `poc_it.runtime.poc_runtime_environment.prepare_poc_runtime_environment`).
+      Ejecutar pytest con el `python` del PATH del proceso de PoC-it produce falsos negativos
+      (`ModuleNotFoundError`) cuando ese entorno no tiene instaladas las dependencias declaradas
+      en el `requirements.txt`/`requirements-dev.txt` de la PoC. Si no se pasa explícitamente,
+      lo resolvemos aquí.
 
     Importante (Windows):
     - Hemos observado fallos en `pytest_sessionfinish` (plugin junitxml) cuando el path del XML
@@ -303,6 +312,14 @@ def _run_pytest(project_dir: str) -> Tuple[bool, str, str]:
       1) usamos ruta ABSOLUTA normalizada para --junitxml
       2) si aun así falla por junitxml, reintentamos SIN junitxml (fallback) para no bloquear el loop
     """
+    if python_executable:
+        py = python_executable
+    else:
+        from poc_it.runtime.poc_runtime_environment import prepare_poc_runtime_environment
+
+        env = prepare_poc_runtime_environment(project_dir)
+        py = str(env.python_executable) if env.python_executable.exists() else sys.executable
+
     report_dir = os.path.abspath(os.path.join(project_dir, ".poc_it"))
     os.makedirs(report_dir, exist_ok=True)
     junit_path = os.path.normpath(os.path.join(report_dir, "pytest_junit.xml"))
@@ -310,7 +327,7 @@ def _run_pytest(project_dir: str) -> Tuple[bool, str, str]:
 
     # Intento 1: con junitxml + json-report (preferido)
     base_cmd = [
-        "python",
+        py,
         "-m",
         "pytest",
         "-q",
@@ -333,7 +350,7 @@ def _run_pytest(project_dir: str) -> Tuple[bool, str, str]:
     out_low = (out or "").lower()
     if ("junitxml.py" in out_low or "pytest_sessionfinish" in out_low) and ("filenotfounderror" in out_low or "winerror 3" in out_low):
         p2 = subprocess.run(
-            ["python", "-m", "pytest", "-q", "--json-report", f"--json-report-file={json_path}"],
+            [py, "-m", "pytest", "-q", "--json-report", f"--json-report-file={json_path}"],
             cwd=project_dir,
             capture_output=True,
             text=True,
@@ -1233,6 +1250,26 @@ def _runtime_openapi_paths(runtime_contracts: Optional[dict]) -> Dict[str, set]:
     return out
 
 
+def _path_template_matches(url: str, template: str) -> bool:
+    """True si `url` (concreta, p.ej. /products/1) encaja con `template` (p.ej. /products/{product_id}).
+
+    No asume ningún nombre de parámetro: cualquier segmento `{...}` de la plantilla actúa como
+    comodín, sea cual sea su nombre real.
+    """
+    if "{" not in template:
+        return url == template
+    url_segments = url.strip("/").split("/")
+    template_segments = template.strip("/").split("/")
+    if len(url_segments) != len(template_segments):
+        return False
+    for u_seg, t_seg in zip(url_segments, template_segments):
+        if re.fullmatch(r"\{[^{}]+\}", t_seg):
+            continue
+        if u_seg != t_seg:
+            return False
+    return True
+
+
 def _gate_patch_tests_endpoints_exist_in_openapi(
     patch: Dict[str, str],
     *,
@@ -1275,16 +1312,17 @@ def _gate_patch_tests_endpoints_exist_in_openapi(
 
             if not url:
                 continue
-            # Normalizar path params: /items/1 -> /items/{id} si existe en OpenAPI
-            candidates = [url]
-            if re.search(r"/\d+", url):
-                candidates.append(re.sub(r"/\d+", "/{id}", url))
+            # Match contra las plantillas reales de OpenAPI (p.ej. /products/{product_id}),
+            # sin asumir que el path param se llama literalmente "id": una URL concreta de test
+            # como /products/1 debe reconocerse contra CUALQUIER nombre de parámetro declarado.
             ok = False
-            for cand in candidates:
-                ms = openapi_paths.get(cand)
-                if ms and meth in ms:
-                    ok = True
-                    break
+            if url in openapi_paths and meth in openapi_paths[url]:
+                ok = True
+            else:
+                for template, ms in openapi_paths.items():
+                    if meth in ms and _path_template_matches(url, template):
+                        ok = True
+                        break
             if not ok:
                 bad.append(f"{path}:{meth.upper()} {url}")
 
@@ -1358,7 +1396,16 @@ def repair_tests_until_pytest_passes(
     max_repairs: int = 3,
     runtime_contracts: Optional[dict] = None,
     runtime_facts: Optional[dict] = None,
+    python_executable: Optional[str] = None,
 ) -> PytestRepairResult:
+    # `python_executable`: Python del entorno aislado de la PoC (`.poc_it/venv`). Si no se pasa
+    # explícitamente, se resuelve UNA VEZ aquí (en vez de re-resolverlo en cada `_run_pytest`).
+    if not python_executable:
+        from poc_it.runtime.poc_runtime_environment import prepare_poc_runtime_environment
+
+        _env = prepare_poc_runtime_environment(project_dir)
+        python_executable = str(_env.python_executable) if _env.python_executable.exists() else sys.executable
+
     # Snapshot de integridad del código de producción (Pipeline C)
     prod_snapshot = _snapshot_production_fingerprint(project_dir)
     rejected_patch_paths: List[str] = []
@@ -1417,7 +1464,7 @@ def repair_tests_until_pytest_passes(
 
     attempt = 0
     while attempt <= max_allowed:
-        ok, out, _junit_path = _run_pytest(project_dir)
+        ok, out, _junit_path = _run_pytest(project_dir, python_executable)
         last_out = out
         cls = classify_pytest_failure(out)
 
@@ -2039,7 +2086,7 @@ def repair_tests_until_pytest_passes(
             return _mk_result(ok=False, attempts=attempt, last_output=out, patched_files=patched_total)
 
         # Acceptance gate: re-run pytest inmediatamente y aceptar SOLO si mejora vs baseline o vs prev
-        ok_after, out_after, _ = _run_pytest(project_dir)
+        ok_after, out_after, _ = _run_pytest(project_dir, python_executable)
         last_out = out_after
 
         junit_xml_after = _read_pytest_junit_xml(project_dir)
@@ -2089,6 +2136,14 @@ def repair_tests_until_pytest_passes(
             except Exception:
                 pass
 
+            # `no_improve_streak` es el único freno para dejar de intentar reparar cuando los
+            # parches sucesivos no mejoran nada: sin incrementarlo aquí, el check de la línea
+            # ~2193 (`if no_improve_streak >= NO_IMPROVE_LIMIT`) nunca se cumple y el bucle
+            # agota siempre `max_allowed` intentos (hasta 10), aunque lleve varias iteraciones
+            # sin ningún progreso real — justo el patrón observado: mismo fallo "unclassified"
+            # repetido intento tras intento sin converger.
+            no_improve_streak += 1
+
             append_trace_event(
                 project_dir,
                 TraceEvent(
@@ -2097,8 +2152,34 @@ def repair_tests_until_pytest_passes(
                     attempt=attempt,
                     action="gate_reject_no_improve",
                     files_changed=list(patch.keys()),
+                    detail=f"no_improve_streak={no_improve_streak}",
                 ),
             )
+
+            if no_improve_streak >= NO_IMPROVE_LIMIT:
+                logger.info(
+                    "[PYTEST-REPAIR] %s parches consecutivos sin mejora; degradando a contract-lite.",
+                    no_improve_streak,
+                )
+                _degrade_to_contract_lite(nombre_proyecto=nombre_proyecto, estructura=estructura)
+                ok2, out2, _ = _run_pytest(project_dir, python_executable)
+                _persist_test_validation_report(
+                    project_dir,
+                    ok=bool(ok2),
+                    degraded=True,
+                    degrade_type="contract-lite",
+                    production_code_modified_by_test_repair=production_code_modified_by_test_repair,
+                    rejected_patch_paths=rejected_patch_paths,
+                    harness_strategy=harness_strategy,
+                )
+                return _mk_result(
+                    ok=bool(ok2),
+                    attempts=attempt,
+                    last_output=out2,
+                    patched_files=patched_total,
+                    degraded=True,
+                    degrade_type="contract-lite",
+                )
 
             attempt += 1
             continue
@@ -2149,7 +2230,7 @@ markers =
                 no_improve_streak,
             )
             _degrade_to_contract_lite(nombre_proyecto=nombre_proyecto, estructura=estructura)
-            ok2, out2, _ = _run_pytest(project_dir)
+            ok2, out2, _ = _run_pytest(project_dir, python_executable)
 
             # Política:
             # - Degradamos a contract-lite y re-ejecutamos pytest (suite mínima smoke+openapi).
@@ -2206,7 +2287,7 @@ markers =
     try:
         logger.info("[PYTEST-REPAIR] Presupuesto agotado; degradando a contract-lite (último recurso).")
         _degrade_to_contract_lite(nombre_proyecto=nombre_proyecto, estructura=estructura)
-        ok2, out2, _ = _run_pytest(project_dir)
+        ok2, out2, _ = _run_pytest(project_dir, python_executable)
         if ok2:
             _persist_test_validation_report(
                 project_dir,

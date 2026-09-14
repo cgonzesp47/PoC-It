@@ -18,6 +18,7 @@ para alimentar el loop de reparación LLM sobre app/**.
 
 import json
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 import os
@@ -75,15 +76,44 @@ def _safe_extract_marker_json(out: str, marker: str) -> Optional[dict]:
     return None
 
 
+def _select_probe_endpoints(
+    endpoints: List[dict],
+    *,
+    allow: Optional[List[str]],
+    max_endpoints: int,
+) -> List[dict]:
+    """
+    Selecciona qué endpoints son seguros de probar con una petición real:
+    - Sin dependencias (`depends_imports` vacío): herméticos por construcción, siempre se incluyen.
+    - Con dependencias: solo si TODAS están en `allow` (overrideables), para no arriesgarse a
+      llamar de verdad a un servicio externo real.
+    """
+    selected: List[dict] = []
+    for ep in endpoints:
+        deps = ep.get("depends_imports") or []
+        if not isinstance(deps, list):
+            continue
+        if deps and not (allow and all(str(d) in allow for d in deps)):
+            continue
+        selected.append(ep)
+        if len(selected) >= max_endpoints:
+            break
+    return selected
+
+
 def run_runtime_probe(
     *,
     project_dir: str,
     estructura: Dict[str, str],
-    max_endpoints: int = 3,
+    max_endpoints: int = 25,
+    python_executable: str | None = None,
 ) -> RuntimeProbeResult:
     """
     Ejecuta un probe request-time. Selecciona endpoints desde runtime_contracts:
-    - Solo endpoints con depends_imports no vacío (para poder overridear herméticamente).
+    - Endpoints sin dependencias (depends_imports vacío): son herméticos por construcción
+      (nada externo que mockear), así que se incluyen siempre.
+    - Endpoints con dependencias: solo si todas están en `allowed_dependency_overrides`
+      (para poder overridearlas herméticamente sin tocar nada externo real).
     - Limita a max_endpoints para evitar probes largos.
 
     Devuelve ok=False y detail con stdout/stderr si:
@@ -114,18 +144,13 @@ def run_runtime_probe(
                             derived.append(s)
             allow = sorted(set(derived)) if derived else None
 
-    # Pre-filtrado: solo endpoints overrideables (depends_imports no vacío)
-    selected: List[dict] = []
-    for ep in endpoints:
-        deps = ep.get("depends_imports") or []
-        if not isinstance(deps, list) or not deps:
-            continue
-        if allow is not None and allow:
-            if not all(str(d) in allow for d in deps):
-                continue
-        selected.append(ep)
-        if len(selected) >= max_endpoints:
-            break
+    env_vars_explicit: List[str] = []
+    if isinstance(rc, dict):
+        raw_env_vars = rc.get("env_vars_explicit")
+        if isinstance(raw_env_vars, list):
+            env_vars_explicit = [str(v).strip() for v in raw_env_vars if str(v).strip()]
+
+    selected = _select_probe_endpoints(endpoints, allow=allow, max_endpoints=max_endpoints)
 
     payload = json.dumps({"endpoints": selected}, ensure_ascii=False)
 
@@ -171,6 +196,26 @@ class _StubAttrProxy:
         async def _noop():
             return _StubAttrProxy(self._dep_fqn, self._chain + ["__await__"])
         return _noop().__await__()
+
+    def __getitem__(self, key):
+        # Muchos clientes reales (p.ej. clientes de APIs de terceros) se acceden como dict:
+        # `client['folder_id']`, `response['id']`. Sin esto el probe abortaba con
+        # "object is not subscriptable" ante código de app perfectamente correcto, gastando
+        # presupuesto de reparación LLM intentando "arreglar" algo que no está roto.
+        _sig_touch(self._dep_fqn, f"__getitem__[{key!r}]", kind="attr", awaited=None, chain=self._chain + [f"[{key!r}]"])
+        return _StubAttrProxy(self._dep_fqn, self._chain + [f"[{key!r}]"])
+
+    def __contains__(self, key):
+        return True
+
+    def __iter__(self):
+        return iter(())
+
+    def __bool__(self):
+        return True
+
+    def __str__(self):
+        return f"stub:{self._dep_fqn}"
 
 def _mk_stub(dep_fqn: str):
     return _StubAttrProxy(dep_fqn)
@@ -403,7 +448,7 @@ def main():
     if r.status_code >= 500:
         raise RuntimeError(f"openapi failed: {r.status_code}")
 
-    selected = json.loads(r'''__ENDPOINTS_JSON__''') or {}
+    selected = json.loads(__ENDPOINTS_JSON__) or {}
     eps = selected.get("endpoints") or []
 
     openapi = {}
@@ -546,20 +591,37 @@ def main():
 
 if __name__ == "__main__":
     main()
-""".replace("__ENDPOINTS_JSON__", payload.replace("\\", "\\\\").replace("'", "\\'"))
+""".replace("__ENDPOINTS_JSON__", repr(payload))
 
-    # Importante: ejecutar el probe con el Python del venv del proyecto generado si existe,
+    # Importante: ejecutar el probe con el Python del entorno aislado de la PoC (`.poc_it/venv`),
     # para evitar falsos negativos en máquinas donde PoC-it no tiene instaladas las deps del proyecto.
-    venv_py = os.path.join(project_dir, ".poc_it", "venv", "Scripts", "python.exe")
-    if not os.path.exists(venv_py):
-        venv_py = os.path.join(project_dir, ".poc_it", "venv", "bin", "python")
-    py = venv_py if os.path.exists(venv_py) else "python"
+    # El caller debería pasar `python_executable` (resuelto por
+    # `poc_it.runtime.poc_runtime_environment.prepare_poc_runtime_environment`); si no, resolvemos
+    # aquí best-effort.
+    if python_executable:
+        py = python_executable
+    else:
+        from poc_it.runtime.poc_runtime_environment import prepare_poc_runtime_environment
+
+        runtime_env = prepare_poc_runtime_environment(project_dir)
+        py = str(runtime_env.python_executable) if runtime_env.python_executable.exists() else sys.executable
+
+    # Igual que `_ensure_env` en el arnés de tests (tests_harness.py): las variables de entorno
+    # declaradas como necesarias (spec.env required + os.getenv detectado por AST) reciben un
+    # valor dummy si no están ya en el entorno real. Sin esto, cualquier PoC con una variable de
+    # entorno legítimamente obligatoria (p.ej. GOOGLE_DRIVE_FOLDER_ID) fallaba SIEMPRE el probe
+    # con un ValidationError de pydantic-settings, aunque el código generado fuera correcto —
+    # un falso positivo que bloqueaba el pipeline antes de llegar a generar tests.
+    subprocess_env = dict(os.environ)
+    for var in env_vars_explicit:
+        subprocess_env.setdefault(var, "DUMMY")
 
     p = subprocess.run(
         [py, "-c", code],
         cwd=project_dir,
         capture_output=True,
         text=True,
+        env=subprocess_env,
     )
     out = (p.stdout or "") + "\n" + (p.stderr or "")
     if p.returncode != 0:
@@ -622,5 +684,26 @@ if __name__ == "__main__":
     except Exception:
         # Best-effort: no romper el pipeline por el merge de facts
         pass
+
+    # IMPORTANTE: hasta aquí `ok=True` solo reflejaba que el propio script del probe no se cayó
+    # (returncode 0) — un endpoint que responde >=500 o lanza una excepción se registraba en
+    # `errors`/ENDPOINT_ERRORS_JSON pero nunca se propagaba a `ok`, así que ningún fallo real de
+    # endpoint llegaba a activar reparación, por muchos endpoints que se probasen. Lo corregimos
+    # aquí: si algún endpoint probado falló, el probe se considera no-ok.
+    endpoint_errors = []
+    try:
+        errors_obj = _safe_extract_marker_json(out, "ENDPOINT_ERRORS_JSON:")
+        if isinstance(errors_obj, dict):
+            raw_errors = errors_obj.get("errors")
+            if isinstance(raw_errors, list):
+                endpoint_errors = [e for e in raw_errors if isinstance(e, dict)]
+    except Exception:
+        endpoint_errors = []
+
+    if endpoint_errors:
+        return RuntimeProbeResult(
+            ok=False,
+            detail=out + "\nENDPOINT_ERRORS:\n" + json.dumps(endpoint_errors, ensure_ascii=False, indent=2),
+        )
 
     return RuntimeProbeResult(ok=True, detail=out)

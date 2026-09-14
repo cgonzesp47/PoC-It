@@ -31,8 +31,15 @@ def extraer_json_tolerante(respuesta: str) -> Optional[dict]:
             s = m.group(1).strip()
 
     # 2) intento directo
+    #
+    # strict=False: el LLM devuelve habitualmente código multi-línea dentro del campo
+    # "content" con saltos de línea reales (no escapados como \n), que el parser JSON
+    # estricto rechaza como "Invalid control character". Es un fallo intermitente muy
+    # frecuente en ficheros de código largos/multi-línea, ajeno a si el contenido en sí
+    # es válido. `strict=False` permite caracteres de control literales dentro de strings
+    # sin relajar ninguna otra regla de la gramática JSON.
     try:
-        return json.loads(s)
+        return json.loads(s, strict=False)
     except Exception:
         pass
 
@@ -41,6 +48,6 @@ def extraer_json_tolerante(respuesta: str) -> Optional[dict]:
         start = s.index("{")
         end = s.rindex("}")
         candidate = s[start : end + 1]
-        return json.loads(candidate)
+        return json.loads(candidate, strict=False)
     except Exception:
         return None

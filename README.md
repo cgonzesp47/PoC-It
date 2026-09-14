@@ -44,6 +44,53 @@ La idea arquitectónica central es que cada fase no tenga que reinterpretar desd
 
 ---
 
+## Guía rápida: cómo usar PoC-it
+
+### 1. Requisitos
+
+- Python 3.11+ (el mismo intérprete que uses para el resto del proyecto).
+- Node.js + npm — solo si vas a usar la **interfaz web**; se usan para compilar el frontend de `ui/`.
+- Tus propias API keys de al menos un proveedor LLM (ver siguiente punto). PoC-it no incluye ninguna clave propia: cada usuario debe configurar la suya antes de poder generar una PoC.
+
+### 2. Configurar tus API keys
+
+Copia `.env_example` a `.env` en la raíz del proyecto y rellena tus propias credenciales. El pipeline llama a los modelos a través de un proxy LiteLLM local (`litellm_config.yaml`) que reparte cada fase entre varios proveedores con fallback automático entre ellos, así que cuantas más de estas claves configures, más resiliente será la generación ante fallos o límites de un proveedor concreto:
+
+- `GROQ_API_KEY`
+- `GEMINI_API_KEY`
+- `MISTRAL_API_KEY`
+- `OPENROUTER_API_KEY`
+
+(`CEREBRAS_API_KEY` existe en `.env_example` pero no se usa actualmente en el enrutado del proxy.)
+
+Opcional, solo si quieres que PoC-it publique automáticamente los proyectos generados en GitLab: `POCIT_GITLAB_TOKEN`, `POCIT_GITLAB_URL`, `POCIT_GITLAB_GROUP`.
+
+Si usas la interfaz web, también puedes rellenar/editar estas mismas claves desde la pantalla **Ajustes** (se guardan en el mismo `.env`) en lugar de editar el fichero a mano.
+
+### 3. Arrancar la aplicación
+
+**Interfaz web (recomendado)** — arranca el proxy LiteLLM automáticamente y, si es la primera vez, compila el frontend:
+
+```bash
+python -m poc_it.web
+```
+
+Se abre `http://127.0.0.1:8000` en el navegador. Desde ahí puedes crear una PoC nueva rellenando la plantilla, seguir el progreso en vivo, inspeccionar el resultado (ficheros generados, estado de tests, publicación) y consultar el historial de PoCs generadas (incluidas las que ya existieran en `output/` antes de usar la interfaz).
+
+**CLI interactivo** — el flujo original por terminal:
+
+```bash
+python -m poc_it.main
+```
+
+Ambos caminos ejecutan exactamente el mismo pipeline (`poc_it/pipeline_runner.py`); la interfaz web es una capa encima, no una implementación distinta.
+
+### 4. Generar tu primera PoC
+
+Rellena los 6 campos de la plantilla — nombre, problema que resuelve, quién la usará, qué debe poder hacer, límites/restricciones, y tecnologías/integraciones necesarias — y lanza la generación. El resultado se materializa en `output/<nombre>/` (ver [sección 25](#25-salida-generada)).
+
+---
+
 ## Objetivo
 
 El objetivo de PoC-it es producir una PoC backend ejecutable —o, si no es viable materializarla, un análisis estructurado— a partir de necesidades funcionales descritas en lenguaje natural.
@@ -1333,6 +1380,8 @@ PoC-it sigue siendo un orquestador de pipeline con varias fuentes de verdad y ga
 
 Este repositorio está orientado a Python. La versión exacta debe ajustarse a lo que indiquen el entorno y las dependencias del proyecto; en ausencia de una restricción explícita visible en los módulos inspeccionados, la recomendación práctica es usar una versión moderna de Python 3 compatible con FastAPI, pytest y las librerías del repositorio.
 
+Si vas a usar la interfaz web (`poc_it/web/`), necesitas además Node.js + npm para compilar el frontend de `ui/`.
+
 ### Instalar dependencias
 
 Desde la raíz del proyecto:
@@ -1342,6 +1391,8 @@ pip install -r requirements.txt
 ```
 
 Si el repositorio distingue dependencias adicionales de desarrollo en tu entorno local, instálalas también según proceda.
+
+Las dependencias del frontend (`ui/node_modules`) se instalan solas la primera vez que arrancas `python -m poc_it.web`; no hace falta hacerlo a mano.
 
 ---
 
@@ -1371,13 +1422,14 @@ Dependiendo de tu entorno, puede ser necesario arrancar el proxy/configuración 
 
 ## 24. Ejecución
 
-El punto de entrada real del proyecto es:
+Hay dos puntos de entrada, ambos ejecutando el mismo pipeline (`poc_it/pipeline_runner.py`) — ver la [guía rápida](#guía-rápida-cómo-usar-poc-it) al principio de este documento para el detalle de uso:
 
 ```bash
-python -m poc_it.main
+python -m poc_it.web    # interfaz web (recomendado)
+python -m poc_it.main   # CLI interactivo original
 ```
 
-Ese comando ejecuta el flujo interactivo definido en `poc_it/main.py`, muestra la plantilla al usuario y lanza el pipeline apropiado según el modo clasificado.
+El modo CLI ejecuta el flujo interactivo definido en `poc_it/main.py`, muestra la plantilla al usuario por terminal y lanza el pipeline apropiado según el modo clasificado. El modo web (`poc_it/web/server.py`) expone la misma plantilla como formulario, retransmite el progreso en vivo y añade un historial de runs; arranca automáticamente el proxy LiteLLM al iniciar.
 
 ### Modo demo
 
