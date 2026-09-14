@@ -56,6 +56,17 @@ La idea arquitectónica central es que cada fase no tenga que reinterpretar desd
 
 ### 2. Configuración del entorno de desarrollo
 
+### 2.1. Arranque rápido (Recomendado)
+
+Si quieres empezar directamente sin configurar el entorno a mano, el script se encarga de crear el `.venv`, instalar dependencias, generar tu `.env` si falta y arrancar el servidor:
+
+* **En Windows (PowerShell):**
+  ```powershell
+  Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+  .\run.ps1
+
+### 2.2. Arranque manual
+
 Sigue estos pasos ordenados según tu sistema operativo para configurar el entorno virtual e instalar las dependencias necesarias.
 
 #### En Windows (PowerShell):
